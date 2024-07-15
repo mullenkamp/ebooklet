@@ -1,0 +1,189 @@
+[project]
+name = "bookcase"
+authors = [
+  { name = "bookcase", email = "mullenkamp1@gmail.com" }
+]
+description = "Organise all your data in key/value books and sync them with S3."
+readme = "README.md"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+]
+requires-python = ">=3.10"
+dependencies = [
+  's3func',
+  'zstandard',
+  'urllib3',
+  'booklet',
+  'orjson'
+]
+
+# [tool.ruff]
+# target-version = "py310"
+# extend-select = ["I", "TRY", "UP"]
+
+# [tool.pytest.ini_options]
+# addopts = "--cov=bookcase/ --cov-report=term-missing"
+
+
+[tool.hatch]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+# [tool.hatch.version]
+# source = "regex_commit"
+# commit_extra_args = ["-e"]
+# path = "bookcase/__init__.py"
+
+[tool.hatch.envs.default]
+python = "3.10"
+dependencies = [
+    "spyder-kernels==2.4",
+    "black",
+    "mypy",
+    "ruff",
+    "pytest",
+    "pytest-cov",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    
+]
+
+[[tool.hatch.envs.all.matrix]]
+python = ['3.10', '3.11', '3.12']
+
+[tool.hatch.envs.lint]
+detached = true
+dependencies = [
+  "black>=23.1.0",
+  "mypy>=1.0.0",
+  "ruff>=0.0.243",
+]
+[tool.hatch.envs.lint.scripts]
+typing = "mypy --install-types --non-interactive {args:src/bookcase tests}"
+style = [
+  "ruff {args:.}",
+  "black --check --diff {args:.}",
+]
+fmt = [
+  "black {args:.}",
+  "ruff --fix {args:.}",
+  "style",
+]
+all = [
+  "style",
+  "typing",
+]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest {args:tests}"
+test-cov = "coverage run -m pytest {args:tests}"
+cov-report = [
+  "- coverage combine",
+  "coverage report",
+]
+cov = [
+  "test-cov",
+  "cov-report",
+]
+docs-serve = "mkdocs serve"
+docs-build = "mkdocs build"
+
+[tool.black]
+target-version = ["py37"]
+line-length = 120
+skip-string-normalization = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+select = [
+  "A",
+  "ARG",
+  "B",
+  "C",
+  "DTZ",
+  "E",
+  "EM",
+  "F",
+  "FBT",
+  "I",
+  "ICN",
+  "ISC",
+  "N",
+  "PLC",
+  "PLE",
+  "PLR",
+  "PLW",
+  "Q",
+  "RUF",
+  "S",
+  "T",
+  "TID",
+  "UP",
+  "W",
+  "YTT",
+]
+ignore = [
+  # Allow non-abstract empty methods in abstract base classes
+  "B027",
+  # Allow boolean positional values in function calls, like `dict.get(... True)`
+  "FBT003",
+  # Ignore checks for possible passwords
+  "S105", "S106", "S107",
+  # Ignore complexity
+  "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+]
+unfixable = [
+  # Don't touch unused imports
+  "F401",
+]
+
+[tool.ruff.isort]
+known-first-party = ["bookcase"]
+
+[tool.ruff.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.per-file-ignores]
+# Tests can use magic values, assertions, and relative imports
+"tests/**/*" = ["PLR2004", "S101", "TID252"]
+
+[tool.coverage.run]
+source_pkgs = ["bookcase", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/bookcase/__about__.py",
+]
+
+[tool.coverage.paths]
+bookcase = ["src/bookcase", "*/bookcase/src/bookcase"]
+tests = ["tests", "*/bookcase/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-regex-commit"]
+build-backend = "hatchling.build"
+
+[project.urls]
+Documentation = "https://mullenkamp.github.io/bookcase/"
+Source = "https://github.com/mullenkamp/bookcase"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/bookcase",
+]
+exclude = [
+  "/bookcase/tests/*",
+]
+
+[tool.hatch.version]
+path = "bookcase/__init__.py"
