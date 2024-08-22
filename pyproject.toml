@@ -3,7 +3,7 @@ name = "bookcase"
 authors = [
   { name = "bookcase", email = "mullenkamp1@gmail.com" }
 ]
-description = "Organise all your data in key/value books and sync them with S3."
+description = "Organise all your data in key/value booklets and sync them with S3"
 readme = "README.md"
 dynamic = ["version"]
 classifiers = [
@@ -11,10 +11,10 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  's3func',
+  's3func>=0.5',
   'zstandard',
-  'urllib3',
-  'booklet',
+  'urllib3>=2',
+  'booklet>=0.3',
   'orjson'
 ]
 

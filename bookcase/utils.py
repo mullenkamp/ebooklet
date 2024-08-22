@@ -5,13 +5,14 @@ Created on Thu Jan  5 11:04:13 2023
 
 @author: mike
 """
-# import os
+import os
 import io
 # from pydantic import BaseModel, HttpUrl
 import pathlib
 import copy
 # from time import sleep
 import hashlib
+from hashlib import blake2b
 import booklet
 import orjson
 from s3func import S3Session, HttpSession, s3
@@ -19,55 +20,69 @@ import urllib3
 import shutil
 from datetime import datetime, timezone
 import zstandard as zstd
+from glob import glob
+import portalocker
+import concurrent.futures
 # from collections.abc import Mapping, MutableMapping
-# from __init__ import __version__ as version
+from __init__ import __version__ as version
 
 ############################################
 ### Parameters
 
-version = '0.1.0'
+# version = '0.1.0'
 
-default_n_buckets = 10003
+default_n_buckets = 100003
 
-blt_files = ('_local_data', '_remote_keys')
+blt_files = ('.local_data', '.remote_index')
+
+local_storage_options = ('write_buffer_size', 'n_bytes_file', 'n_bytes_key', 'n_bytes_value', 'n_buckets')
 
 ############################################
 ### Exception classes
 
 
-class BaseError(Exception):
-    def __init__(self, message, objs=[], *args):
-        self.message = message # without this you may get DeprecationWarning
-        # Special attribute you desire with your Error,
-        # for file in blt_files:
-        #     f = getattr(obj, file)
-        #     if f is not None:
-        #         f.close()
-        for obj in objs:
-            if obj:
-                obj.close()
-        # allow users initialize misc. arguments as any other builtin Error
-        super(BaseError, self).__init__(message, *args)
+# class BaseError(Exception):
+#     def __init__(self, message, objs=[], temp_path=None, *args):
+#         self.message = message # without this you may get DeprecationWarning
+#         # Special attribute you desire with your Error,
+#         # for file in blt_files:
+#         #     f = getattr(obj, file)
+#         #     if f is not None:
+#         #         f.close()
+#         for obj in objs:
+#             if obj:
+#                 obj.close()
+#         if temp_path:
+#             temp_path.cleanup()
+#         # allow users initialize misc. arguments as any other builtin Error
+#         super(BaseError, self).__init__(message, *args)
 
 
-class S3dbmValueError(BaseError):
-    pass
+# class S3dbmValueError(BaseError):
+#     pass
 
-class S3dbmTypeError(BaseError):
-    pass
+# class S3dbmTypeError(BaseError):
+#     pass
 
-class S3dbmKeyError(BaseError):
-    pass
+# class S3dbmKeyError(BaseError):
+#     pass
 
-class S3dbmHttpError(BaseError):
-    pass
+# class S3dbmHttpError(BaseError):
+#     pass
 
-class S3dbmSerializeError(BaseError):
-    pass
+# class S3dbmSerializeError(BaseError):
+#     pass
 
 
 ############################################
 ### Functions
+
+
+def hash_book_name(book_name):
+    """
+
+    """
+    return blake2b(book_name.encode(), digest_size=12).hexdigest()
 
 
 def bytes_to_int(b, signed=False):
@@ -96,16 +111,37 @@ def make_timestamp(value=None):
     return int_us
 
 
-def close_files(local_data, remote_keys):
+def bookcase_finalizer(temp_path, lock):
     """
+    The finalizer function for bookcase instances.
+    """
+    if temp_path:
+        shutil.rmtree(temp_path, True)
+    if lock:
+        lock.release()
 
+
+def book_finalizer(local_data, local_index, remote_index):
+    """
+    The finalizer function for book instances.
     """
     local_data.close()
-    if remote_keys:
-        remote_keys.close()
+    if local_index:
+        local_index.close()
+    if remote_index:
+        remote_index.close()
 
 
-def init_remote_config(flag, bucket, connection_config, remote_url, threads, read_timeout):
+def write_metadata(local_meta_path, meta):
+    """
+
+    """
+    meta_bytes = zstd.compress(orjson.dumps(meta, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY), level=1)
+    with io.open(local_meta_path, 'wb') as f:
+        f.write(meta_bytes)
+
+
+def init_remote_config(bucket, connection_config, remote_url, threads, read_timeout):
     """
 
     """
@@ -130,24 +166,53 @@ def init_remote_config(flag, bucket, connection_config, remote_url, threads, rea
         s3_session = S3Session(connection_config, bucket, threads, read_timeout=read_timeout, stream=False)
         remote_s3_access = True
 
-    if (not remote_s3_access) and (flag != 'r'):
-        raise ValueError("If flag != 'r', then the appropriate remote write access parameters must be passed.")
+    # if (not remote_s3_access) and (flag != 'r'):
+    #     raise ValueError("If flag != 'r', then the appropriate remote write access parameters must be passed.")
 
     return http_session, s3_session, remote_s3_access, remote_http_access, host_url, remote_base_url
 
 
-def init_metadata(local_meta_path, remote_keys_path, http_session, s3_session, remote_s3_access, remote_http_access, remote_url, remote_db_key, value_serializer, local_storage_kwargs):
+def init_metadata(local_meta_path, remote_keys_path, write, http_session, s3_session, remote_s3_access, remote_http_access, remote_url, remote_db_key, value_serializer, local_storage_kwargs):
     """
 
     """
     meta_in_remote = False
     # get_remote_keys = False
+    remote_meta = None
+
+    if remote_s3_access:
+        int_us = make_timestamp()
+    else:
+        int_us = 0
+
+    # version_date = datetime.fromtimestamp(int(int_us*0.000001)).strftime('%Y%m%dT%H%M%SZ')
+    # old_meta = None
+    new_meta = {
+        'package_version': version,
+        'local_storage_kwargs': local_storage_kwargs,
+        'value_serializer': value_serializer,
+        'last_modified': int_us,
+        'user_metadata': {},
+        'books': {},
+        'default_book': None
+        }
+
+    glob_str = str(local_meta_path) + '.*'
+    extra_files = glob(glob_str)
 
     if local_meta_path.exists():
+        # if write:
+        #     portalocker.lock(local_meta_path, portalocker.LOCK_EX)
+        # else:
+        #     portalocker.lock(local_meta_path, portalocker.LOCK_EX)
         with io.open(local_meta_path, 'rb') as f:
-            meta = orjson.loads(zstd.decompress(f.read()))
+            local_meta = orjson.loads(zstd.decompress(f.read()))
+    elif not write:
+        raise FileExistsError('Bookcase was open for read-only, but nothing exists to open.')
     else:
-        meta = None
+        for file in extra_files:
+            os.remove(file)
+        local_meta = None
 
     if remote_http_access or remote_s3_access:
         if remote_http_access:
@@ -159,105 +224,127 @@ def init_metadata(local_meta_path, remote_keys_path, http_session, s3_session, r
 
         meta0 = func(key)
         if meta0.status == 200:
-            if meta0.metadata['file_type'] != 's3dbm':
-                raise TypeError('The remote file is not an s3dbm file.')
+            if meta0.metadata['file_type'] != 'bookcase':
+                raise TypeError('The remote db file is not a bookcase file.')
             remote_meta = orjson.loads(zstd.decompress(meta0.data))
             meta_in_remote = True
 
-            ## Determine if the remote keys file needs to be downloaded
-            if meta is None:
-                with open(local_meta_path, 'wb') as f:
-                    f.write(meta0.data)
-                meta = remote_meta
-            else:
+            ## Remote meta is the only meta needed now
+            meta = remote_meta
+
+            ## Determine if the local remote index files needs to be removed
+            if local_meta is not None:
                 remote_ts = remote_meta['last_modified']
-                local_ts = meta['last_modified']
+                local_ts = local_meta['last_modified']
                 if remote_ts > local_ts:
-                    get_remote_keys_file(local_meta_path, remote_db_key, remote_url, http_session, s3_session, remote_http_access)
+                    # get_remote_keys_file(local_meta_path, remote_db_key, remote_url, http_session, s3_session, remote_http_access)
 
-                    with open(local_meta_path, 'wb') as f:
-                        f.write(meta0.data)
+                    # with open(local_meta_path, 'wb') as f:
+                    #     f.write(meta0.data)
 
-                    meta = remote_meta
-        elif meta0.status != 404:
+                    local_books = local_meta['books'].copy()
+                    remote_books = remote_meta['books']
+
+                    # local_remote_index_ts = {}
+                    # for file in extra_files:
+                    #     if '.remote_index' in file:
+                    #         book_hash = file.split('.')[-2]
+                    #         local_book_ts = books[book_hash]['last_modified']
+                    #         local_remote_index_ts[book_hash] = local_book_ts
+
+                    for file in extra_files:
+                        if '.remote_index' in file:
+                            book_hash = file.split('.')[-2]
+                            local_book_ts = local_books[book_hash]['last_modified']
+                            remote_book = remote_books.get(book_hash)
+                            if remote_book:
+                                remote_book_ts = remote_book['last_modified']
+                                if remote_book_ts > local_book_ts:
+                                    os.remove(file)
+
+                    ## Combining the local and remote books ensures a complete list if local was opened and changed offline
+                    local_books.update(remote_books)
+                    meta['books'] = local_books
+
+        elif meta0.status == 404:
+            if local_meta is None:
+                meta = new_meta
+            else:
+                meta = local_meta
+        else:
             raise urllib3.exceptions.HTTPError(meta0.error)
 
-    if meta is None:
+    elif local_meta:
+        meta = local_meta
+    else:
+        meta = new_meta
+
+    return meta, meta_in_remote
+
+
+def create_book(local_meta_path, meta, book_name, book_hash, remote_s3_access):
+    """
+
+    """
+    if remote_s3_access:
         int_us = make_timestamp()
-        version_date = datetime.fromtimestamp(int(int_us*0.000001)).strftime('%Y%m%dT%H%M%SZ')
-        meta = {
-            'package_version': version,
-            'local_data_kwargs': local_storage_kwargs,
-            'value_serializer': value_serializer,
-            'last_modified': int_us,
-            'user_metadata': {},
-            'versions': [
-                {'version_date': version_date,
-                 'user_metadata': {}
-                 }
-                ]
-            }
-        with io.open(local_meta_path, 'wb') as f:
-            f.write(zstd.compress(orjson.dumps(meta, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)))
     else:
-        version_date = meta['versions'][-1]['version_date']
+        int_us = 0
 
-    return meta, meta_in_remote, version_date
+    meta['books'][book_hash] = {'last_modified': int_us, 'name': book_name, 'user_metadata': {}}
+    if meta['default_book'] is None:
+        meta['default_book'] = book_hash
+
+    meta['last_modified'] = int_us
+
+    # write_metadata(local_meta_path, meta)
+    return meta
 
 
-def init_local_storage(local_meta_path, flag, meta):
+def init_local_storage(book_base_path, flag, meta):
     """
 
     """
-    local_data_file_name = local_meta_path.name + '.data'
-    local_data_path = local_meta_path.parent.joinpath(local_data_file_name)
+    local_data_path = book_base_path.parent.joinpath(book_base_path.name + 'local_data')
+    local_index_path = book_base_path.parent.joinpath(book_base_path.name + 'local_index')
 
-    if local_data_path.exists():
-        if flag == 'n':
-            ## Overwrite local data file
-            with booklet.open(local_data_path, flag=flag, **meta['local_data_kwargs']) as f:
-                pass
-        # else:
-        #     ## Open existing file
-        #     f = booklet.open(local_data_path, flag=flag)
-    else:
+    if not local_data_path.exists() or not local_index_path.exists():
         ## Create local data file
-        with booklet.open(local_data_path, flag=flag, **meta['local_data_kwargs']) as f:
+        with booklet.open(local_data_path, flag='n', **meta['local_storage_kwargs']):
+            pass
+        with booklet.FixedValue(local_index_path, 'n', key_serializer='str', value_len=7):
             pass
 
-    return local_data_path
+    return local_data_path, local_index_path
 
 
-def get_remote_keys_file(remote_keys_path, remote_db_key, remote_url, http_session, s3_session, remote_http_access):
+def get_remote_index_file(book_base_path, book_hash, remote_db_key, remote_url, http_session, s3_session, remote_http_access, remote_s3_access, overwrite=False):
     """
 
     """
-    if remote_http_access:
-        # remote_keys_url_path = remote_base_url.joinpath(remote_keys_name)
-        # remote_keys_key = host_url + str(remote_keys_url_path)
+    remote_index_path = book_base_path.parent.joinpath(book_base_path.name + 'remote_index')
 
-        remote_keys_key = remote_url + '.remote_keys'
+    if not remote_index_path.exists() or overwrite:
+        if remote_http_access:
+            remote_index_key = remote_url + f'{book_hash}.remote_index'
+            func = http_session.get_object
+        elif remote_s3_access:
+            remote_index_key = remote_db_key + f'{book_hash}.remote_index'
+            func = s3_session.get_object
+        else:
+            return remote_index_path
 
-        func = http_session.get_object
-    else:
-        # key_path = pathlib.Path(remote_db_key)
-        # remote_keys_key = str(key_path.parent.joinpath(remote_keys_name))
+        index0 = func(remote_index_key)
+        if index0.status == 200:
+            with open(remote_index_path, 'wb') as f:
+                shutil.copyfileobj(index0.data, f)
+        elif index0.status != 404:
+            raise urllib3.exceptions.HTTPError(index0.error)
 
-        remote_keys_key = remote_db_key + '.remote_keys'
-
-        func = s3_session.get_object
-
-    hash0 = func(remote_keys_key)
-    if hash0.status == 200:
-        with open(remote_keys_path, 'wb') as f:
-            shutil.copyfileobj(hash0.data, f)
-    else:
-        raise urllib3.exceptions.HTTPError(hash0.error)
-
-    return True
+    return remote_index_path
 
 
-def get_remote_value(local_data, remote_keys, key, remote_s3_access, remote_http_access, bucket=None, s3_session=None, http_session=None, host_url=None, remote_base_url=None):
+def get_remote_value(local_data, local_index, remote_index, key, remote_s3_access, remote_http_access, s3_session=None, http_session=None, host_url=None, remote_base_url=None):
     """
 
     """
@@ -281,95 +368,142 @@ def get_remote_value(local_data, remote_keys, key, remote_s3_access, remote_http
                 print(error)
                 counter += 1
                 if counter == 5:
-                    close_files(local_data, remote_keys)
+                    # close_files(local_data, remote_index)
                     raise error
         elif resp.status == 404:
-            raise S3dbmKeyError(f'{key} not found in remote.', [local_data, remote_keys])
+            raise KeyError(f'{key} not found in remote.')
             break
         else:
-            return S3dbmHttpError(f'{key} returned the http error {resp.status}.', [local_data, remote_keys])
+            return urllib3.exceptions.HttpError(f'{key} returned the http error {resp.status}.')
 
-    mod_time_int = make_timestamp(resp.metadata['upload_timestamp'])
-    mod_time_bytes = int_to_bytes(mod_time_int, 6)
+    # mod_time_int = make_timestamp(resp.metadata['upload_timestamp'])
+    # mod_time_bytes = int_to_bytes(mod_time_int, 6)
 
-    val_md5 = hashlib.md5(valb).digest()
+    # val_md5 = hashlib.md5(valb).digest()
     # obj_size_bytes = int_to_bytes(len(valb), 4)
 
-    local_data[key] = mod_time_bytes + val_md5 + valb
+    local_data[key] = valb
+    local_index[key] = remote_index[key]
 
-    # if remote_keys:
-
-    #     remote_keys[key] = mod_time_bytes + val_md5 + obj_size_bytes
-
-    return valb
+    return key
 
 
-def get_value(local_data, remote_keys, key, bucket=None, s3_client=None, session=None, host_url=None, remote_base_url=None):
+def load_value(local_data, local_index, remote_index, key, remote_s3_access, remote_http_access, s3_session, http_session, host_url=None, remote_base_url=None, overwrite=False):
     """
 
     """
-    if key in local_data:
-        local_value_bytes = local_data[key]
-        value_bytes = local_value_bytes[22:]
+    if remote_index:
+        if key not in remote_index:
+            return False
+
+        remote_time_bytes = remote_index[key]
+
+        local_time_bytes = None
+        if not overwrite:
+            if key in local_data:
+                if local_index:
+                    local_time_bytes = local_index[key]
+
+        if local_time_bytes:
+            remote_mod_time_int = bytes_to_int(remote_time_bytes)
+            local_mod_time_int = bytes_to_int(local_time_bytes)
+            if remote_mod_time_int < local_mod_time_int:
+                return True
+
+        get_remote_value(local_data, local_index, remote_index, key, remote_s3_access, remote_http_access, s3_session, http_session, host_url, remote_base_url)
+
+        return True
+
+    elif key in local_data:
+        return True
     else:
-        value_bytes = None
+        return False
 
-    if remote_keys:
-        if key not in remote_keys:
-            return None
-            # close_files(local_data, remote_keys)
-            # raise S3dbmKeyError(f'{key} does not exist.')
 
-        remote_value_bytes = remote_keys[key]
+# def get_value(local_data, local_index, remote_index, key, bucket=None, s3_client=None, session=None, host_url=None, remote_base_url=None):
+#     """
 
-        if value_bytes:
-            remote_md5 = remote_value_bytes[6:22]
-            local_md5 = local_value_bytes[6:22]
-            if remote_md5 != local_md5:
-                remote_mod_time_int = bytes_to_int(remote_value_bytes[:6])
-                local_mod_time_int = bytes_to_int(local_value_bytes[:6])
-                if remote_mod_time_int > local_mod_time_int:
-                    value_bytes = get_remote_value(local_data, remote_keys, key, bucket, s3_client, session, host_url, remote_base_url)
-        else:
-            value_bytes = get_remote_value(local_data, remote_keys, key, bucket, s3_client, session, host_url, remote_base_url)
+#     """
+#     if key in local_data:
+#         if local_index:
+#             local_time_bytes = local_index[key]
+#         else:
+#             return local_data[key]
+#     else:
+#         local_time_bytes = None
 
-    # if value_bytes is None:
-    #     raise S3dbmKeyError(f'{key} does not exist.')
+#     if remote_index:
+#         if key not in remote_index:
+#             return None
 
-    return value_bytes
+#         remote_time_bytes = remote_index[key]
+
+#         if local_time_bytes:
+#             remote_mod_time_int = bytes_to_int(remote_time_bytes)
+#             local_mod_time_int = bytes_to_int(local_time_bytes)
+#             if remote_mod_time_int < local_mod_time_int:
+#                 return local_data[key]
+
+#         value_bytes = get_remote_value(local_data, local_index, remote_index, key, bucket, s3_client, session, host_url, remote_base_url)
+
+#     else:
+#         value_bytes = None
+
+#     return value_bytes
 
 
 #################################################
 ### local/remote changelog
 
 
-def create_changelog(local_data_path, remote_keys_path, local_meta_path, n_buckets, meta_in_remote):
+# def create_changelog(local_data_path, remote_index_path, local_meta_path, n_buckets, meta_in_remote):
+#     """
+#     Only check and save by the microsecond timestamp. Might need to add in the md5 hash if this is not sufficient.
+#     """
+#     changelog_path = local_meta_path.parent.joinpath(local_meta_path.name + '.changelog')
+#     with booklet.FixedValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
+#         with booklet.VariableValue(local_data_path) as local_data:
+#             if meta_in_remote:
+#                 # shutil.copyfile(remote_keys_path, temp_remote_keys_path)
+#                 # f = booklet.FixedValue(temp_remote_keys_path, 'w')
+#                 with booklet.VariableValue(remote_index_path) as remote_index:
+#                     for key, local_bytes_us in local_data.items():
+#                         remote_val = remote_index.get(key)
+#                         if remote_val:
+#                             local_int_us = bytes_to_int(local_bytes_us)
+#                             remote_bytes_us = remote_val[:7]
+#                             remote_int_us = bytes_to_int(remote_bytes_us)
+#                             if local_int_us > remote_int_us:
+#                                 f[key] = local_bytes_us + remote_bytes_us
+#                         else:
+#                             f[key] = local_bytes_us + int_to_bytes(0, 7)
+#             else:
+#                 # f = booklet.FixedValue(temp_remote_keys_path, 'n', key_serializer='str', value_len=26)
+#                 for key, local_bytes_us in local_data.items():
+#                     f[key] = local_bytes_us + int_to_bytes(0, 7)
+
+#     return changelog_path
+
+
+def create_changelog(local_index, remote_index, book_base_path, n_buckets, meta_in_remote):
     """
     Only check and save by the microsecond timestamp. Might need to add in the md5 hash if this is not sufficient.
     """
-    changelog_path = local_meta_path.parent.joinpath(local_meta_path.name + '.changelog')
+    changelog_path = book_base_path.parent.joinpath(book_base_path.name + 'changelog')
     with booklet.FixedValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
-        with booklet.VariableValue(local_data_path) as local_data:
-            if meta_in_remote:
-                # shutil.copyfile(remote_keys_path, temp_remote_keys_path)
-                # f = booklet.FixedValue(temp_remote_keys_path, 'w')
-                with booklet.VariableValue(remote_keys_path) as remote_keys:
-                    for key, local_val in local_data.items():
-                        local_bytes_us = local_val[:7]
-                        remote_val = remote_keys.get(key)
-                        if remote_val:
-                            local_int_us = bytes_to_int(local_bytes_us)
-                            remote_bytes_us = remote_val[:7]
-                            remote_int_us = bytes_to_int(remote_bytes_us)
-                            if local_int_us > remote_int_us:
-                                f[key] = local_bytes_us + remote_bytes_us
-                        else:
-                            f[key] = local_bytes_us + int_to_bytes(0, 7)
-            else:
-                # f = booklet.FixedValue(temp_remote_keys_path, 'n', key_serializer='str', value_len=26)
-                for key, local_val in local_data.items():
-                    local_bytes_us = local_val[:7]
+        if meta_in_remote and remote_index:
+            for key, local_bytes_us in local_index.items():
+                remote_bytes_us = remote_index.get(key)
+                if remote_bytes_us:
+                    local_int_us = bytes_to_int(local_bytes_us)
+                    remote_int_us = bytes_to_int(remote_bytes_us)
+                    if local_int_us > remote_int_us:
+                        f[key] = local_bytes_us + remote_bytes_us
+                else:
                     f[key] = local_bytes_us + int_to_bytes(0, 7)
+        else:
+            for key, local_bytes_us in local_index.items():
+                f[key] = local_bytes_us + int_to_bytes(0, 7)
 
     return changelog_path
 
@@ -388,11 +522,94 @@ def view_changelog(changelog_path):
                 remote_ts = None
             else:
                 remote_ts = datetime.fromtimestamp(remote_int_us*0.000001)
+
             dict1 = {
                 'key': key,
                 'remote_timestamp': remote_ts,
-                'local_timestamp': datetime.fromtimestamp(local_int_us*0.000001)}
+                'local_timestamp': datetime.fromtimestamp(local_int_us*0.000001)
+                }
+
             yield dict1
+
+
+
+##############################################
+### Update remote
+
+
+def update_remote(local_meta_path, meta, local_data, remote_index_path, remote_index, book_hash, changelog_path, n_buckets, s3_session, remote_db_key, executor):
+    """
+
+    """
+    ## Prep remote data
+    base_remote_key = f'{remote_db_key}.{book_hash}'
+
+    ## Upload data and update the remote_index file
+    futures = {}
+    with booklet.FixedValue(changelog_path) as f:
+        for key in f:
+            remote_key = base_remote_key + '/' + key
+            f = executor.submit(s3_session.put_object(remote_key, local_data[key]))
+            futures[f] = key
+
+    ## Check the uploads to see if any fail
+        updated = False
+        failures = []
+        for future in concurrent.futures.as_completed(futures):
+            key = futures[future]
+            run_result = future.result()
+            if run_result.status == 200:
+                remote_index[key] = f[key][:7]
+                updated = True
+            else:
+                failures.append(key)
+
+    ## Upload the remote_index file
+    if updated:
+        futures = {}
+        remote_index.sync()
+        remote_index_key = base_remote_key + '.remote_index'
+        with open(remote_index_path, 'rb') as ri:
+            f = executor.submit(s3_session.put_object(remote_index_key, ri.read()))
+            futures[f] = remote_index_key
+
+        ## Save metadata file
+        mod_time = make_timestamp()
+        meta['last_modified'] = mod_time
+        meta['books'][book_hash]['last_modified'] = mod_time
+        write_metadata(local_meta_path, meta)
+
+        ## Upload the metadata file
+        with open(local_meta_path, 'rb') as ri:
+            f = executor.submit(s3_session.put_object(remote_db_key, ri.read()))
+            futures[f] = remote_db_key
+
+        for future in concurrent.futures.as_completed(futures):
+            key = futures[future]
+            run_result = future.result()
+            if run_result.status != 200:
+                failures.append(key)
+
+        if failures:
+            print(f"These uploads failed: {', '.split(failures)}")
+
+        return True
+    else:
+        return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

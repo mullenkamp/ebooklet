@@ -87,7 +87,7 @@ def get_logs(request):
 ################################################
 ### Tests
 
-self = Session(
+self = Bookcase(
     local_db_path,
     remote_url,
     flag,
@@ -98,14 +98,12 @@ self = Session(
     buffer_size=524288,
     read_timeout=60,
     threads=10,
-    break_past_locks=False,
+    break_other_locks=False,
     **local_storage_kwargs
     )
 
 
 self['test1'] = list(range(100))
-
-
 
 
 
