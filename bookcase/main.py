@@ -13,13 +13,15 @@ import multiprocessing
 import threading
 import booklet
 import s3func
-import zstandard as zstd
+# import zstandard as zstd
 import orjson
 import pprint
 import tempfile
 import weakref
 import shutil
-import portalocker
+import uuid
+import urllib3
+# import portalocker
 
 import utils
 # from . import utils
@@ -241,35 +243,394 @@ class UserMetadata(MutableMapping):
     #             f.write(zstd.compress(orjson.dumps(self._metadata, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)))
 
 
+class BaseRemote:
+    """
+
+    """
+    def __bool__(self):
+        """
+        Test to see if remote read access is possible. Same as .read_access.
+        """
+        return self.read_access
+
+    def close(self):
+        """
+        Close the remote connection. Should return None.
+        """
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    # @property
+    def uuid(self):
+        """
+        UUID of the remote object
+        """
+        raise NotImplementedError()
+
+    # @property
+    def timestamp(self):
+        """
+        Timestamp as int_us of the last modified date
+        """
+        raise NotImplementedError()
+
+    # @property
+    def readable(self):
+        """
+        Test to see if remote read access is possible. Returns a bool.
+        """
+        return False
+
+    # @property
+    def writable(self):
+        """
+        Test to see if remote write access is possible. Returns a bool.
+        """
+        return False
+
+    def get_object(self, key: str):
+        """
+        Get a remote object/file. The input should be a key as a str. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
+        """
+        raise NotImplementedError()
+
+    def put_object(self, key: str, data: bytes):
+        """
+        Put a remote object/file to the remote. The input should be a key as a str and data as bytes. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
+        """
+        raise NotImplementedError()
+
+    def list_objects(self, prefix: str=None, start_after: str=None):
+        """
+        List all objects associated with the primary key object. Same return object as get and put except that the object should have an .iter_objects method to iterate through all returned object keys.
+        """
+        raise NotImplementedError()
+
+    def delete(self):
+        """
+        Delete the remote entirely.
+        """
+        raise NotImplementedError()
+
+
+    # @property
+    def lock(self):
+        """
+        A lock object for the remote that should have a .break_other_locks method, an .aquire method, a .locked method, and a .release method. The .aquire method should have a timeout parameter.
+        If there's no lock, then return None.
+        """
+        raise NotImplementedError()
+
+
+class BaseS3Remote(BaseRemote):
+    """
+
+    """
+    @property
+    def readable(self):
+        """
+
+        """
+        if not self._readable_check:
+            resp_obj = self.get_db_object()
+            if resp_obj.status == 200:
+                self._readable = True
+
+                self._init_bytes = resp_obj.data
+
+                self.timestamp = booklet.utils.bytes_to_int(self._init_bytes[booklet.utils.file_timestamp_pos:booklet.utils.file_timestamp_pos + booklet.utils.timestamp_bytes_len])
+
+                self.uuid = uuid.UUID(bytes=bytes(self._init_bytes[49:65]))
+            elif resp_obj.status == 404:
+                self._readable = True
+
+            self._readable_check = True
+
+        return self._readable
+
+    @property
+    def writable(self):
+        """
+
+        """
+        if not self._writable_check:
+            test_key = self.db_key + uuid.uuid6().hex[:13]
+            put_resp = self._session.put_object(test_key, b'0')
+            if put_resp.status // 200 == 2:
+                self._writable = True
+                _ = self._session.delete_object(test_key, put_resp.metadata['version_id'])
+
+            self._writable_check = True
+
+        return self._writable
+
+
+    def close(self):
+        """
+
+        """
+        self._finalizer()
+
+    def get_db_object(self):
+        """
+
+        """
+        if self.readable:
+            return self._session.get_object(self.db_key)
+        else:
+            raise ValueError('Remote is not readable.')
+
+    def put_db_object(self, data: bytes, metadata={}):
+        """
+
+        """
+        if self.writable:
+            return self._session.put_object(self.db_key, data, metadata=metadata)
+        else:
+            raise ValueError('Remote is not writable.')
+
+    def get_object(self, key: str):
+        """
+
+        """
+        if self.readable:
+            return self._session.get_object(self.db_key + '/' + key)
+        else:
+            raise ValueError('Remote is not readable.')
+
+    def put_object(self, key: str, data: bytes, metadata={}):
+        """
+
+        """
+        if self.writable:
+            return self._session.put_object(self.db_key + '/' + key, data, metadata=metadata)
+        else:
+            raise ValueError('Remote is not writable.')
+
+    def list_objects(self):
+        """
+
+        """
+        if self.readable:
+            return self._session.list_objects(prefix=self.db_key)
+        else:
+            raise ValueError('Remote is not readable.')
+
+    def delete_objects(self, keys):
+        """
+        Delete objects
+        """
+        if self.writable:
+            del_list = []
+            resp = self._session.list_object_versions(prefix=self.db_key + '/')
+            for obj in resp.iter_objects():
+                key0 = obj['key']
+                key = key0.split('/')[-1]
+                if key in keys:
+                    del_list.append({'Key': key0, 'VersionId': obj['version_id']})
+
+            del_resp = self._session.delete_objects(del_list)
+            if del_resp.status // 100 != 2:
+                raise urllib3.exceptions.HTTPError(del_resp.error)
+        else:
+            raise ValueError('Remote is not writable.')
+
+
+    def delete_remote(self):
+        """
+
+        """
+        if self.writable:
+            del_list = []
+            resp = self._session.list_object_versions(prefix=self.db_key)
+            for obj in resp.iter_objects():
+                key0 = obj['key']
+                del_list.append({'Key': key0, 'VersionId': obj['version_id']})
+
+            del_resp = self._session.delete_objects(del_list)
+            if del_resp.status // 100 != 2:
+                raise urllib3.exceptions.HTTPError(del_resp.error)
+        else:
+            raise ValueError('Remote is not writable.')
+
+
+    def lock(self):
+        """
+
+        """
+        lock = self._session.s3lock(self.db_key)
+        return lock
+
+
+
+class S3Remote(BaseS3Remote):
+    """
+
+    """
+    def __init__(self,
+                db_key: str,
+                bucket: str,
+                connection_config: Union[s3func.utils.S3ConnectionConfig, s3func.utils.B2ConnectionConfig],
+                threads: int=20,
+                read_timeout: int=60,
+                retries: int=3,
+                ):
+        """
+
+        """
+        ## Set up the session
+        session = s3func.S3Session(connection_config, bucket, threads, read_timeout=read_timeout, stream=False, max_attempts=retries)
+
+        self.db_key = db_key
+
+        ## Check for read and write access
+        self._readable_check = False
+        self._writable_check = False
+        self._readable = False
+        self._writable = False
+
+        # resp_obj = self.get_db_object()
+        # if resp_obj.status == 200:
+        #     self.readable = True
+
+        #     self._init_bytes = resp_obj.data
+
+        #     self.timestamp = booklet.utils.bytes_to_int(self._init_bytes[booklet.utils.file_timestamp_pos:booklet.utils.file_timestamp_pos + booklet.utils.timestamp_bytes_len])
+
+        #     self.uuid = uuid.UUID(bytes=bytes(self._init_bytes[49:65]))
+
+            # if object_lock:
+            #     lock = session.s3lock(db_key)
+
+            #     if break_other_locks:
+            #         lock.break_other_locks()
+
+            #     lock.aquire(timeout=lock_timeout)
+
+            # put_resp = session.put_object(test_key, b'0')
+            # if put_resp.status == 200:
+            #     self.writable = True
+            #     _ = session.delete_object(test_key, put_resp.metadata['version_id'])
+
+        ## Finalizer
+        self._finalizer = weakref.finalize(self, session._client.close)
+
+        ## Assign properties
+        self.db_key = db_key
+        self._bucket = bucket
+        self._connection_config = connection_config
+        self._threads = threads
+        self._read_timeout = read_timeout
+        self._retries = retries
+        # self._lock_timeout = lock_timeout
+        # self.lock = lock
+        self._session = session
+        self._init_bytes = None
+
+
+class HttpRemote(BaseRemote):
+    """
+    Only get requests work.
+    """
+    def __init__(self,
+                db_url: str,
+                threads: int=20,
+                read_timeout: int=60,
+                retries: int=3,
+                headers=None
+                ):
+        """
+
+        """
+        self._readable_check = False
+        self._writable_check = False
+        self._readable = False
+        self._writable = False
+
+        session = s3func.HttpSession(threads, read_timeout=read_timeout, stream=False, max_attempts=retries)
+
+        self._finalizer = weakref.finalize(self, session._session.clear)
+
+        ## Assign properties
+        self.db_key = db_url
+        self._threads = threads
+        self._read_timeout = read_timeout
+        self._retries = retries
+        self._session = session
+        self._init_bytes = None
+
+
+    def close(self):
+        """
+
+        """
+        self._finalizer()
+
+    def get_db_object(self):
+        """
+
+        """
+        if self.readable:
+            return self._session.get_object(self.db_key)
+        else:
+            raise ValueError('Remote is not readable.')
+
+    def get_object(self, key: str):
+        """
+
+        """
+        return self._session.get_object(self.db_key + '/' + key)
+
+    @property
+    def readable(self):
+        """
+
+        """
+        if not self._readable_check:
+            resp_obj = self.get_db_object()
+            if resp_obj.status == 200:
+                self._readable = True
+
+                self._init_bytes = resp_obj.data
+
+                self.timestamp = booklet.utils.bytes_to_int(self._init_bytes[booklet.utils.file_timestamp_pos:booklet.utils.file_timestamp_pos + booklet.utils.timestamp_bytes_len])
+
+                self.uuid = uuid.UUID(bytes=bytes(self._init_bytes[49:65]))
+            elif resp_obj.status == 404:
+                self._readable = True
+
+            self._readable_check = True
+
+        return self._readable
+
+
 class Bookcase:
     """
 
     """
     def __init__(self,
-                 local_db_path: Union[str, pathlib.Path],
-                 remote_url: str=None,
-                 write: bool = False,
-                 remote_db_key: str=None,
-                 bucket: str=None,
-                 connection_config: Union[s3func.utils.S3ConnectionConfig, s3func.utils.B2ConnectionConfig]=None,
+                 file_path: Union[str, pathlib.Path],
+                 flag: str = "r",
                  value_serializer: str = None,
-                 buffer_size: int=524288,
-                 read_timeout: int=120,
-                 threads: int=20,
-                 lock_timeout=-1,
-                 break_other_locks=False,
-                 **local_storage_kwargs,
+                 n_buckets: int=12007,
+                 buffer_size: int = 2**22,
+                 remote: Union[BaseRemote, str]=None
                  ):
         """
 
         """
         ## Pre-processing
-        if local_db_path is None:
+        if file_path is None:
             temp_path = pathlib.Path(tempfile.TemporaryDirectory().name)
             local_meta_path = temp_path.joinpath('temp.bcs')
             self._finalizer = weakref.finalize(self, shutil.rmtree, temp_path, True)
         else:
-            local_meta_path = pathlib.Path(local_db_path)
+            local_meta_path = pathlib.Path(file_path)
             temp_path = None
 
         # local_meta_path = pathlib.Path(local_db_path)
@@ -289,9 +650,6 @@ class Bookcase:
             value_serializer_code = booklet.serializers.serial_name_dict[value_serializer]
         else:
             raise ValueError(f'value_serializer must be one of {booklet.available_serializers}.')
-
-        ## Check the remote config
-        http_session, s3_session, remote_s3_access, remote_http_access, host_url, remote_base_url = utils.init_remote_config(bucket, connection_config, remote_url, threads, read_timeout)
 
         ## Create S3 lock for writes
         if write and remote_s3_access:
@@ -455,30 +813,55 @@ class Bookcase:
             return False
 
 
-class Book(MutableMapping):
+class EBooklet(MutableMapping):
     """
 
     """
     def __init__(
             self,
-            # local_db_path: Union[str, pathlib.Path],
-            # remote_url: HttpUrl=None,
-            # flag: str = "r",
-            # remote_db_key: str=None,
-            # bucket: str=None,
-            # connection_config: Union[s3func.utils.S3ConnectionConfig, s3func.utils.B2ConnectionConfig]=None,
-            # value_serializer: str = None,
-            # buffer_size: int=524288,
-            # read_timeout: int=60,
-            # threads: int=20,
-            # **local_storage_kwargs,
-            bookcase: Bookcase,
-            book_hash: str,
-            flag: str
+            file_path: Union[str, pathlib.Path],
+            flag: str = "r",
+            value_serializer: str = None,
+            n_buckets: int=12007,
+            buffer_size: int = 2**22,
+            remote: Union[BaseRemote, str, list]=None,
+            inherit_remote: Union[BaseRemote, str]=None,
+            inherit_data: bool=False,
             ):
         """
 
         """
+        ## Inherit another remote
+        if (inherit_remote is not None) and (flag in ('c', 'n')):
+            if isinstance(inherit_remote, str):
+                inherit_remote = HttpRemote(inherit_remote)
+            elif not isinstance(inherit_remote, BaseRemote):
+                raise TypeError('inherit_remote must be either a Remote or a url string.')
+
+            # TODO: Pull down the remote ebooklet and assign it to this new object
+
+        ## Determine the remotes that read and write
+        self._read_remote = None
+        self._write_remote = None
+        if remote:
+            if isinstance(remote, list):
+                for r in remote:
+                    if isinstance(r, HttpRemote):
+                        self._read_remote = r
+                    elif isinstance(r, S3Remote):
+                        self._write_remote = r
+                        if self._read_remote is None:
+                            self._read_remote = r
+            elif isinstance(r, HttpRemote):
+                self._read_remote = r
+            elif isinstance(r, S3Remote):
+                self._read_remote = r
+                self._write_remote = r
+
+        ## Init the local file
+        local_file_path = pathlib.Path(file_path)
+
+
         book_file_name = bookcase._local_meta_path.name + f'.{book_hash}.'
         book_base_path = bookcase._local_meta_path.parent.joinpath(book_file_name)
 
@@ -610,7 +993,7 @@ class Book(MutableMapping):
 
     def __len__(self):
         """
-        
+
         """
         if self._remote_index:
             return len(self._remote_index)
@@ -744,10 +1127,10 @@ class Book(MutableMapping):
 
     def pull_remote_index(self):
         """
-    
+
         """
         remote_index_path = utils.get_remote_index_file(self._book_base_path, self._book_hash, self._remote_db_key, self._remote_url, self._http_session, self._s3_session, self.remote_http_access, self.remote_s3_access, True)
-    
+
         return remote_index_path
 
 

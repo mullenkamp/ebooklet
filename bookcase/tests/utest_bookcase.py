@@ -5,7 +5,7 @@ try:
     import tomllib as toml
 except ImportError:
     import tomli as toml
-from s3func import s3, http_url
+from s3func import S3Session, HttpSession, B2Session
 
 #################################################
 ### Parameters
@@ -30,21 +30,25 @@ flag = "n"
 buffer_size = 524288
 read_timeout = 60
 threads = 10
-file_name = 'test.s3dbm'
+file_name = 'gwrc_flow_sensor_datasets.csv'
 local_db_path = script_path.joinpath(file_name)
 # remote_db_key = uuid.uuid4().hex
-remote_db_key = file_name
+db_key = file_name
 # remote_db_key = 'gwrc_flow_sensor_sites.gpkg'
 # remote_db_key = '802037bfcd1c47359b36affdc893c7cc'
-key = 'stns_data.blt'
+key = 'gwrc_flow_sensor_datasets.csv'
 base_url = 'https://b2.tethys-ts.xyz/file/' + bucket + '/'
-remote_url = base_url +  remote_db_key
+remote_url = base_url +  db_key
+db_url = remote_url
 value_serializer = 'pickle_zstd'
-remote_object_lock=False
+retries: int=3
+object_lock=False
+break_other_locks=False
 init_remote=True
+lock_timeout=-1
 local_storage_kwargs = {}
 
-s3 = s3.client(conn_config)
+# s3 = s3.client(conn_config)
 
 
 ################################################

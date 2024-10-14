@@ -15,7 +15,7 @@ import hashlib
 from hashlib import blake2b
 import booklet
 import orjson
-from s3func import S3Session, HttpSession, s3
+from s3func import S3Session, HttpSession
 import urllib3
 import shutil
 from datetime import datetime, timezone
@@ -77,38 +77,18 @@ local_storage_options = ('write_buffer_size', 'n_bytes_file', 'n_bytes_key', 'n_
 ############################################
 ### Functions
 
-
-def hash_book_name(book_name):
+def fake_finalizer():
+    """
+    The finalizer function for S3Remote instances.
     """
 
+
+def s3remote_finalizer(lock):
     """
-    return blake2b(book_name.encode(), digest_size=12).hexdigest()
-
-
-def bytes_to_int(b, signed=False):
+    The finalizer function for S3Remote instances.
     """
-    Remember for a single byte, I only need to do b[0] to get the int. And it's really fast as compared to the function here. This is only needed for bytes > 1.
-    """
-    return int.from_bytes(b, 'little', signed=signed)
-
-
-def int_to_bytes(i, byte_len, signed=False):
-    """
-
-    """
-    return i.to_bytes(byte_len, 'little', signed=signed)
-
-
-def make_timestamp(value=None):
-    """
-    Milliseconds should have at least 6 bytes for storage, while microseconds should have 7 bytes.
-    """
-    if value is None:
-        value = datetime.now(timezone.utc)
-
-    int_us = int(value.timestamp() * 1000000)
-
-    return int_us
+    if lock:
+        lock.release()
 
 
 def bookcase_finalizer(temp_path, lock):
@@ -136,12 +116,57 @@ def write_metadata(local_meta_path, meta):
     """
 
     """
-    meta_bytes = zstd.compress(orjson.dumps(meta, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY), level=1)
+    meta_bytes = orjson.dumps(meta, option=orjson.OPT_SERIALIZE_NUMPY)
     with io.open(local_meta_path, 'wb') as f:
         f.write(meta_bytes)
 
 
-def init_remote_config(bucket, connection_config, remote_url, threads, read_timeout):
+def get_save_remote_file(local_path, remote_url, remote_db_key, http_session, s3_session, remote_s3_access, remote_http_access):
+    """
+
+    """
+    if remote_http_access:
+        func = http_session.get_object
+        key = remote_url
+    else:
+        func = s3_session.get_object
+        key = remote_db_key
+
+    resp = func(key)
+    if resp.status == 200:
+        with open(local_path, 'wb') as f:
+            f.write(resp.data)
+    else:
+        raise urllib3.exceptions.HTTPError(resp.error)
+
+
+def get_remote_file(remote_url, remote_db_key, http_session, s3_session, remote_s3_access, remote_http_access):
+    """
+
+    """
+    if remote_http_access:
+        func = http_session.get_object
+        key = remote_url
+    else:
+        func = s3_session.get_object
+        key = remote_db_key
+
+    resp = func(key)
+    if resp.status == 200:
+        return resp.data
+    else:
+        raise urllib3.exceptions.HTTPError(resp.error)
+
+
+def get_book_files(local_meta_path, remote_url, remote_db_key, http_session, s3_session, remote_s3_access, remote_http_access):
+    """
+    Function to get the book_index and book_metadata files from the remote.
+    """
+
+
+
+
+def init_remote_config(bucket, connection_config, remote_url, threads, read_timeout, retries):
     """
 
     """
@@ -155,7 +180,7 @@ def init_remote_config(bucket, connection_config, remote_url, threads, read_time
     if remote_url is not None:
         url_grp = urllib3.util.parse_url(remote_url)
         if url_grp.scheme is not None:
-            http_session = HttpSession(threads, read_timeout=read_timeout, stream=False)
+            http_session = HttpSession(threads, read_timeout=read_timeout, stream=False, max_attempts=retries)
             url_path = pathlib.Path(url_grp.path)
             remote_base_url = url_path.parent
             host_url = url_grp.scheme + '://' + url_grp.host
@@ -163,7 +188,7 @@ def init_remote_config(bucket, connection_config, remote_url, threads, read_time
         else:
             print(f'{remote_url} is not a proper url.')
     if (bucket is not None) and (connection_config is not None):
-        s3_session = S3Session(connection_config, bucket, threads, read_timeout=read_timeout, stream=False)
+        s3_session = S3Session(connection_config, bucket, threads, read_timeout=read_timeout, stream=False, max_attempts=retries)
         remote_s3_access = True
 
     # if (not remote_s3_access) and (flag != 'r'):
@@ -185,15 +210,12 @@ def init_metadata(local_meta_path, remote_keys_path, write, http_session, s3_ses
     else:
         int_us = 0
 
-    # version_date = datetime.fromtimestamp(int(int_us*0.000001)).strftime('%Y%m%dT%H%M%SZ')
-    # old_meta = None
     new_meta = {
         'package_version': version,
         'local_storage_kwargs': local_storage_kwargs,
         'value_serializer': value_serializer,
         'last_modified': int_us,
         'user_metadata': {},
-        'books': {},
         'default_book': None
         }
 
@@ -204,9 +226,9 @@ def init_metadata(local_meta_path, remote_keys_path, write, http_session, s3_ses
         # if write:
         #     portalocker.lock(local_meta_path, portalocker.LOCK_EX)
         # else:
-        #     portalocker.lock(local_meta_path, portalocker.LOCK_EX)
+        #     portalocker.lock(local_meta_path, portalocker.LOCK_SH)
         with io.open(local_meta_path, 'rb') as f:
-            local_meta = orjson.loads(zstd.decompress(f.read()))
+            local_meta = orjson.loads(f.read())
     elif not write:
         raise FileExistsError('Bookcase was open for read-only, but nothing exists to open.')
     else:
@@ -226,7 +248,7 @@ def init_metadata(local_meta_path, remote_keys_path, write, http_session, s3_ses
         if meta0.status == 200:
             if meta0.metadata['file_type'] != 'bookcase':
                 raise TypeError('The remote db file is not a bookcase file.')
-            remote_meta = orjson.loads(zstd.decompress(meta0.data))
+            remote_meta = orjson.loads(meta0.data)
             meta_in_remote = True
 
             ## Remote meta is the only meta needed now
@@ -301,47 +323,90 @@ def create_book(local_meta_path, meta, book_name, book_hash, remote_s3_access):
     return meta
 
 
-def init_local_storage(book_base_path, flag, meta):
+def init_local_file(local_file_path, flag, read_remote, value_serializer, n_buckets, buffer_size):
     """
 
     """
-    local_data_path = book_base_path.parent.joinpath(book_base_path.name + 'local_data')
-    local_index_path = book_base_path.parent.joinpath(book_base_path.name + 'local_index')
+    overwrite_remote_index = False
+    if local_file_path.exists():
 
-    if not local_data_path.exists() or not local_index_path.exists():
-        ## Create local data file
-        with booklet.open(local_data_path, flag='n', **meta['local_storage_kwargs']):
-            pass
-        with booklet.FixedValue(local_index_path, 'n', key_serializer='str', value_len=7):
-            pass
+        if read_remote.readable:
+            ## Check the uuid
+            remote_uuid = read_remote.uuid
 
-    return local_data_path, local_index_path
+            with booklet.open(local_file_path) as f:
+                local_uuid = f.uuid
+                local_timestamp = f._file_timestamp
 
+            if remote_uuid != local_uuid:
+                raise ValueError('The local file has a different UUID than the remote. Use a different local file path or delete the existing one.')
 
-def get_remote_index_file(book_base_path, book_hash, remote_db_key, remote_url, http_session, s3_session, remote_http_access, remote_s3_access, overwrite=False):
-    """
+            ## Check timestamp to determine if the local remote_index needs to be updated
+            if read_remote.timestamp > local_timestamp:
+                overwrite_remote_index = True
 
-    """
-    remote_index_path = book_base_path.parent.joinpath(book_base_path.name + 'remote_index')
+    else:
+        if read_remote.readable:
+            ## Init with the remote bytes - keeps the remote uuid and timestamp
+            with booklet.open(local_file_path, flag='n', init_bytes=read_remote._init_bytes):
+                pass
 
-    if not remote_index_path.exists() or overwrite:
-        if remote_http_access:
-            remote_index_key = remote_url + f'{book_hash}.remote_index'
-            func = http_session.get_object
-        elif remote_s3_access:
-            remote_index_key = remote_db_key + f'{book_hash}.remote_index'
-            func = s3_session.get_object
+            overwrite_remote_index = True
         else:
-            return remote_index_path
+            ## Else create a new file
+            with booklet.open(local_file_path, flag='n', key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size):
+                pass
 
-        index0 = func(remote_index_key)
-        if index0.status == 200:
-            with open(remote_index_path, 'wb') as f:
-                shutil.copyfileobj(index0.data, f)
-        elif index0.status != 404:
-            raise urllib3.exceptions.HTTPError(index0.error)
+    return local_file_path, overwrite_remote_index
+
+
+def get_remote_index_file(local_file_path, overwrite_remote_index, read_remote):
+    """
+
+    """
+    remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
+
+    if not remote_index_path.exists() or overwrite_remote_index:
+        if read_remote.readable:
+            remote_index_key = read_remote.db_key + '.remote_index'
+            func = read_remote.get_object
+
+            index0 = func(remote_index_key)
+            if index0.status == 200:
+                with open(remote_index_path, 'wb') as f:
+                    shutil.copyfileobj(index0.data, f)
+            elif index0.status != 404:
+                raise urllib3.exceptions.HTTPError(index0.error)
+        else:
+            remote_index_path = None
 
     return remote_index_path
+
+
+# def get_remote_index_file(book_base_path, book_hash, remote_db_key, remote_url, http_session, s3_session, remote_http_access, remote_s3_access, overwrite=False):
+#     """
+
+#     """
+#     remote_index_path = book_base_path.parent.joinpath(book_base_path.name + 'remote_index')
+
+#     if not remote_index_path.exists() or overwrite:
+#         if remote_http_access:
+#             remote_index_key = remote_url + f'{book_hash}.remote_index'
+#             func = http_session.get_object
+#         elif remote_s3_access:
+#             remote_index_key = remote_db_key + f'{book_hash}.remote_index'
+#             func = s3_session.get_object
+#         else:
+#             return remote_index_path
+
+#         index0 = func(remote_index_key)
+#         if index0.status == 200:
+#             with open(remote_index_path, 'wb') as f:
+#                 shutil.copyfileobj(index0.data, f)
+#         elif index0.status != 404:
+#             raise urllib3.exceptions.HTTPError(index0.error)
+
+#     return remote_index_path
 
 
 def get_remote_value(local_data, local_index, remote_index, key, remote_s3_access, remote_http_access, s3_session=None, http_session=None, host_url=None, remote_base_url=None):

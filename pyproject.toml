@@ -11,10 +11,10 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-  's3func>=0.5',
+  's3func>=0.6',
   'zstandard',
   'urllib3>=2',
-  'booklet>=0.3',
+  'booklet>=0.5',
   'orjson'
 ]
 
