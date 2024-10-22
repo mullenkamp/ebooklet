@@ -1,8 +1,8 @@
-site_name: bookcase
+site_name: ebooklet
 site_description: Organise all your data in key/value books and sync them with S3.
 
-repo_url: https://github.com/mullenkamp/bookcase
-repo_name: mullenkamp/bookcase
+repo_url: https://github.com/mullenkamp/ebooklet
+repo_name: mullenkamp/ebooklet
 
 theme:
     name: material
@@ -50,9 +50,9 @@ plugins:
 
 watch:
     - docs
-    - bookcase
+    - ebooklet
 
 nav:
     - About: index.md
     - Reference:
-        - bookcase: reference/bookcase.md
+        - ebooklet: reference/ebooklet.md

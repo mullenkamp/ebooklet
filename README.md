@@ -1,18 +1,18 @@
-# bookcase
+# ebooklet
 
 <p align="center">
     <em>Organise all your data in key/value books and sync them with S3.</em>
 </p>
 
-[![build](https://github.com/mullenkamp/bookcase/workflows/Build/badge.svg)](https://github.com/mullenkamp/bookcase/actions)
-[![codecov](https://codecov.io/gh/mullenkamp/bookcase/branch/master/graph/badge.svg)](https://codecov.io/gh/mullenkamp/bookcase)
-[![PyPI version](https://badge.fury.io/py/bookcase.svg)](https://badge.fury.io/py/bookcase)
+[![build](https://github.com/mullenkamp/ebooklet/workflows/Build/badge.svg)](https://github.com/mullenkamp/ebooklet/actions)
+[![codecov](https://codecov.io/gh/mullenkamp/ebooklet/branch/master/graph/badge.svg)](https://codecov.io/gh/mullenkamp/ebooklet)
+[![PyPI version](https://badge.fury.io/py/ebooklet.svg)](https://badge.fury.io/py/ebooklet)
 
 ---
 
-**Documentation**: <a href="https://mullenkamp.github.io/bookcase/" target="_blank">https://mullenkamp.github.io/bookcase/</a>
+**Documentation**: <a href="https://mullenkamp.github.io/ebooklet/" target="_blank">https://mullenkamp.github.io/ebooklet/</a>
 
-**Source Code**: <a href="https://github.com/mullenkamp/bookcase" target="_blank">https://github.com/mullenkamp/bookcase</a>
+**Source Code**: <a href="https://github.com/mullenkamp/ebooklet" target="_blank">https://github.com/mullenkamp/ebooklet</a>
 
 ---
 

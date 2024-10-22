@@ -1,5 +1,5 @@
-{% set name = "bookcase" %}
-{% set package_name = "bookcase" %}
+{% set name = "ebooklet" %}
+{% set package_name = "ebooklet" %}
 {% set version = "0.1.0" %}
 # {% set sha256 = "72a156e328247c91cb7f5440ffa98069c0090892f8d9d07fd57e36c0611a0403" %}
 
@@ -38,16 +38,19 @@ requirements:
     - hatchling
   run:
     - python >=3.10
+    - s3func >=0.6
+    - urllib3 >=2
+    - booklet >=0.7.4
 
 test:
   imports:
-    - bookcase
+    - ebooklet
 
 about:
-  home: https://github.com/mullenkamp/bookcase
+  home: https://github.com/mullenkamp/ebooklet
   license: Apache Software License 2.0
   license_family: APACHE
   summary: ""
   description: Organise all your data in key/value books and sync them with S3.
-  doc_url: https://mullenkamp.github.io/bookcase/
+  doc_url: https://mullenkamp.github.io/ebooklet/
   dev_url: ''

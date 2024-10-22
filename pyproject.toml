@@ -1,7 +1,7 @@
 [project]
-name = "bookcase"
+name = "ebooklet"
 authors = [
-  { name = "bookcase", email = "mullenkamp1@gmail.com" }
+  { name = "Mike", email = "mullenkamp1@gmail.com" }
 ]
 description = "Organise all your data in key/value booklets and sync them with S3"
 readme = "README.md"
@@ -12,10 +12,8 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
   's3func>=0.6',
-  'zstandard',
   'urllib3>=2',
-  'booklet>=0.5',
-  'orjson'
+  'booklet>=0.7.4',
 ]
 
 # [tool.ruff]
@@ -23,7 +21,7 @@ dependencies = [
 # extend-select = ["I", "TRY", "UP"]
 
 # [tool.pytest.ini_options]
-# addopts = "--cov=bookcase/ --cov-report=term-missing"
+# addopts = "--cov=ebooklet/ --cov-report=term-missing"
 
 
 [tool.hatch]
@@ -34,7 +32,7 @@ allow-direct-references = true
 # [tool.hatch.version]
 # source = "regex_commit"
 # commit_extra_args = ["-e"]
-# path = "bookcase/__init__.py"
+# path = "ebooklet/__init__.py"
 
 [tool.hatch.envs.default]
 python = "3.10"
@@ -61,7 +59,7 @@ dependencies = [
   "ruff>=0.0.243",
 ]
 [tool.hatch.envs.lint.scripts]
-typing = "mypy --install-types --non-interactive {args:src/bookcase tests}"
+typing = "mypy --install-types --non-interactive {args:src/ebooklet tests}"
 style = [
   "ruff {args:.}",
   "black --check --diff {args:.}",
@@ -141,7 +139,7 @@ unfixable = [
 ]
 
 [tool.ruff.isort]
-known-first-party = ["bookcase"]
+known-first-party = ["ebooklet"]
 
 [tool.ruff.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -151,16 +149,16 @@ ban-relative-imports = "all"
 "tests/**/*" = ["PLR2004", "S101", "TID252"]
 
 [tool.coverage.run]
-source_pkgs = ["bookcase", "tests"]
+source_pkgs = ["ebooklet", "tests"]
 branch = true
 parallel = true
 omit = [
-  "src/bookcase/__about__.py",
+  "src/ebooklet/__about__.py",
 ]
 
 [tool.coverage.paths]
-bookcase = ["src/bookcase", "*/bookcase/src/bookcase"]
-tests = ["tests", "*/bookcase/tests"]
+ebooklet = ["src/ebooklet", "*/ebooklet/src/ebooklet"]
+tests = ["tests", "*/ebooklet/tests"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -174,16 +172,16 @@ requires = ["hatchling", "hatch-regex-commit"]
 build-backend = "hatchling.build"
 
 [project.urls]
-Documentation = "https://mullenkamp.github.io/bookcase/"
-Source = "https://github.com/mullenkamp/bookcase"
+Documentation = "https://mullenkamp.github.io/ebooklet/"
+Source = "https://github.com/mullenkamp/ebooklet"
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "/bookcase",
+    "/ebooklet",
 ]
 exclude = [
-  "/bookcase/tests/*",
+  "/ebooklet/tests/*",
 ]
 
 [tool.hatch.version]
-path = "bookcase/__init__.py"
+path = "ebooklet/__init__.py"

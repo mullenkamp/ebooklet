@@ -111,6 +111,7 @@ ENV/
 .DS_Store
 
 ## Other files
-/bookcase/tests/*.blt
-/bookcase/tests/*.toml
-/bookcase/tests/*.yml
+/ebooklet/tests/*.blt
+/ebooklet/tests/*.blt.*
+/ebooklet/tests/*.toml
+/ebooklet/tests/*.yml
