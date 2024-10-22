@@ -126,6 +126,7 @@ list(changes.iter_changes())
 changes.discard()
 
 changes.push()
+changes.pull()
 
 self = EBooklet(
     remote,

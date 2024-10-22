@@ -59,7 +59,7 @@ class Change:
         """
         self._ebooklet.sync()
         self._ebooklet._read_remote._parse_db_object()
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_remote)
+        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_remote, self._ebooklet._flag)
         if overwrite_remote_index:
             utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_remote)
 
@@ -94,7 +94,8 @@ class Change:
                 # print(key)
                 del self._ebooklet._local_file[key]
 
-        self.update()
+        self._changelog_path.unlink()
+        self._changelog_path = None
 
 
     def push(self, force_push=False):
