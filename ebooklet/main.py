@@ -21,13 +21,15 @@ import weakref
 import shutil
 import uuid6 as uuid
 import urllib3
+from itertools import count
+from collections import deque
 # import portalocker
 
-import utils
-# from . import utils
+# import utils
+from . import utils
 
-import remotes
-# from . import remotes
+# import remotes
+from . import remotes
 
 # uuid_s3dbm = b'K=d:\xa89F(\xbc\xf5 \xd7$\xbd;\xf2'
 # version = 1
@@ -58,10 +60,16 @@ class Change:
 
         """
         self._ebooklet.sync()
-        self._ebooklet._read_remote._parse_db_object()
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_remote, self._ebooklet._flag)
+
+        ## update the remote timestamp
+        self._ebooklet._read_remote.get_timestamp_db_object()
+
+        ## Determine if a change has occurred
+        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_remote, self._ebooklet._flag, True)
+
+        ## Pull down the remote index
         if overwrite_remote_index:
-            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_remote)
+            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_remote, self._ebooklet._flag)
 
 
     def update(self):
@@ -84,6 +92,9 @@ class Change:
         """
         Removes changed keys in the local file. If keys is None, then removes all changed keys.
         """
+        if not self._ebooklet.writable:
+            raise ValueError('File is open for read-only.')
+
         with booklet.FixedValue(self._changelog_path) as f:
             if keys is None:
                 rm_keys = f.keys()
@@ -106,6 +117,9 @@ class Change:
         if not self._ebooklet._write_remote.writable:
             raise ValueError('Remote is not writable.')
 
+        if not self._ebooklet.writable:
+            raise ValueError('File is open for read-only.')
+
         self.update()
 
         # if self._remote_index is None:
@@ -124,7 +138,7 @@ class Change:
 
             if self._ebooklet._read_remote.uuid is None:
                 self._ebooklet._read_remote._parse_db_object()
-                self._ebooklet._write_remote._parse_db_object()
+                # self._ebooklet._write_remote._parse_db_object()
 
         return success
 
@@ -497,6 +511,7 @@ class EBooklet(MutableMapping):
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
+            init_check_remote: bool=True,
             # lock_remote: bool=True,
             # break_other_locks=False,
             # inherit_remote: Union[remotes.BaseRemote, str]=None,
@@ -514,19 +529,27 @@ class EBooklet(MutableMapping):
 
             # TODO: Pull down the remote ebooklet and assign it to this new object
 
-        ## Determine the remotes that read and write
-        read_remote, write_remote, lock = utils.check_parse_remotes(remote, flag, lock_remote, break_other_locks)
+        check_timestamp = init_check_remote
 
-        ## Init the local file
         local_file_path = pathlib.Path(file_path)
 
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_remote, value_serializer, n_buckets, buffer_size)
+        local_file_exists = local_file_path.exists()
+
+        ## Determine the remotes that read and write
+        read_remote, write_remote, lock = utils.check_parse_remotes(remote, flag, check_timestamp, lock_remote, break_other_locks, local_file_exists)
+
+        ## Init the local file
+        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_remote, value_serializer, n_buckets, buffer_size, check_timestamp)
 
         remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_remote, flag)
 
         # Open remote index file
-        if remote_index_path.exists() and (flag != 'n'):
-            remote_index = booklet.FixedValue(remote_index_path, 'w')
+        if remote_index_path.exists():
+            remote_index = booklet.FixedValue(remote_index_path, 'r')
+            # if flag == 'r':
+            #     remote_index = booklet.FixedValue(remote_index_path, 'r')
+            # elif flag in ('w', 'c'):
+            #     remote_index = booklet.FixedValue(remote_index_path, 'w')
         else:
             remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
@@ -549,6 +572,7 @@ class EBooklet(MutableMapping):
         self._read_remote = read_remote
         self._write_remote = write_remote
         # self._changelog_path = None
+        self._n_buckets = local_file._n_buckets
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_remote._threads)
 
 
@@ -595,10 +619,15 @@ class EBooklet(MutableMapping):
         """
 
         """
-        if self._remote_index is not None:
-            return self._remote_index.keys()
-        else:
-            return self._local_file.keys()
+        overlap = set()
+        for key in self._local_file.keys():
+            if key in self._remote_index:
+                overlap.add(key)
+            yield key
+
+        for key in self._remote_index.keys():
+            if key not in overlap:
+                yield key
 
 
     def items(self):
@@ -673,18 +702,17 @@ class EBooklet(MutableMapping):
         """
 
         """
-        if self._remote_index is not None:
-            return len(self._remote_index)
-        else:
-            return len(self._local_file)
+        counter = count()
+        deque(zip(self.keys(), counter), maxlen=0)
+
+        return next(counter)
 
 
     def __contains__(self, key):
-        if self._remote_index is not None:
-            return key in self._remote_index
+        if (key in self._remote_index) or (key in self._local_file):
+            return True
         else:
-            return key in self._local_file
-
+            return False
 
     def get(self, key, default=None):
         failure = self._load_item(key)
@@ -709,8 +737,11 @@ class EBooklet(MutableMapping):
         """
         Prunes the old keys and associated values. Returns the number of removed items. The method can also prune remove keys/values older than the timestamp. The user can also reindex the booklet file. False does no reindexing, True increases the n_buckets to a preassigned value, or an int of the n_buckets. True can only be used if the default n_buckets were used at original initialisation.
         """
-        if self._write:
-                return self._local_file.prune(timestamp=timestamp, reindex=reindex)
+        if self.writable:
+            removed = self._local_file.prune(timestamp=timestamp, reindex=reindex)
+            self._n_buckets = self._local_file._n_buckets
+
+            return removed
         else:
             raise ValueError('File is open for read only.')
 
@@ -737,6 +768,11 @@ class EBooklet(MutableMapping):
         futures = {}
         failure_dict = {}
 
+        writable = self._local_file.writable
+
+        if not writable:
+            self._local_file.reopen('w')
+
         if keys is None:
             for key, remote_time_bytes in self._remote_index.items():
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
@@ -757,6 +793,9 @@ class EBooklet(MutableMapping):
             if error is not None:
                 failure_dict[key] = error
 
+        if not writable:
+            self._local_file.reopen('r')
+
         return failure_dict
 
 
@@ -768,7 +807,12 @@ class EBooklet(MutableMapping):
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
-            failure = utils.get_remote_value(self._local_file, key, self._read_remote)
+            if not self._local_file.writable:
+                self._local_file.reopen('w')
+                failure = utils.get_remote_value(self._local_file, key, self._read_remote)
+                self._local_file.reopen('r')
+            else:
+                failure = utils.get_remote_value(self._local_file, key, self._read_remote)
             return failure
         else:
             return None
@@ -791,7 +835,7 @@ class EBooklet(MutableMapping):
 
     def __delitem__(self, key):
         if self.writable:
-            if self._remote_index is not None:
+            if key in self._remote_index:
                 del self._remote_index[key]
                 self._deletes.add(key)
 
@@ -835,6 +879,19 @@ class EBooklet(MutableMapping):
 
     def changes(self):
         return Change(self)
+
+
+    def reopen(self, flag):
+        """
+
+        """
+        self.close()
+        self._local_file.reopen(flag)
+        self._remote_index.reopen(flag)
+
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_remote._threads)
+
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_remote, self._write_remote, None)
 
 
     # def pull(self):

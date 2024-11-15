@@ -1,11 +1,16 @@
 import pytest
 import os, pathlib
-import uuid
+import uuid6 as uuid
+from tempfile import NamedTemporaryFile
 try:
     import tomllib as toml
 except ImportError:
     import tomli as toml
-from s3func import s3, http_url
+from s3func import S3Session, HttpSession, B2Session
+import booklet
+import ebooklet
+from ebooklet import __version__, EBooklet, remotes
+from copy import deepcopy
 
 #################################################
 ### Parameters
@@ -23,6 +28,8 @@ except:
         'aws_secret_access_key': os.environ['aws_secret_access_key'],
         }
 
+# tf = NamedTemporaryFile()
+# file_path = tf.name
 
 connection_config = conn_config
 bucket = 'achelous'
@@ -30,21 +37,33 @@ flag = "n"
 buffer_size = 524288
 read_timeout = 60
 threads = 10
-file_name = 'test.s3dbm'
-local_db_path = script_path.joinpath(file_name)
-# remote_db_key = uuid.uuid4().hex
-remote_db_key = file_name
-# remote_db_key = 'gwrc_flow_sensor_sites.gpkg'
-# remote_db_key = '802037bfcd1c47359b36affdc893c7cc'
-key = 'stns_data.blt'
+# db_key = 'test.blt'
+db_key = uuid.uuid8().hex[:13]
+file_path = script_path.joinpath(db_key)
 base_url = 'https://b2.tethys-ts.xyz/file/' + bucket + '/'
-remote_url = base_url +  remote_db_key
-value_serializer = 'pickle_zstd'
+db_url = base_url +  db_key
+value_serializer = 'pickle'
 remote_object_lock=False
 init_remote=True
 local_storage_kwargs = {}
 
-s3 = s3.client(conn_config)
+data_dict = {str(key): key*2 for key in range(2, 30)}
+
+data = deepcopy(data_dict)
+
+meta = {'test1': 'data'}
+
+
+
+################################################
+### Tests
+
+print(__version__)
+
+s3_remote = remotes.S3Remote(db_key, bucket, connection_config)
+http_remote = remotes.HttpRemote(db_url)
+
+remote = [s3_remote, http_remote]
 
 
 ################################################
@@ -71,188 +90,261 @@ def get_logs(request):
         # Add code here to cleanup failure scenario
         print("executing test failed")
 
-        obj_keys = []
-        for js in list_object_versions(s3, bucket):
-            if js['Key'] == obj_key:
-                obj_keys.append({'Key': js['Key'], 'VersionId': js['VersionId']})
+        s3open = s3_remote.open()
+        s3open.delete_remote()
 
-        if obj_keys:
-            delete_objects(s3, bucket, obj_keys)
+        file_path.unlink()
+        remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
+        remote_index_path.unlink()
+
 
     # elif request.node.rep_call.passed:
     #     # Add code here to cleanup success scenario
     #     print("executing test success")
 
-
 ################################################
-### Tests
-
-self = Bookcase(
-    local_db_path,
-    remote_url,
-    flag,
-    remote_db_key,
-    bucket,
-    connection_config,
-    value_serializer,
-    buffer_size=524288,
-    read_timeout=60,
-    threads=10,
-    break_other_locks=False,
-    **local_storage_kwargs
-    )
+### Normal local operations
 
 
-self['test1'] = list(range(100))
+def test_set_items():
+    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+        for key, value in data_dict.items():
+            f[key] = value
+
+    with EBooklet(http_remote, file_path) as f:
+        value = f['10']
+
+    assert value == data_dict['10']
 
 
+def test_update():
+    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+        f.update(data_dict)
 
-# @pytest.mark.parametrize(
-#     "a,b,result",
-#     [
-#         (0, 0, 0),
-#         (1, 1, 2),
-#         (3, 2, 5),
-#     ],
-# )
-# def test_add(a: int, b: int, result: int):
-#     assert add(a, b) == result
+    with EBooklet(http_remote, file_path) as f:
+        value = f['10']
+
+    assert value == data_dict['10']
 
 
-def test_put_object():
+def test_set_get_metadata():
     """
 
     """
-    ### Upload with bytes
-    with open(script_path.joinpath(file_name), 'rb') as f:
-        obj = f.read()
+    with EBooklet(remote, file_path, 'w') as f:
+        old_meta = f.get_metadata()
+        f.set_metadata(meta)
 
-    resp1 = put_object(s3, bucket, obj_key, obj)
+    assert old_meta is None
 
-    meta = resp1['ResponseMetadata']
-    if meta['HTTPStatusCode'] != 200:
-        raise ValueError('Upload failed')
+    with EBooklet(http_remote, file_path) as f:
+        new_meta = f.get_metadata()
 
-    resp1_etag = resp1['ETag']
-
-    ## Upload with a file-obj
-    resp2 = put_object(s3, bucket, obj_key, open(script_path.joinpath(file_name), 'rb'))
-
-    meta = resp2['ResponseMetadata']
-    if meta['HTTPStatusCode'] != 200:
-        raise ValueError('Upload failed')
-
-    resp2_etag = resp2['ETag']
-
-    assert resp1_etag == resp2_etag
+    assert new_meta == meta
 
 
-def test_list_objects():
-    """
+def test_set_get_timestamp():
+    with EBooklet(remote, file_path, 'w') as f:
+        ts_old, value = f.get_timestamp('10', True)
+        ts_new = booklet.utils.make_timestamp_int()
+        f.set_timestamp('10', ts_new)
 
-    """
-    count = 0
-    found_key = False
-    for i, js in enumerate(list_objects(s3, bucket)):
-        count += 1
-        if js['Key'] == obj_key:
-            found_key = True
+    with EBooklet(http_remote, file_path) as f:
+        ts_new = f.get_timestamp('10')
 
-    assert found_key
+    assert ts_new > ts_old and value == data_dict['10']
 
 
-def test_list_object_versions():
-    """
+def test_keys():
+    with EBooklet(http_remote, file_path) as f:
+        keys = set(list(f.keys()))
 
-    """
-    count = 0
-    found_key = False
-    for i, js in enumerate(list_object_versions(s3, bucket)):
-        count += 1
-        if js['Key'] == obj_key:
-            found_key = True
+    source_keys = set(list(data_dict.keys()))
 
-    assert found_key
+    assert source_keys == keys
 
 
-def test_get_object():
-    """
-
-    """
-    stream1 = get_object(obj_key, bucket, s3)
-    data1 = stream1.read()
-
-    stream2 = get_object(obj_key, bucket, connection_config=conn_config)
-    data2 = stream2.read()
-
-    assert data1 == data2
+def test_items():
+    with EBooklet(http_remote, file_path) as f:
+        for key, value in f.items():
+            source_value = data_dict[key]
+            assert source_value == value
 
 
-def test_url_to_stream():
-    """
+def test_timestamps():
+    with EBooklet(http_remote, file_path) as f:
+        for key, ts, value in f.timestamps(True):
+            source_value = data_dict[key]
+            assert source_value == value
 
-    """
-    stream1 = url_to_stream(url)
-    data1 = stream1.read()
-
-    stream2 = base_url_to_stream(obj_key, base_url)
-    data2 = stream2.read()
-
-    assert data1 == data2
+        ts_new = booklet.utils.make_timestamp_int()
+        for key, ts in f.timestamps():
+            assert ts_new > ts
 
 
-def test_legal_hold():
-    """
-
-    """
-    hold = get_object_legal_hold(s3, bucket, obj_key)
-    if hold:
-        raise ValueError("There's a hold, but there shouldn't be.")
-
-    put_object_legal_hold(s3, bucket, obj_key, True)
-
-    hold = get_object_legal_hold(s3, bucket, obj_key)
-    if not hold:
-        raise ValueError("There isn't a hold, but there should be.")
-
-    put_object_legal_hold(s3, bucket, obj_key, False)
-
-    hold = get_object_legal_hold(s3, bucket, obj_key)
-    if hold:
-        raise ValueError("There's a hold, but there shouldn't be.")
-
-    resp2 = put_object(s3, bucket, obj_key, open(script_path.joinpath(file_name), 'rb'), object_legal_hold=True)
-
-    hold = get_object_legal_hold(s3, bucket, obj_key)
-    if not hold:
-        raise ValueError("There isn't a hold, but there should be.")
-
-    put_object_legal_hold(s3, bucket, obj_key, False)
-
-    hold = get_object_legal_hold(s3, bucket, obj_key)
-    if hold:
-        raise ValueError("There's a hold, but there shouldn't be.")
+def test_contains():
+    with EBooklet(http_remote, file_path) as f:
+        for key in data_dict:
+            if key not in f:
+                raise KeyError(key)
 
     assert True
 
 
-def test_delete_objects():
-    """
+def test_len():
+    with EBooklet(http_remote, file_path) as f:
+        new_len = len(f)
 
-    """
-    obj_keys = []
-    for js in list_object_versions(s3, bucket):
-        if js['Key'] == obj_key:
-            obj_keys.append({'Key': js['Key'], 'VersionId': js['VersionId']})
+    assert len(data_dict) == new_len
 
-    delete_objects(s3, bucket, obj_keys)
 
-    found_key = False
-    for i, js in enumerate(list_object_versions(s3, bucket)):
-        if js['Key'] == obj_key:
-            found_key = True
+def test_delete_len():
+    indexes = ['11', '12']
 
-    assert not found_key
+    for index in indexes:
+        _ = data.pop(index)
+
+        with EBooklet(s3_remote, file_path, 'w') as f:
+            f[index] = 0
+            f[index] = 0
+            del f[index]
+
+            f.sync()
+
+            new_len = len(f)
+
+            try:
+                _ = f[index]
+                raise ValueError()
+            except KeyError:
+                pass
+
+        assert new_len == len(data)
+
+
+def test_items2():
+    with EBooklet(s3_remote, file_path, init_check_remote=False) as f:
+        for key, value in f.items():
+            source_value = data[key]
+            assert source_value == value
+
+
+def test_values():
+    with EBooklet(s3_remote, file_path) as f:
+        for value in f.values():
+            pass
+
+        for key, source_value in data.items():
+            value = f[key]
+            assert source_value == value
+
+
+def test_prune():
+    with EBooklet(s3_remote, file_path, 'w') as f:
+        old_len = len(f)
+        removed_items = f.prune()
+        new_len = len(f)
+        test_value = f['2']
+
+    assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
+
+    # Reindex
+    with EBooklet(s3_remote, file_path, 'w') as f:
+        old_len = len(f)
+        old_n_buckets = f._n_buckets
+        removed_items = f.prune(reindex=True)
+        new_n_buckets = f._n_buckets
+        new_len = len(f)
+        test_value = f['2']
+
+    assert (removed_items == 0) and (new_n_buckets > old_n_buckets) and (new_len == old_len) and isinstance(test_value, int)
+
+    # Remove the rest via timestamp filter
+    timestamp = booklet.utils.make_timestamp_int()
+
+    with EBooklet(s3_remote, file_path, 'w') as f:
+        removed_items = f.prune(timestamp=timestamp)
+        new_len = len(f)
+        meta = f.get_metadata()
+
+    assert (old_len == removed_items) and (new_len == 0) and isinstance(meta, dict)
+
+
+# def test_set_items_get_items():
+#     with EBooklet(remote, file_path, 'n', key_serializer='uint4', value_serializer='pickle') as f:
+#         for key, value in data_dict.items():
+#             f[key] = value
+
+#     with EBooklet(remote, file_path, 'w') as f:
+#         f[50] = [0, 0]
+#         value1 = f[10]
+#         value2 = f[50]
+
+#     assert (value1 == data_dict[10]) and (value2 == [0, 0])
+
+    # with EBooklet(file_path) as f:
+    #     value = f[50]
+    #     assert value == [0, 0]
+
+    #     value = f[10]
+    #     assert value == data_dict[10]
+
+## Always make this last!!!
+def test_clear():
+    with EBooklet(s3_remote, file_path, 'w') as f:
+        f.clear()
+        f_meta = f.get_metadata()
+
+        assert (len(f) == 0) and (len(list(f.keys())) == 0) and (f_meta is None)
+
+
+#############################################################
+### Sync with remotes
+
+
+def test_push():
+    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+        for key, value in data_dict.items():
+            f[key] = value
+
+        f.sync()
+
+        changes = f.changes()
+        print(list(changes.iter_changes()))
+        changes.push()
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path.unlink()
+
+
+def test_read_remote():
+    http_remote = remotes.HttpRemote(db_url)
+
+    with EBooklet(http_remote, file_path) as f:
+        value1 = f['10']
+        assert value1 == data_dict['10']
+
+        for key, value in f.items():
+            source_value = data_dict[key]
+            assert source_value == value
+
+
+##################################
+### Remove files
+
+def test_remove_remote_local():
+    s3open = s3_remote.open()
+    s3open.delete_remote()
+
+    file_path.unlink()
+    remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
+    remote_index_path.unlink()
+
+
+
+
+
 
 
 

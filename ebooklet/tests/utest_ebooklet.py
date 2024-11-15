@@ -1,6 +1,7 @@
 import pytest
 import os, pathlib
 import uuid6 as uuid
+from tempfile import NamedTemporaryFile
 try:
     import tomllib as toml
 except ImportError:
