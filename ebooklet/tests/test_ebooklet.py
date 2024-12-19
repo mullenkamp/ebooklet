@@ -24,8 +24,8 @@ except:
     conn_config = {
         # 'service_name': 's3',
         'endpoint_url': os.environ['endpoint_url'],
-        'aws_access_key_id': os.environ['aws_access_key_id'],
-        'aws_secret_access_key': os.environ['aws_secret_access_key'],
+        'access_key_id': os.environ['aws_access_key_id'],
+        'access_key': os.environ['aws_secret_access_key'],
         }
 
 # tf = NamedTemporaryFile()
