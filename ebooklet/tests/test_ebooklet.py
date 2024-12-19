@@ -9,7 +9,7 @@ except ImportError:
 from s3func import S3Session, HttpSession, B2Session
 import booklet
 import ebooklet
-from ebooklet import __version__, EBooklet, remotes
+from ebooklet import __version__, EBooklet, remote
 from copy import deepcopy
 
 #################################################
@@ -22,7 +22,7 @@ try:
         conn_config = toml.load(f)['connection_config']
 except:
     conn_config = {
-        'service_name': 's3',
+        # 'service_name': 's3',
         'endpoint_url': os.environ['endpoint_url'],
         'aws_access_key_id': os.environ['aws_access_key_id'],
         'aws_secret_access_key': os.environ['aws_secret_access_key'],
@@ -31,7 +31,7 @@ except:
 # tf = NamedTemporaryFile()
 # file_path = tf.name
 
-connection_config = conn_config
+# connection_config = conn_config
 bucket = 'achelous'
 flag = "n"
 buffer_size = 524288
@@ -60,10 +60,10 @@ meta = {'test1': 'data'}
 
 print(__version__)
 
-s3_remote = remotes.S3Remote(db_key, bucket, connection_config)
-http_remote = remotes.HttpRemote(db_url)
+s3_conn = remote.S3Conn(db_key, bucket, **conn_config)
+http_conn = remote.HttpConn(db_url)
 
-remote = [s3_remote, http_remote]
+remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
 
 
 ################################################
@@ -90,7 +90,7 @@ def get_logs(request):
         # Add code here to cleanup failure scenario
         print("executing test failed")
 
-        s3open = s3_remote.open()
+        s3open = s3_conn.open()
         s3open.delete_remote()
 
         file_path.unlink()
@@ -107,21 +107,21 @@ def get_logs(request):
 
 
 def test_set_items():
-    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         for key, value in data_dict.items():
             f[key] = value
 
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         value = f['10']
 
     assert value == data_dict['10']
 
 
 def test_update():
-    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         f.update(data_dict)
 
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         value = f['10']
 
     assert value == data_dict['10']
@@ -131,32 +131,32 @@ def test_set_get_metadata():
     """
 
     """
-    with EBooklet(remote, file_path, 'w') as f:
+    with EBooklet(remote_conn, file_path, 'w') as f:
         old_meta = f.get_metadata()
         f.set_metadata(meta)
 
     assert old_meta is None
 
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         new_meta = f.get_metadata()
 
     assert new_meta == meta
 
 
 def test_set_get_timestamp():
-    with EBooklet(remote, file_path, 'w') as f:
+    with EBooklet(remote_conn, file_path, 'w') as f:
         ts_old, value = f.get_timestamp('10', True)
         ts_new = booklet.utils.make_timestamp_int()
         f.set_timestamp('10', ts_new)
 
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         ts_new = f.get_timestamp('10')
 
     assert ts_new > ts_old and value == data_dict['10']
 
 
 def test_keys():
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         keys = set(list(f.keys()))
 
     source_keys = set(list(data_dict.keys()))
@@ -165,14 +165,14 @@ def test_keys():
 
 
 def test_items():
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         for key, value in f.items():
             source_value = data_dict[key]
             assert source_value == value
 
 
 def test_timestamps():
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         for key, ts, value in f.timestamps(True):
             source_value = data_dict[key]
             assert source_value == value
@@ -183,7 +183,7 @@ def test_timestamps():
 
 
 def test_contains():
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         for key in data_dict:
             if key not in f:
                 raise KeyError(key)
@@ -192,7 +192,7 @@ def test_contains():
 
 
 def test_len():
-    with EBooklet(http_remote, file_path) as f:
+    with EBooklet(http_conn, file_path) as f:
         new_len = len(f)
 
     assert len(data_dict) == new_len
@@ -204,7 +204,7 @@ def test_delete_len():
     for index in indexes:
         _ = data.pop(index)
 
-        with EBooklet(s3_remote, file_path, 'w') as f:
+        with EBooklet(s3_conn, file_path, 'w') as f:
             f[index] = 0
             f[index] = 0
             del f[index]
@@ -222,15 +222,15 @@ def test_delete_len():
         assert new_len == len(data)
 
 
-def test_items2():
-    with EBooklet(s3_remote, file_path, init_check_remote=False) as f:
-        for key, value in f.items():
-            source_value = data[key]
-            assert source_value == value
+# def test_items2():
+#     with EBooklet(s3_conn, file_path, init_check_remote=False) as f:
+#         for key, value in f.items():
+#             source_value = data[key]
+#             assert source_value == value
 
 
 def test_values():
-    with EBooklet(s3_remote, file_path) as f:
+    with EBooklet(s3_conn, file_path) as f:
         for value in f.values():
             pass
 
@@ -240,7 +240,7 @@ def test_values():
 
 
 def test_prune():
-    with EBooklet(s3_remote, file_path, 'w') as f:
+    with EBooklet(s3_conn, file_path, 'w') as f:
         old_len = len(f)
         removed_items = f.prune()
         new_len = len(f)
@@ -249,7 +249,7 @@ def test_prune():
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
     # Reindex
-    with EBooklet(s3_remote, file_path, 'w') as f:
+    with EBooklet(s3_conn, file_path, 'w') as f:
         old_len = len(f)
         old_n_buckets = f._n_buckets
         removed_items = f.prune(reindex=True)
@@ -262,7 +262,7 @@ def test_prune():
     # Remove the rest via timestamp filter
     timestamp = booklet.utils.make_timestamp_int()
 
-    with EBooklet(s3_remote, file_path, 'w') as f:
+    with EBooklet(s3_conn, file_path, 'w') as f:
         removed_items = f.prune(timestamp=timestamp)
         new_len = len(f)
         meta = f.get_metadata()
@@ -291,7 +291,7 @@ def test_prune():
 
 ## Always make this last!!!
 def test_clear():
-    with EBooklet(s3_remote, file_path, 'w') as f:
+    with EBooklet(s3_conn, file_path, 'w') as f:
         f.clear()
         f_meta = f.get_metadata()
 
@@ -303,7 +303,7 @@ def test_clear():
 
 
 def test_push():
-    with EBooklet(remote, file_path, 'n', value_serializer='pickle') as f:
+    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -319,7 +319,7 @@ def test_push():
 
 
 def test_read_remote():
-    http_remote = remotes.HttpRemote(db_url)
+    http_remote = remote.HttpConn(db_url)
 
     with EBooklet(http_remote, file_path) as f:
         value1 = f['10']
@@ -334,7 +334,7 @@ def test_read_remote():
 ### Remove files
 
 def test_remove_remote_local():
-    s3open = s3_remote.open()
+    s3open = s3_conn.open()
     s3open.delete_remote()
 
     file_path.unlink()

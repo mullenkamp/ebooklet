@@ -28,8 +28,8 @@ from collections import deque
 # import utils
 from . import utils
 
-# import remotes
-from . import remotes
+# import remote
+from . import remote
 
 # uuid_s3dbm = b'K=d:\xa89F(\xbc\xf5 \xd7$\xbd;\xf2'
 # version = 1
@@ -62,14 +62,14 @@ class Change:
         self._ebooklet.sync()
 
         ## update the remote timestamp
-        self._ebooklet._read_remote.get_timestamp_db_object()
+        self._ebooklet._read_conn_open.get_timestamp()
 
         ## Determine if a change has occurred
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_remote, self._ebooklet._flag, True)
+        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_conn_open, self._ebooklet._flag)
 
         ## Pull down the remote index
         if overwrite_remote_index:
-            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_remote, self._ebooklet._flag)
+            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_conn_open, self._ebooklet._flag)
 
 
     def update(self):
@@ -77,7 +77,7 @@ class Change:
 
         """
         self._ebooklet.sync()
-        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._read_remote)
+        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._read_conn_open)
 
         self._changelog_path = changelog_path
 
@@ -114,7 +114,7 @@ class Change:
         Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating).
         Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
         """
-        if not self._ebooklet._write_remote.writable:
+        if not self._ebooklet._write_conn_open.writable:
             raise ValueError('Remote is not writable.')
 
         if not self._ebooklet.writable:
@@ -129,16 +129,15 @@ class Change:
         #     self._finalizer.detach()
         #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
 
-        success = utils.update_remote(self._ebooklet._local_file_path, self._ebooklet._remote_index_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._write_remote, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag)
+        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._write_conn_open, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag)
 
         if success:
             self._changelog_path.unlink()
             self._changelog_path = None # Force a reset of the changelog
             self._ebooklet._deletes.clear()
 
-            if self._ebooklet._read_remote.uuid is None:
-                self._ebooklet._read_remote._parse_db_object()
-                # self._ebooklet._write_remote._parse_db_object()
+            if self._ebooklet._read_conn_open.uuid is None:
+                self._ebooklet._read_conn_open.get_init_bytes()
 
         return success
 
@@ -505,13 +504,13 @@ class EBooklet(MutableMapping):
     """
     def __init__(
             self,
-            remote: Union[remotes.BaseRemote, str, list],
+            remote_conn: Union[remote.BaseConn, str],
             file_path: Union[str, pathlib.Path],
             flag: str = "r",
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            init_check_remote: bool=True,
+            # init_check_remote: bool=True,
             # lock_remote: bool=True,
             # break_other_locks=False,
             # inherit_remote: Union[remotes.BaseRemote, str]=None,
@@ -529,32 +528,32 @@ class EBooklet(MutableMapping):
 
             # TODO: Pull down the remote ebooklet and assign it to this new object
 
-        check_timestamp = init_check_remote
+        # check_timestamp = init_check_remote
 
         local_file_path = pathlib.Path(file_path)
 
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
-        read_remote, write_remote, lock = utils.check_parse_remotes(remote, flag, check_timestamp, lock_remote, break_other_locks, local_file_exists)
+        read_conn_open, write_conn_open, lock = utils.check_parse_remotes(remote_conn, flag, lock_remote, break_other_locks, local_file_exists)
 
         ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_remote, value_serializer, n_buckets, buffer_size, check_timestamp)
+        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, value_serializer, n_buckets, buffer_size)
 
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_remote, flag)
+        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_conn_open, flag)
 
         # Open remote index file
         if remote_index_path.exists():
-            remote_index = booklet.FixedValue(remote_index_path, 'r')
-            # if flag == 'r':
-            #     remote_index = booklet.FixedValue(remote_index_path, 'r')
-            # elif flag in ('w', 'c'):
-            #     remote_index = booklet.FixedValue(remote_index_path, 'w')
+            # remote_index = booklet.FixedValue(remote_index_path, 'r')
+            if flag == 'r':
+                remote_index = booklet.FixedValue(remote_index_path, 'r')
+            else:
+                remote_index = booklet.FixedValue(remote_index_path, 'w')
         else:
             remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_remote, write_remote, None)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open, None)
 
         ## Assign properties
         if flag == 'r':
@@ -569,11 +568,12 @@ class EBooklet(MutableMapping):
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
         self._deletes = set()
-        self._read_remote = read_remote
-        self._write_remote = write_remote
+        self._read_conn_open = read_conn_open
+        self._write_conn_open = write_conn_open
         # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_remote._threads)
+        self._clear = False
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._threads)
 
 
     # def _pre_value(self, value) -> bytes:
@@ -679,7 +679,7 @@ class EBooklet(MutableMapping):
         if self.writable:
             self._local_file.set(key, value, timestamp)
 
-            # if self._read_remote.uuid:
+            # if self._read_conn.uuid:
             #     int_us = utils.make_timestamp()
             # else:
             #     old_val = self._local_index.get(key)
@@ -741,6 +741,8 @@ class EBooklet(MutableMapping):
             removed = self._local_file.prune(timestamp=timestamp, reindex=reindex)
             self._n_buckets = self._local_file._n_buckets
 
+            _ = self._remote_index.prune(reindex)
+
             return removed
         else:
             raise ValueError('File is open for read only.')
@@ -777,14 +779,14 @@ class EBooklet(MutableMapping):
             for key, remote_time_bytes in self._remote_index.items():
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_remote)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
                     futures[f] = key
         else:
             for key in keys:
                 remote_time_bytes = self._remote_index.get(key)
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_remote)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
                     futures[f] = key
 
         for f in concurrent.futures.as_completed(futures):
@@ -803,16 +805,19 @@ class EBooklet(MutableMapping):
         """
 
         """
+        # if key in self._deletes:
+        #     raise KeyError(key)
+
         remote_time_bytes = self._remote_index.get(key)
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
             if not self._local_file.writable:
                 self._local_file.reopen('w')
-                failure = utils.get_remote_value(self._local_file, key, self._read_remote)
+                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
                 self._local_file.reopen('r')
             else:
-                failure = utils.get_remote_value(self._local_file, key, self._read_remote)
+                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
             return failure
         else:
             return None
@@ -854,9 +859,9 @@ class EBooklet(MutableMapping):
         if self.writable:
             self._local_file.clear()
 
-            if not local_only:
-                if self._remote_index is not None:
-                    self._remote_index.clear()
+            # if not local_only:
+            #     if self._remote_index is not None:
+            #         self._remote_index.clear()
         else:
             raise ValueError('File is open for read only.')
 
@@ -873,7 +878,7 @@ class EBooklet(MutableMapping):
     def sync(self):
         self._executor.shutdown()
         del self._executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_remote._threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -889,9 +894,9 @@ class EBooklet(MutableMapping):
         self._local_file.reopen(flag)
         self._remote_index.reopen(flag)
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_remote._threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
 
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_remote, self._write_remote, None)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_conn_open, self._write_conn_open, None)
 
 
     # def pull(self):
@@ -899,10 +904,10 @@ class EBooklet(MutableMapping):
 
     #     """
     #     self.sync()
-    #     self._read_remote._parse_db_object()
-    #     overwrite_remote_index = utils.check_local_remote_sync(self._local_file, self._read_remote)
+    #     self._read_conn._parse_db_object()
+    #     overwrite_remote_index = utils.check_local_remote_sync(self._local_file, self._read_conn)
     #     if overwrite_remote_index:
-    #         utils.get_remote_index_file(self._local_file_path, overwrite_remote_index, self._read_remote)
+    #         utils.get_remote_index_file(self._local_file_path, overwrite_remote_index, self._read_conn)
 
 
     # def update_changelog(self):
@@ -910,7 +915,7 @@ class EBooklet(MutableMapping):
 
     #     """
     #     self.sync()
-    #     changelog_path = utils.create_changelog(self._local_file_path, self._local_file, self._remote_index, self._read_remote)
+    #     changelog_path = utils.create_changelog(self._local_file_path, self._local_file, self._remote_index, self._read_conn)
 
     #     self._changelog_path = changelog_path
 
@@ -926,7 +931,7 @@ class EBooklet(MutableMapping):
     #     Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating).
     #     Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
     #     """
-    #     if not self._write_remote.writable:
+    #     if not self._write_conn.writable:
     #         raise ValueError('Remote is not writable.')
 
     #     self.update_changelog()
@@ -938,15 +943,15 @@ class EBooklet(MutableMapping):
     #     #     self._finalizer.detach()
     #     #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
 
-    #     success = utils.update_remote(self._local_file_path, self._remote_index_path, self._local_file, self._remote_index, self._changelog_path, self._write_remote, self._executor, force_push, self._deletes, self._flag)
+    #     success = utils.update_remote(self._local_file_path, self._remote_index_path, self._local_file, self._remote_index, self._changelog_path, self._write_conn, self._executor, force_push, self._deletes, self._flag)
 
     #     if success:
     #         self._changelog_path.unlink()
     #         self._changelog_path = None # Force a reset of the changelog
 
-    #         if self._read_remote.uuid is None:
-    #             self._read_remote._parse_db_object()
-    #             self._write_remote._parse_db_object()
+    #         if self._read_conn.uuid is None:
+    #             self._read_conn._parse_db_object()
+    #             self._write_conn._parse_db_object()
 
     #     return success
 
@@ -957,7 +962,7 @@ def open(
     value_serializer: str = None,
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    remote: Union[remotes.BaseRemote, str, list]=None,
+    remote_conn: Union[remote.BaseConn, str]=None,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. Lots of options including read caching.
@@ -1020,4 +1025,4 @@ def open(
     if remote is None:
         return booklet.VariableValue(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
     else:
-        return EBooklet(remote=remote, file_path=file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+        return EBooklet(remote=remote, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)

@@ -19,10 +19,10 @@ try:
         conn_config = toml.load(f)['connection_config']
 except:
     conn_config = {
-        'service_name': 's3',
+        # 'service_name': 's3',
         'endpoint_url': os.environ['endpoint_url'],
-        'aws_access_key_id': os.environ['aws_access_key_id'],
-        'aws_secret_access_key': os.environ['aws_secret_access_key'],
+        'access_key_id': os.environ['aws_access_key_id'],
+        'access_key': os.environ['aws_secret_access_key'],
         }
 
 
@@ -96,13 +96,13 @@ def get_logs(request):
 ################################################
 ### Tests
 
-s3_remote = remotes.S3Remote(db_key, bucket, connection_config)
-http_remote = remotes.HttpRemote(db_url)
+s3_conn = remote.S3Conn(db_key, bucket, **connection_config)
+http_conn = remote.HttpConn(db_url)
 
-remote = [s3_remote, http_remote]
+remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
 
 self = EBooklet(
-    remote,
+    remote_conn,
     file_path,
     flag,
     value_serializer,
@@ -110,13 +110,15 @@ self = EBooklet(
     )
 
 self = EBooklet(
-    remote,
+    remote_conn,
     file_path,
     'c',
     )
 
 self['test1'] = list(range(100))
 self['test2'] = 10
+
+self.close()
 
 changes = self.changes()
 
@@ -130,7 +132,7 @@ changes.push()
 changes.pull()
 
 self = EBooklet(
-    remote,
+    remote_conn,
     file_path,
     'w',
     )
@@ -145,10 +147,14 @@ if s3_remote.uuid:
 
 
 self = EBooklet(
-    [s3_remote, http_remote],
+    http_conn,
     file_path,
     'r',
     )
+
+iter1 = self.get_items(['test1', 'test2', 'test3'])
+
+failures = self.load_items(['test1', 'test2', 'test3'])
 
 
 with open(self._remote_index_path, 'rb') as ri:
@@ -157,7 +163,7 @@ with open(self._remote_index_path, 'rb') as ri:
 
 self = booklet.VariableValue(file_path)
 
-
+del self['test3']
 
 
 

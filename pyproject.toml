@@ -1,14 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.26.1"]
+build-backend = "hatchling.build"
+
 [project]
 name = "ebooklet"
 authors = [
   { name = "Mike", email = "mullenkamp1@gmail.com" }
 ]
+license-expression = "Apache-2.0"
 description = "Organise all your data in key/value booklets and sync them with S3"
 readme = "README.md"
 dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",
 ]
+keywords = [
+    "dbm",
+    "shelve",
+    "booklet"
+]
+
 requires-python = ">=3.10"
 dependencies = [
   's3func>=0.6',
@@ -37,7 +48,7 @@ allow-direct-references = true
 [tool.hatch.envs.default]
 python = "3.10"
 dependencies = [
-    "spyder-kernels==2.4",
+    "spyder-kernels==2.5",
     "black",
     "mypy",
     "ruff",
@@ -166,10 +177,6 @@ exclude_lines = [
   "if __name__ == .__main__.:",
   "if TYPE_CHECKING:",
 ]
-
-[build-system]
-requires = ["hatchling", "hatch-regex-commit"]
-build-backend = "hatchling.build"
 
 [project.urls]
 Documentation = "https://mullenkamp.github.io/ebooklet/"
