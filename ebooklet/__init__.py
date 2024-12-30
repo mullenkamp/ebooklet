@@ -1,10 +1,9 @@
 """
 
 """
-from ebooklet.main import open, EBooklet
-# from ebooklet import remotes
+from ebooklet.main import open, EVariableLengthValue
 from ebooklet.remote import S3Conn, HttpConn, Conn
 
-__all__ = ["open", "EBooklet", 'S3Conn', 'HttpConn', 'Conn']
+__all__ = ["open", "EVariableLengthValue", 'S3Conn', 'HttpConn', 'Conn']
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'

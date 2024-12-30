@@ -36,9 +36,9 @@ from . import remote
 
 default_n_buckets = 100003
 
-blt_files = ('.local_data', '.remote_index')
+# blt_files = ('.local_data', '.remote_index')
 
-local_storage_options = ('write_buffer_size', 'n_bytes_file', 'n_bytes_key', 'n_bytes_value', 'n_buckets')
+# local_storage_options = ('write_buffer_size', 'n_bytes_file', 'n_bytes_key', 'n_bytes_value', 'n_buckets')
 
 int_to_bytes = booklet.utils.int_to_bytes
 bytes_to_int = booklet.utils.bytes_to_int
@@ -89,11 +89,13 @@ def fake_finalizer():
     """
 
 
-def s3remote_finalizer(session):
+def s3remote_finalizer(session, lock):
     """
     The finalizer function for S3Remote instances.
     """
-    session._client.close()
+    session.client.close()
+    if lock is not None:
+        lock.release()
 
 
 # def bookcase_finalizer(temp_path, lock):
@@ -106,7 +108,7 @@ def s3remote_finalizer(session):
 #         lock.release()
 
 
-def ebooklet_finalizer(local_file, remote_index, read_conn, write_conn, lock):
+def ebooklet_finalizer(local_file, remote_index, read_conn, write_conn):
     """
     The finalizer function for book instances.
     """
@@ -117,8 +119,8 @@ def ebooklet_finalizer(local_file, remote_index, read_conn, write_conn, lock):
         read_conn.close()
     if write_conn is not None:
         write_conn.close()
-    if lock is not None:
-        lock.release()
+    # if lock is not None:
+    #     lock.release()
 
 
 # def write_metadata(local_meta_path, meta):
@@ -167,34 +169,44 @@ def ebooklet_finalizer(local_file, remote_index, read_conn, write_conn, lock):
 #         raise urllib3.exceptions.HTTPError(resp.error)
 
 
-def check_parse_remotes(remote_conn, flag, lock_remote, break_other_locks, local_file_exists):
+def check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists):
     """
 
     """
     if isinstance(remote_conn, str):
         remote_conn = remote.HttpConn(remote_conn)
         read_conn_open = remote_conn.open()
+        write_conn_open = None
 
     elif 's3_conn' in remote_conn.type:
         if remote_conn.type == 's3_conn':
-            remote_conn_open = remote_conn.open()
+            if object_lock and (flag != 'r'):
+                remote_conn_open = remote_conn.open(object_lock, break_other_locks, lock_timeout)
+            else:
+                remote_conn_open = remote_conn.open()
         else:
             remote_conn_open = remote_conn
         read_conn_open = remote_conn_open
         write_conn_open = remote_conn_open
+
     elif 'http_conn' in remote_conn.type:
         if remote_conn.type == 'http_conn':
             read_conn_open = remote_conn.open()
         else:
             read_conn_open = remote_conn
         write_conn_open = None
+
     elif 'conn' in remote_conn.type:
         if remote_conn.type == 'conn':
-            remote_conn_open = remote_conn.open()
+            if object_lock and (flag != 'r'):
+                remote_conn_open = remote_conn.open(object_lock, break_other_locks, lock_timeout)
+            else:
+                remote_conn_open = remote_conn.open()
         else:
             remote_conn_open = remote_conn
         read_conn_open = remote_conn_open.http_conn_open
         write_conn_open = remote_conn_open.s3_conn_open
+
     else:
         raise TypeError('The remote must be either a Conn object or a url string.')
 
@@ -203,13 +215,13 @@ def check_parse_remotes(remote_conn, flag, lock_remote, break_other_locks, local
     elif flag != 'r' and write_conn_open is None and not local_file_exists:
         raise ValueError('If open for write, then an S3Remote object must be passed.')
 
-    if lock_remote and (write_conn_open is not None) and (flag != 'r'):
-        lock = write_conn_open.lock()
-        lock.aquire()
-    else:
-        lock = None
+    # if lock_remote and (write_conn_open is not None) and (flag != 'r'):
+    #     lock = write_conn_open.lock()
+    #     lock.aquire()
+    # else:
+    #     lock = None
 
-    return read_conn_open, write_conn_open, lock
+    return read_conn_open, write_conn_open
 
 
 def check_local_remote_sync(local_file, read_conn, flag):

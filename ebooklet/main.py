@@ -498,7 +498,7 @@ class Change:
 #             return False
 
 
-class EBooklet(MutableMapping):
+class EVariableLengthValue(MutableMapping):
     """
 
     """
@@ -510,9 +510,9 @@ class EBooklet(MutableMapping):
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            # init_check_remote: bool=True,
-            # lock_remote: bool=True,
-            # break_other_locks=False,
+            object_lock: bool=False,
+            break_other_locks: bool=False,
+            lock_timeout: int=-1,
             # inherit_remote: Union[remotes.BaseRemote, str]=None,
             # inherit_data: bool=False,
             ):
@@ -535,7 +535,7 @@ class EBooklet(MutableMapping):
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
-        read_conn_open, write_conn_open, lock = utils.check_parse_remotes(remote_conn, flag, lock_remote, break_other_locks, local_file_exists)
+        read_conn_open, write_conn_open = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
 
         ## Init the local file
         local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, value_serializer, n_buckets, buffer_size)
@@ -553,7 +553,7 @@ class EBooklet(MutableMapping):
             remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open, None)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open)
 
         ## Assign properties
         if flag == 'r':
@@ -572,8 +572,9 @@ class EBooklet(MutableMapping):
         self._write_conn_open = write_conn_open
         # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
-        self._clear = False
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._threads)
+        # self._clear = False
+        # self._lock = lock
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._conn.threads)
 
 
     # def _pre_value(self, value) -> bytes:
@@ -878,7 +879,7 @@ class EBooklet(MutableMapping):
     def sync(self):
         self._executor.shutdown()
         del self._executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._conn.threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -894,9 +895,12 @@ class EBooklet(MutableMapping):
         self._local_file.reopen(flag)
         self._remote_index.reopen(flag)
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
+        if self._lock is not None:
+            self._lock.aquire()
 
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_conn_open, self._write_conn_open, None)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._conn.threads)
+
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_conn_open, self._write_conn_open, self._lock)
 
 
     # def pull(self):
@@ -965,43 +969,36 @@ def open(
     remote_conn: Union[remote.BaseConn, str]=None,
     ):
     """
-    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. Lots of options including read caching.
+    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. If remote_conn is not passed, then it opens a normal booklet file.
 
     Parameters
     -----------
-    bucket : str
-        The S3 bucket with the objects.
-
-    client : botocore.client.BaseClient or None
-        The boto3 S3 client object that can be directly passed. This allows the user to include whatever client parameters they wish. It's recommended to use the s3_client function supplied with this package. If None, then connection_config must be passed.
-
-    connection_config: dict or None
-        If client is not passed to open, then the connection_config must be supplied. If both are passed, then client takes priority. connection_config should be a dict of service_name, endpoint_url, aws_access_key_id, and aws_secret_access_key.
-
-    public_url : HttpUrl or None
-        If the S3 bucket is publicly accessible, then supplying the public_url will download objects via normal http. The provider parameter is associated with public_url to specify the provider's public url style.
+    file_path : str or pathlib.Path
+        It must be a path to a local file location. If you want to use a tempfile, then use the name from the NamedTemporaryFile initialized class.
 
     flag : str
         Flag associated with how the file is opened according to the dbm style. See below for details.
 
+    key_serializer : str, class, or None
+        The serializer to use to convert the input value to bytes. Run the booklet.available_serializers to determine the internal serializers that are available. None will require bytes as input. A custom serializer class can also be used. If the objects can be serialized to json, then use orjson or msgpack. They are super fast and you won't have the pickle issues.
+        If a custom class is passed, then it must have dumps and loads methods.
+
+    value_serializer : str, class, or None
+        Similar to the key_serializer, except for the values.
+
+    n_buckets : int
+        The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.
+
     buffer_size : int
-        The buffer memory size used for reading and writing. Defaults to 512000.
-
-    retries : int
-        The number of http retries for reads and writes. Defaults to 3.
-
-    read_timeout : int
-        The http read timeout in seconds. Defaults to 120.
-
-    provider : str or None
-        Associated with public_url. If provider is None, then it will try to figure out the provider (in a very rough way). Options include, b2, r2, and contabo.
-
-    threads : int
-        The max number of threads to use when using several methods. Defaults to 30.
+        The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
+        This is only used when the file is open for writing.
+    
+    remote_conn : BaseConn, str, or None
+        The object to connect to a remote. It can either be a Conn type object, an http url string, or None. If None, no remote connection is made and the file is only opened locally.
 
     Returns
     -------
-    S3dbm
+    Ebooklet or Booklet
 
     The optional *flag* argument can be:
 
@@ -1022,7 +1019,7 @@ def open(
     +---------+-------------------------------------------+
 
     """
-    if remote is None:
-        return booklet.VariableValue(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+    if remote_conn is None:
+        return booklet.open(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
     else:
-        return EBooklet(remote=remote, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+        return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)

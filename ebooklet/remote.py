@@ -308,15 +308,15 @@ class BaseConnOpenReadWrite(BaseConnOpenRead):
         """
         return self._session.list_object_versions(prefix=self.db_key)
 
-    def lock(self):
-        """
+    # def lock(self):
+    #     """
 
-        """
-        if self.writable:
-            lock = self._session.s3lock(self.db_key)
-            return lock
-        else:
-            raise ValueError('Conn is not writable.')
+    #     """
+    #     if self.writable:
+    #         lock = self._session.s3lock(self.db_key)
+    #         return lock
+    #     else:
+    #         raise ValueError('Conn is not writable.')
 
 
 # class BaseS3ConnOpenReadWrite(BaseConnOpenReadWrite):
@@ -382,12 +382,19 @@ class S3Conn(BaseConn):
         ## Assign properties
         self.db_key = db_key
         self.bucket = bucket
-        self.connection_config = dict(
-            service_name='s3',
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=access_key,
-            endpoint_url=endpoint_url
-            )
+        self.access_key_id = access_key_id
+        self.access_key = access_key
+
+        if isinstance(endpoint_url, str):
+            if not s3func.utils.is_url(endpoint_url):
+                raise TypeError(f'{endpoint_url} is not a proper url.')
+        self.endpoint_url = endpoint_url
+        # self.connection_config = dict(
+        #     service_name='s3',
+        #     aws_access_key_id=access_key_id,
+        #     aws_secret_access_key=access_key,
+        #     endpoint_url=endpoint_url
+        #     )
         self.threads = threads
         self.read_timeout = read_timeout
         self.retries = retries
@@ -410,7 +417,7 @@ class S3Conn(BaseConn):
         """
 
         """
-        session = s3func.S3Session(self.connection_config, self.bucket, self.threads, read_timeout=self.read_timeout, stream=False, max_attempts=self.retries)
+        session = s3func.S3Session(self.access_key_id, self.access_key, self.bucket, self.endpoint_url, self.threads, read_timeout=self.read_timeout, stream=False, max_attempts=self.retries)
 
         self.uuid = super().get_uuid(session)
 
@@ -422,31 +429,41 @@ class S3Conn(BaseConn):
 
         """
         if isinstance(access_key_id, str):
-            self.connection_config['aws_access_key_id'] = access_key_id
+            self.access_key_id = access_key_id
         else:
             raise TypeError(access_key_id)
 
         if isinstance(access_key, str):
-            self.connection_config['aws_secret_access_key'] = access_key
+            self.access_key = access_key
         else:
             raise TypeError(access_key)
 
         if isinstance(endpoint_url, str):
-            self.connection_config['endpoint_url'] = endpoint_url
+            if not s3func.utils.is_url(endpoint_url):
+                raise TypeError(f'{endpoint_url} is not a proper url.')
+            self.endpoint_url = endpoint_url
         elif endpoint_url is not None:
             raise TypeError(access_key)
 
 
-    def open(self):
+    def open(self,
+             object_lock=False,
+             break_other_locks=False,
+             lock_timeout=-1,
+             ):
         """
 
         """
-        if self.connection_config['aws_access_key_id'] is None or self.connection_config['aws_secret_access_key'] is None:
+        if self.access_key_id is None or self.access_key is None:
             raise ValueError("access_key_id and access_key must be assigned to open a connection.")
         if self.uuid is None:
             self.get_uuid()
 
-        return S3ConnOpen(self)
+        return S3ConnOpen(self,
+                          object_lock=False,
+                          break_other_locks=False,
+                          lock_timeout=-1,
+                          )
 
 
 class S3ConnOpen(BaseConnOpenReadWrite):
@@ -456,12 +473,15 @@ class S3ConnOpen(BaseConnOpenReadWrite):
     def __init__(self,
                  s3_conn,
                  # check_timestamp=True,
+                 object_lock=False,
+                 break_other_locks=False,
+                 lock_timeout=-1,
                 ):
         """
 
         """
         ## Set up the session
-        session = s3func.S3Session(s3_conn.connection_config, s3_conn.bucket, s3_conn.threads, read_timeout=s3_conn.read_timeout, stream=False, max_attempts=s3_conn.retries)
+        session = s3func.S3Session(s3_conn.access_key_id, s3_conn.access_key, s3_conn.bucket, s3_conn.endpoint_url, s3_conn.threads, read_timeout=s3_conn.read_timeout, stream=False, max_attempts=s3_conn.retries)
         self._session = session
 
         self.db_key = s3_conn.db_key
@@ -474,30 +494,18 @@ class S3ConnOpen(BaseConnOpenReadWrite):
         # self._readable = False
         self._writable = False
 
-        # resp_obj = self.get_db_object()
-        # if resp_obj.status == 200:
-        #     self.readable = True
-
-        #     self._init_bytes = resp_obj.data
-
-        #     self.timestamp = booklet.utils.bytes_to_int(self._init_bytes[booklet.utils.file_timestamp_pos:booklet.utils.file_timestamp_pos + booklet.utils.timestamp_bytes_len])
-
-        #     self.uuid = uuid.UUID(bytes=bytes(self._init_bytes[49:65]))
-
-            # if object_lock:
-            #     lock = session.s3lock(db_key)
-
-            #     if break_other_locks:
-            #         lock.break_other_locks()
-
-            #     lock.aquire(timeout=lock_timeout)
-
-            # put_resp = session.put_object(test_key, b'0')
-            # if put_resp.status == 200:
-            #     self.writable = True
-            #     _ = session.delete_object(test_key, put_resp.metadata['version_id'])
 
         self.get_init_bytes()
+
+        if object_lock:
+            lock = session.s3lock(self.db_key)
+
+            if break_other_locks:
+                lock.break_other_locks()
+
+            lock.aquire(timeout=lock_timeout)
+        else:
+            lock = None
 
         # if check_timestamp:
         #     self.get_timestamp_db_object()
@@ -505,18 +513,18 @@ class S3ConnOpen(BaseConnOpenReadWrite):
         #     self.timestamp = None
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.s3remote_finalizer, self._session)
+        self._finalizer = weakref.finalize(self, utils.s3remote_finalizer, self._session, lock)
 
         ## Assign properties
-        self._bucket = s3_conn.bucket
-        self._connection_config = s3_conn.connection_config
-        self._threads = s3_conn.threads
-        self._read_timeout = s3_conn.read_timeout
-        self._retries = s3_conn.retries
+        # self._bucket = s3_conn.bucket
+        # self._connection_config = s3_conn.connection_config
+        # self._threads = s3_conn.threads
+        # self._read_timeout = s3_conn.read_timeout
+        # self._retries = s3_conn.retries
         self.type = 's3_conn_open'
         self._conn = s3_conn
         # self._lock_timeout = lock_timeout
-        # self.lock = lock
+        self.lock = lock
 
 
 class HttpConn(BaseConn):
@@ -601,10 +609,10 @@ class HttpConnOpen(BaseConnOpenRead):
         self._finalizer = weakref.finalize(self, session._session.clear)
 
         ## Assign properties
-        self._threads = http_conn.threads
-        self._read_timeout = http_conn.read_timeout
-        self._retries = http_conn.retries
-        self._headers = http_conn._headers
+        # self._threads = http_conn.threads
+        # self._read_timeout = http_conn.read_timeout
+        # self._retries = http_conn.retries
+        # self._headers = http_conn._headers
         self.type = 'http_conn_open'
         self._conn = http_conn
 
@@ -659,17 +667,19 @@ class Conn:
 
         """
         if isinstance(access_key_id, str):
-            self.s3_conn.connection_config['aws_access_key_id'] = access_key_id
+            self.access_key_id = access_key_id
         else:
             raise TypeError(access_key_id)
 
         if isinstance(access_key, str):
-            self.s3_conn.connection_config['aws_secret_access_key'] = access_key
+            self.access_key = access_key
         else:
             raise TypeError(access_key)
 
         if isinstance(endpoint_url, str):
-            self.s3_conn.connection_config['endpoint_url'] = endpoint_url
+            if not s3func.utils.is_url(endpoint_url):
+                raise TypeError(f'{endpoint_url} is not a proper url.')
+            self.endpoint_url = endpoint_url
         elif endpoint_url is not None:
             raise TypeError(access_key)
 
@@ -682,11 +692,19 @@ class Conn:
             assert self.s3_conn.uuid == self.http_conn.uuid
 
 
-    def open(self):
+    def open(self,
+             object_lock=False,
+             break_other_locks=False,
+             lock_timeout=-1,
+             ):
         """
 
         """
-        return ConnOpen(self)
+        return ConnOpen(self,
+                        object_lock=False,
+                        break_other_locks=False,
+                        lock_timeout=-1,
+                        )
 
 
 class ConnOpen:
@@ -695,13 +713,20 @@ class ConnOpen:
     """
     def __init__(self,
                  conn,
-                 # check_timestamp=True
+                 # check_timestamp=True,
+                 object_lock=False,
+                 break_other_locks=False,
+                 lock_timeout=-1,
                  ):
         """
 
         """
         if conn.s3_conn is not None:
-            s3_conn_open = conn.s3_conn.open()
+            s3_conn_open = conn.s3_conn.open(
+                object_lock=False,
+                break_other_locks=False,
+                lock_timeout=-1,
+                )
         else:
             s3_conn_open = None
 
@@ -716,6 +741,13 @@ class ConnOpen:
         self.http_conn_open = http_conn_open
         self.type = 'conn_open'
         self._conn = conn
+
+        def close(self):
+            if self.s3_conn_open is not None:
+                self.s3_conn_open.close()
+
+            if self.http_conn_open is not None:
+                self.http_conn_open.close()
 
 
 
