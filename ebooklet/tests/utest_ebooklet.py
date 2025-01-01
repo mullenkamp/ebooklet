@@ -8,7 +8,7 @@ except ImportError:
     import tomli as toml
 from s3func import S3Session, HttpSession, B2Session
 import booklet
-from ebooklet import EBooklet, remote
+# from ebooklet import EBooklet, remote
 
 #################################################
 ### Parameters

@@ -20,18 +20,20 @@ script_path = pathlib.Path(os.path.realpath(os.path.dirname(__file__)))
 try:
     with open(script_path.joinpath('s3_config.toml'), "rb") as f:
         conn_config = toml.load(f)['connection_config']
+
+    endpoint_url = conn_config['endpoint_url']
+    access_key_id = conn_config['access_key_id']
+    access_key = conn_config['access_key']
 except:
-    conn_config = {
-        # 'service_name': 's3',
-        'endpoint_url': os.environ['endpoint_url'],
-        'access_key_id': os.environ['aws_access_key_id'],
-        'access_key': os.environ['aws_secret_access_key'],
-        }
+    endpoint_url = os.environ['endpoint_url']
+    access_key_id = os.environ['access_key_id']
+    access_key = os.environ['access_key']
 
 # tf = NamedTemporaryFile()
 # file_path = tf.name
 
 # connection_config = conn_config
+
 bucket = 'achelous'
 flag = "n"
 buffer_size = 524288
@@ -60,7 +62,7 @@ meta = {'test1': 'data'}
 
 print(__version__)
 
-s3_conn = remote.S3Conn(db_key, bucket, **conn_config)
+s3_conn = remote.S3Conn(db_key, bucket, endpoint_url=endpoint_url, access_key_id=access_key_id, access_key=access_key)
 http_conn = remote.HttpConn(db_url)
 
 remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)

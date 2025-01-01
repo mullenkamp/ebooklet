@@ -19,6 +19,7 @@ import orjson
 import urllib3
 import shutil
 from datetime import datetime, timezone
+import base64
 # import zstandard as zstd
 # from glob import glob
 import portalocker
@@ -26,8 +27,8 @@ import concurrent.futures
 # from collections.abc import Mapping, MutableMapping
 # from __init__ import __version__ as version
 
-# import remote
-from . import remote
+import remote
+# from . import remote
 
 ############################################
 ### Parameters
@@ -82,6 +83,7 @@ bytes_to_int = booklet.utils.bytes_to_int
 
 ############################################
 ### Functions
+
 
 def fake_finalizer():
     """
@@ -290,7 +292,7 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, read_conn, fl
         if read_conn.uuid:
             # remote_index_key = read_conn.db_key + '.remote_index'
 
-            index0 = read_conn.get_db_index_object()
+            index0 = read_conn.get_db_object()
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
@@ -706,7 +708,7 @@ def view_changelog(changelog_path):
 ### Update remote
 
 
-def update_remote(local_file, remote_index, changelog_path, write_conn_open, executor, force_push, deletes, flag):
+def update_remote(local_file, remote_index, changelog_path, write_conn_open, executor, force_push, deletes, flag, ebooklet_type):
     """
 
     """
@@ -750,22 +752,7 @@ def update_remote(local_file, remote_index, changelog_path, write_conn_open, exe
     if updated or force_push or deletes:
         time_int_us = booklet.utils.make_timestamp_int()
 
-        futures = {}
-        remote_index_key = write_conn_open.db_key + '.remote_index'
-        remote_index._file.seek(0)
-        f = executor.submit(write_conn_open.put_db_index_object, remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex})
-        futures[f] = remote_index_key
-
-        remote_index.reopen('r')
-
-        # ## remove deletes in remote
-        # if deletes:
-        #     write_conn_open.delete_objects(deletes)
-        #     for key in deletes:
-        #         del remote_index[key]
-        #     remote_index.sync()
-
-        ## Save main file init bytes
+        ## Get main file init bytes
         local_file._set_file_timestamp(time_int_us)
         local_file._file.seek(0)
         local_init_bytes = bytearray(local_file._file.read(200))
@@ -775,23 +762,56 @@ def update_remote(local_file, remote_index, changelog_path, write_conn_open, exe
         n_keys_pos = booklet.utils.n_keys_pos
         local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
 
-        ## Upload the init bytes
-        f = executor.submit(write_conn_open.put_db_object, local_init_bytes, {'timestamp': str(time_int_us), 'uuid': local_file.uuid.hex})
-        futures[f] = write_conn_open.db_key
+        # remote_index_key = write_conn_open.db_key + '.remote_index'
+        remote_index._file.seek(0)
 
-        failures = []
-        for future in concurrent.futures.as_completed(futures):
-            key = futures[future]
-            run_result = future.result()
-            if run_result.status // 100 == 2:
-                failures.append(key)
+        # futures = {}
+        # f = executor.submit(write_conn_open.put_db_object, remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.b64encode(local_init_bytes)})
+        # futures[f] = write_conn_open.db_key
 
-        if failures:
-            urllib3.exceptions.HTTPError(f"These items failed to upload: {', '.join(failures)}. You need to rerun the push with force_push=True or the remote will be corrupted.")
+        resp = write_conn_open.put_db_object(remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.b64encode(local_init_bytes).decode()})
+
+        remote_index.reopen('r')
+
+        if resp.status // 100 != 2:
+            urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
+
+
+        # ## remove deletes in remote
+        # if deletes:
+        #     write_conn_open.delete_objects(deletes)
+        #     for key in deletes:
+        #         del remote_index[key]
+        #     remote_index.sync()
+
+        ## Save main file init bytes
+        # local_file._set_file_timestamp(time_int_us)
+        # local_file._file.seek(0)
+        # local_init_bytes = bytearray(local_file._file.read(200))
+        # if local_init_bytes[:16] != booklet.utils.uuid_variable_blt:
+        #     raise ValueError(local_init_bytes)
+
+        # n_keys_pos = booklet.utils.n_keys_pos
+        # local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
+
+        # ## Upload the init bytes
+        # f = executor.submit(write_conn_open.put_db_object, local_init_bytes, {'timestamp': str(time_int_us), 'uuid': local_file.uuid.hex})
+        # futures[f] = write_conn_open.db_key
+
+        # failures = []
+        # for future in concurrent.futures.as_completed(futures):
+        #     key = futures[future]
+        #     run_result = future.result()
+        #     if run_result.status // 100 == 2:
+        #         failures.append(key)
+
+        # if failures:
+        #     urllib3.exceptions.HTTPError(f"These items failed to upload: {', '.join(failures)}. You need to rerun the push with force_push=True or the remote will be corrupted.")
 
         ## remove deletes in remote
         if deletes:
             write_conn_open.delete_objects(deletes)
+            deletes.clear()
 
         return True
     else:
