@@ -91,7 +91,7 @@ def fake_finalizer():
     """
 
 
-def s3remote_finalizer(session, lock):
+def s3session_finalizer(session, lock):
     """
     The finalizer function for S3Remote instances.
     """
