@@ -62,14 +62,14 @@ class Change:
         self._ebooklet.sync()
 
         ## update the remote timestamp
-        self._ebooklet._read_conn_open.get_timestamp()
+        self._ebooklet._remote_session.get_timestamp()
 
         ## Determine if a change has occurred
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_conn_open, self._ebooklet._flag)
+        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._remote_session, self._ebooklet._flag)
 
         ## Pull down the remote index
         if overwrite_remote_index:
-            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_conn_open, self._ebooklet._flag)
+            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._remote_session, self._ebooklet._flag)
 
 
     def update(self):
@@ -77,7 +77,7 @@ class Change:
 
         """
         self._ebooklet.sync()
-        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._read_conn_open)
+        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session)
 
         self._changelog_path = changelog_path
 
@@ -114,7 +114,7 @@ class Change:
         Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating).
         Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
         """
-        if not self._ebooklet._write_conn_open.writable:
+        if not self._ebooklet._remote_session.writable:
             raise ValueError('Remote is not writable.')
 
         if not self._ebooklet.writable:
@@ -129,15 +129,15 @@ class Change:
         #     self._finalizer.detach()
         #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
 
-        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._write_conn_open, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag)
+        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet._subtype)
 
         if success:
             self._changelog_path.unlink()
             self._changelog_path = None # Force a reset of the changelog
             self._ebooklet._deletes.clear()
 
-            if self._ebooklet._read_conn_open.uuid is None:
-                self._ebooklet._read_conn_open.get_init_bytes()
+            if self._ebooklet._remote_session.uuid is None:
+                self._ebooklet._remote_session.load_db_metadata()
 
         return success
 
@@ -504,7 +504,7 @@ class EVariableLengthValue(MutableMapping):
     """
     def __init__(
             self,
-            remote_conn: Union[remote.BaseConn, str],
+            remote_conn: Union[remote.S3Connection, str],
             file_path: Union[str, pathlib.Path],
             flag: str = "r",
             value_serializer: str = None,
@@ -535,25 +535,25 @@ class EVariableLengthValue(MutableMapping):
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
-        read_conn_open, write_conn_open = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
+        remote_session = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
 
         ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, value_serializer, n_buckets, buffer_size)
+        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_conn_open, flag)
+        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
         # Open remote index file
         if remote_index_path.exists():
             # remote_index = booklet.FixedValue(remote_index_path, 'r')
             if flag == 'r':
-                remote_index = booklet.FixedValue(remote_index_path, 'r')
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
             else:
-                remote_index = booklet.FixedValue(remote_index_path, 'w')
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
         else:
-            remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
+            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session)
 
         ## Assign properties
         if flag == 'r':
@@ -568,14 +568,15 @@ class EVariableLengthValue(MutableMapping):
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
         self._deletes = set()
-        self._read_conn_open = read_conn_open
-        self._write_conn_open = write_conn_open
+        # self._read_conn_open = read_conn_open
+        # self._write_conn_open = write_conn_open
+        self._remote_session = remote_session
         # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
         # self._clear = False
         # self._lock = lock
         self._subtype = 'EVariableLengthValue'
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._conn.threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
 
     # def _pre_value(self, value) -> bytes:
@@ -781,14 +782,14 @@ class EVariableLengthValue(MutableMapping):
             for key, remote_time_bytes in self._remote_index.items():
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
         else:
             for key in keys:
                 remote_time_bytes = self._remote_index.get(key)
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
 
         for f in concurrent.futures.as_completed(futures):
@@ -816,10 +817,10 @@ class EVariableLengthValue(MutableMapping):
         if check:
             if not self._local_file.writable:
                 self._local_file.reopen('w')
-                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
+                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
                 self._local_file.reopen('r')
             else:
-                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
+                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure
         else:
             return None
@@ -880,7 +881,7 @@ class EVariableLengthValue(MutableMapping):
     def sync(self):
         self._executor.shutdown()
         del self._executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._conn.threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -899,9 +900,9 @@ class EVariableLengthValue(MutableMapping):
         # if self._lock is not None:
         #     self._lock.aquire()
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._conn.threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
 
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_conn_open, self._write_conn_open)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._remote_session)
 
 
     # def pull(self):
@@ -961,151 +962,151 @@ class EVariableLengthValue(MutableMapping):
     #     return success
 
 
-class RemoteConnGroup(EVariableLengthValue):
-    """
+# class RemoteConnGroup(EVariableLengthValue):
+#     """
 
-    """
-    def __init__(self,
-                 remote_conn: Union[remote.BaseConn, str],
-                 file_path: Union[str, pathlib.Path],
-                 flag: str = "r",
-                 n_buckets: int=12007,
-                 buffer_size: int = 2**22,
-                 object_lock: bool=False,
-                 break_other_locks: bool=False,
-                 lock_timeout: int=-1,
-                 ):
-        """
+#     """
+#     def __init__(self,
+#                  remote_conn: Union[remote.BaseConn, str],
+#                  file_path: Union[str, pathlib.Path],
+#                  flag: str = "r",
+#                  n_buckets: int=12007,
+#                  buffer_size: int = 2**22,
+#                  object_lock: bool=False,
+#                  break_other_locks: bool=False,
+#                  lock_timeout: int=-1,
+#                  ):
+#         """
 
-        """
-        local_file_path = pathlib.Path(file_path)
+#         """
+#         local_file_path = pathlib.Path(file_path)
 
-        local_file_exists = local_file_path.exists()
+#         local_file_exists = local_file_path.exists()
 
-        ## Determine the remotes that read and write
-        read_conn_open, write_conn_open = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
+#         ## Determine the remotes that read and write
+#         read_conn_open, write_conn_open = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
 
-        ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, 'orjson_zstd', n_buckets, buffer_size)
+#         ## Init the local file
+#         local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, 'orjson_zstd', n_buckets, buffer_size)
 
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_conn_open, flag)
+#         remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_conn_open, flag)
 
-        # Open remote index file
-        if remote_index_path.exists():
-            # remote_index = booklet.FixedValue(remote_index_path, 'r')
-            if flag == 'r':
-                remote_index = booklet.FixedValue(remote_index_path, 'r')
-            else:
-                remote_index = booklet.FixedValue(remote_index_path, 'w')
-        else:
-            remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
+#         # Open remote index file
+#         if remote_index_path.exists():
+#             # remote_index = booklet.FixedValue(remote_index_path, 'r')
+#             if flag == 'r':
+#                 remote_index = booklet.FixedValue(remote_index_path, 'r')
+#             else:
+#                 remote_index = booklet.FixedValue(remote_index_path, 'w')
+#         else:
+#             remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
-        ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open)
+#         ## Finalizer
+#         self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open)
 
-        ## Assign properties
-        if flag == 'r':
-            self.writable = False
-        else:
-            self.writable = True
+#         ## Assign properties
+#         if flag == 'r':
+#             self.writable = False
+#         else:
+#             self.writable = True
 
-        self._flag = flag
-        self._remote_index_path = remote_index_path
-        self._local_file_path = local_file_path
-        self._local_file = local_file
-        self._remote_index_path = remote_index_path
-        self._remote_index = remote_index
-        self._deletes = set()
-        self._read_conn_open = read_conn_open
-        self._write_conn_open = write_conn_open
-        # self._changelog_path = None
-        self._n_buckets = local_file._n_buckets
-        # self._clear = False
-        # self._lock = lock
-        self._subtype = 'RemoteConnGroup'
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._conn.threads)
+#         self._flag = flag
+#         self._remote_index_path = remote_index_path
+#         self._local_file_path = local_file_path
+#         self._local_file = local_file
+#         self._remote_index_path = remote_index_path
+#         self._remote_index = remote_index
+#         self._deletes = set()
+#         self._read_conn_open = read_conn_open
+#         self._write_conn_open = write_conn_open
+#         # self._changelog_path = None
+#         self._n_buckets = local_file._n_buckets
+#         # self._clear = False
+#         # self._lock = lock
+#         self._subtype = 'RemoteConnGroup'
+#         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._conn.threads)
 
-    def items(self):
-        """
+#     def items(self):
+#         """
 
-        """
-        _ = self.load_items()
+#         """
+#         _ = self.load_items()
 
-        return self._local_file.items()
+#         return self._local_file.items()
 
-    def values(self):
-        _ = self.load_items()
+#     def values(self):
+#         _ = self.load_items()
 
-        return self._local_file.values()
+#         return self._local_file.values()
 
-    def timestamps(self, include_value=False):
-        """
-        Return an iterator for timestamps for all keys. Optionally add values to the iterator.
-        """
-        _ = self.load_items()
+#     def timestamps(self, include_value=False):
+#         """
+#         Return an iterator for timestamps for all keys. Optionally add values to the iterator.
+#         """
+#         _ = self.load_items()
 
-        return self._local_file.timestamps(include_value=include_value)
+#         return self._local_file.timestamps(include_value=include_value)
 
 
-    def get_timestamp(self, key, include_value=False, default=None):
-        """
-        Get a timestamp associated with a key. Optionally include the value.
-        """
-        failure = self._load_item(key)
-        if failure:
-            return failure
+#     def get_timestamp(self, key, include_value=False, default=None):
+#         """
+#         Get a timestamp associated with a key. Optionally include the value.
+#         """
+#         failure = self._load_item(key)
+#         if failure:
+#             return failure
 
-        return self._local_file.get_timestamp(key, include_value=include_value, default=default)
+#         return self._local_file.get_timestamp(key, include_value=include_value, default=default)
 
-    def set(self, conn: remote.BaseConn, timestamp=None):
-        """
+#     def set(self, conn: remote.BaseConn, timestamp=None):
+#         """
 
-        """
-        if self.writable:
-            uuid0 = conn.uuid
-            if uuid0 is None:
-                uuid0 = conn.get_uuid()
-                if uuid0 is None:
-                    raise ValueError('Remote does not exist. It must exist to be added to the RemoteConnGroup.')
+#         """
+#         if self.writable:
+#             uuid0 = conn.uuid
+#             if uuid0 is None:
+#                 uuid0 = conn.get_uuid()
+#                 if uuid0 is None:
+#                     raise ValueError('Remote does not exist. It must exist to be added to the RemoteConnGroup.')
 
-            uuid_hex = uuid0.hex
+#             uuid_hex = uuid0.hex
 
-            self._local_file.set(key, value, timestamp)
+#             self._local_file.set(key, value, timestamp)
 
-            # if self._read_conn.uuid:
-            #     int_us = utils.make_timestamp()
-            # else:
-            #     old_val = self._local_index.get(key)
-            #     if old_val:
-            #         int_us = utils.bytes_to_int(old_val) + 1
-            #     else:
-            #         int_us = 0
-            # val_bytes = self._pre_value(value)
-            # self._local_data[key] = val_bytes
-            # self._local_index[key] = utils.int_to_bytes(int_us, 7)
-        else:
-            raise ValueError('File is open for read only.')
+#             # if self._read_conn.uuid:
+#             #     int_us = utils.make_timestamp()
+#             # else:
+#             #     old_val = self._local_index.get(key)
+#             #     if old_val:
+#             #         int_us = utils.bytes_to_int(old_val) + 1
+#             #     else:
+#             #         int_us = 0
+#             # val_bytes = self._pre_value(value)
+#             # self._local_data[key] = val_bytes
+#             # self._local_index[key] = utils.int_to_bytes(int_us, 7)
+#         else:
+#             raise ValueError('File is open for read only.')
 
-    def get(self, key, default=None):
-        failure = self._load_item(key)
-        if failure:
-            return failure
+#     def get(self, key, default=None):
+#         failure = self._load_item(key)
+#         if failure:
+#             return failure
 
-        return self._local_file.get(key, default=default)
+#         return self._local_file.get(key, default=default)
 
-    def get_items(self, keys, default=None):
-        """
+#     def get_items(self, keys, default=None):
+#         """
 
-        """
-        _ = self.load_items(keys)
+#         """
+#         _ = self.load_items(keys)
 
-        for key in keys:
-            output = self._local_file.get(key, default=default)
-            if output is None:
-                yield key, None
-            else:
-                # ts, value = output
-                yield key, output
+#         for key in keys:
+#             output = self._local_file.get(key, default=default)
+#             if output is None:
+#                 yield key, None
+#             else:
+#                 # ts, value = output
+#                 yield key, output
 
 
 
@@ -1115,7 +1116,7 @@ def open(
     value_serializer: str = None,
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    remote_conn: Union[remote.BaseConn, str]=None,
+    remote_conn: Union[remote.S3Connection, str]=None,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. If remote_conn is not passed, then it opens a normal booklet file.
@@ -1141,7 +1142,7 @@ def open(
     buffer_size : int
         The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
         This is only used when the file is open for writing.
-    
+
     remote_conn : BaseConn, str, or None
         The object to connect to a remote. It can either be a Conn type object, an http url string, or None. If None, no remote connection is made and the file is only opened locally.
 

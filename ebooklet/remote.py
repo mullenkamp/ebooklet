@@ -17,8 +17,8 @@ import base64
 import copy
 # import msgspec
 
-import utils
-# from . import utils
+# import utils
+from . import utils
 
 
 ###############################################
@@ -45,7 +45,7 @@ def get_db_metadata(session, db_key):
         raise urllib3.exceptions.HTTPError(resp_obj.error)
 
     if meta is None:
-        return None
+        return dict(uuid=None, timestamp=None, ebooklet_type=None)
     else:
         meta['uuid'] = uuid6.UUID(hex=meta['uuid'])
         # self.uuid = uuid6.UUID(hex=meta['uuid'])
@@ -63,7 +63,7 @@ def get_user_metadata(session, db_key):
 
         meta = orjson.loads(resp_obj.data)
     elif resp_obj.status == 404:
-        meta = {}
+        meta = None
     else:
         raise urllib3.exceptions.HTTPError(resp_obj.error)
 
@@ -218,19 +218,18 @@ class JsonSerializer:
                   db_url=self.db_url,
                   # ebooklet_type=self.ebooklet_type,
                   # timestamp=self.timestamp,
-                  # user_meta=self.user_meta,
+                   user_meta=self.user_meta,
                   )
-        meta = dict(
+        db_meta = dict(
             ebooklet_type=self.ebooklet_type,
             timestamp=self.timestamp,
-            user_meta=self.user_meta,
             )
         uuid1 = self.uuid
         if uuid1 is not None:
-            meta['uuid'] = uuid1.hex
+            db_meta['uuid'] = uuid1.hex
         else:
-            meta['uuid'] = None
-        d1['meta'] = meta
+            db_meta['uuid'] = None
+        d1['db_meta'] = db_meta
 
         return orjson.dumps(
             d1
@@ -244,18 +243,20 @@ class S3SessionReader:
     def __init__(self,
                  read_session,
                  read_db_key,
+                 threads,
                  # timestamp,
                  # uuid,
                  # ebooklet_type,
                  # init_bytes,
                  ):
-        self.read_session = read_session
+        self._read_session = read_session
         self.read_db_key = read_db_key
+        self.threads = threads
         # self.timestamp = timestamp
         # self.uuid = uuid
         # self.ebooklet_type = ebooklet_type
         # self.init_bytes = init_bytes
-        self.load_metadata()
+        self.load_db_metadata()
 
     def __bool__(self):
         """
@@ -276,14 +277,14 @@ class S3SessionReader:
         if hasattr(self, '_finalizer'):
             self._finalizer()
 
-    def load_metadata(self):
+    def load_db_metadata(self):
         """
 
         """
-        resp_obj = self.read_session.head_object(self.read_db_key)
+        resp_obj = self._read_session.head_object(self.read_db_key)
         if resp_obj.status == 200:
             meta = resp_obj.metadata
-            self._init_bytes = base64.b64decode(meta['init_bytes'])
+            self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid6.UUID(hex=meta['uuid'])
             self.ebooklet_type = meta['ebooklet_type']
@@ -361,7 +362,7 @@ class S3SessionReader:
         """
 
         """
-        return self.read_session.get_object(self.read_db_key)
+        return self._read_session.get_object(self.read_db_key)
 
     # def head_db_object(self):
     #     """
@@ -375,7 +376,7 @@ class S3SessionReader:
         """
         Get a remote object/file. The input should be a key as a str. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
         """
-        return self.read_session.get_object(self.read_db_key + '/' + key)
+        return self._read_session.get_object(self.read_db_key + '/' + key)
 
     # def head_object(self, key: str):
     #     """
@@ -393,6 +394,7 @@ class S3SessionWriter(S3SessionReader):
                  write_session,
                  read_db_key,
                  write_db_key,
+                 threads,
                  # timestamp,
                  # uuid,
                  # ebooklet_type,
@@ -401,10 +403,11 @@ class S3SessionWriter(S3SessionReader):
                  break_other_locks=False,
                  lock_timeout=-1
                  ):
-        self.read_session = read_session
-        self.write_session = write_session
+        self._read_session = read_session
+        self._write_session = write_session
         self.read_db_key = read_db_key
         self.write_db_key = write_db_key
+        self.threads = threads
         # self.timestamp = timestamp
         # self.uuid = uuid
         # self.ebooklet_type = ebooklet_type
@@ -417,31 +420,37 @@ class S3SessionWriter(S3SessionReader):
                 lock.break_other_locks()
 
             lock.aquire(timeout=lock_timeout)
+
+            self._writable_check = True
+            self._writable = True
         else:
             lock = None
 
+            self._writable_check = False
+            self._writable = False
+
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.s3session_finalizer, self.write_session, lock)
+        self._finalizer = weakref.finalize(self, utils.s3session_finalizer, self._write_session, lock)
 
         ## Get latest metadata
-        self.load_metadata()
+        self.load_db_metadata()
 
     @property
     def writable(self):
         """
-        Should I include this? Or should I simply let the other mathods fail if it's not writable?
+        Should I include this? Or should I simply let the other methods fail if it's not writable? I do like having an explicit test...
         """
-        # if not self._writable_check:
-        #     test_key = self.write_db_key + uuid6.uuid6().hex[:13]
-        #     put_resp = self.write_session.put_object(test_key, b'0')
-        #     if put_resp.status // 100 == 2:
-        #         self._writable = True
-        #         _ = self.write_session.delete_object(test_key, put_resp.metadata['version_id'])
+        if not self._writable_check:
+            test_key = self.write_db_key + uuid6.uuid6().hex[:13]
+            put_resp = self._write_session.put_object(test_key, b'0')
+            if put_resp.status // 100 == 2:
+                del_resp = self._write_session.delete_object(test_key, put_resp.metadata['version_id'])
+                if del_resp.status // 100 == 2:
+                    self._writable = True
 
-        #     self._writable_check = True
+            self._writable_check = True
 
-        # return self._writable
-        return True
+        return self._writable
 
 
     def put_db_object(self, data: bytes, metadata):
@@ -449,9 +458,9 @@ class S3SessionWriter(S3SessionReader):
 
         """
         if self.writable:
-            return self.write_session.put_object(self.write_db_key, data, metadata=metadata)
+            return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
         else:
-            raise ValueError('Conn is not writable.')
+            raise ValueError('Session is not writable.')
 
 
     # def put_db_index_object(self, data: bytes, metadata={}):
@@ -469,9 +478,9 @@ class S3SessionWriter(S3SessionReader):
 
         """
         if self.writable:
-            return self.write_session.put_object(self.write_db_key + '/' + key, data, metadata=metadata)
+            return self._write_session.put_object(self.write_db_key + '/' + key, data, metadata=metadata)
         else:
-            raise ValueError('Conn is not writable.')
+            raise ValueError('Session is not writable.')
 
 
     def delete_objects(self, keys):
@@ -480,7 +489,7 @@ class S3SessionWriter(S3SessionReader):
         """
         if self.writable:
             del_list = []
-            resp = self.write_session.list_object_versions(prefix=self.write_db_key + '/')
+            resp = self._write_session.list_object_versions(prefix=self.write_db_key + '/')
             for obj in resp.iter_objects():
                 key0 = obj['key']
                 key = key0.split('/')[-1]
@@ -488,11 +497,11 @@ class S3SessionWriter(S3SessionReader):
                     del_list.append({'Key': key0, 'VersionId': obj['version_id']})
 
             if del_list:
-                del_resp = self.write_session.delete_objects(del_list)
+                del_resp = self._write_session.delete_objects(del_list)
                 if del_resp.status // 100 != 2:
                     raise urllib3.exceptions.HTTPError(del_resp.error)
         else:
-            raise ValueError('Conn is not writable.')
+            raise ValueError('Session is not writable.')
 
 
     def delete_remote(self):
@@ -501,16 +510,16 @@ class S3SessionWriter(S3SessionReader):
         """
         if self.writable:
             del_list = []
-            resp = self.write_session.list_object_versions(prefix=self.write_db_key)
+            resp = self._write_session.list_object_versions(prefix=self.write_db_key)
             for obj in resp.iter_objects():
                 key0 = obj['key']
                 del_list.append({'Key': key0, 'VersionId': obj['version_id']})
 
-            self.write_session.delete_objects(del_list)
+            self._write_session.delete_objects(del_list)
             self._init_bytes = None
             self.uuid = None
         else:
-            raise ValueError('Conn is not writable.')
+            raise ValueError('Session is not writable.')
 
     # def rebuild_index(self):
     #     """
@@ -558,7 +567,8 @@ class S3Connection(JsonSerializer):
                 threads: int=20,
                 read_timeout: int=60,
                 retries: int=3,
-                meta: dict={},
+                db_meta: dict=None,
+                user_meta: dict=None,
                 ):
         """
 
@@ -579,26 +589,25 @@ class S3Connection(JsonSerializer):
             raise ValueError('Either db_url or a combo of access_key_id, access_key, db_key, and bucket (and optionally endpoint_url) must be passed.')
 
         ## Get metadata if necessary
-        if all([k in meta for k in ('uuid', 'ebooklet_type', 'timestamp')]):
-            uuid = meta['uuid']
+        if db_meta is None:
+            meta = get_db_metadata(read_session, key)
+        elif all([k in db_meta for k in ('uuid', 'ebooklet_type', 'timestamp')]):
+            uuid = db_meta['uuid']
             if isinstance(uuid, (str, uuid6.UUID)):
                 if isinstance(uuid, str):
-                    meta['uuid'] = uuid6.UUID(hex=uuid)
+                    db_meta['uuid'] = uuid6.UUID(hex=uuid)
                 else:
                     raise TypeError('uuid in meta must be either a string or UUID')
 
-            ebooklet_type = meta['ebooklet_type']
+            ebooklet_type = db_meta['ebooklet_type']
             if ebooklet_type not in ebooklet_types:
                 raise ValueError(f'ebooklet_type in meta must be one of {ebooklet_types}')
-            if 'user_meta' in meta:
-                user_meta = meta['user_meta']
-                if not isinstance(user_meta, dict):
-                    raise TypeError('user_meta in meta must be a dict')
-            else:
-                user_meta = {}
         else:
             meta = get_db_metadata(read_session, key)
-            user_meta = {}
+
+        if user_meta is not None:
+            if not isinstance(user_meta, dict):
+                raise TypeError('user_meta in meta must be a dict or None')
 
         # read_session.clear()
 
@@ -680,7 +689,7 @@ class S3Connection(JsonSerializer):
         read_session, read_db_key = self._make_read_session()
 
         if flag == 'r':
-            return S3SessionReader(read_session, read_db_key)
+            return S3SessionReader(read_session, read_db_key, self.threads)
         else:
             write_session, write_db_key = create_s3_write_session(
                     self.access_key_id,
@@ -696,19 +705,20 @@ class S3Connection(JsonSerializer):
             if write_session is None:
                 raise ValueError("A write session could not be created. Check that all the inputs are assigned.")
 
+            session_writer = S3SessionWriter(
+                                    read_session,
+                                    write_session,
+                                    read_db_key,
+                                    write_db_key,
+                                    self.threads,
+                                    object_lock,
+                                    break_other_locks,
+                                    lock_timeout,
+                                    )
+
             # Check to make sure the uuids are the same if the read and write sessions are different
             if isinstance(read_session, s3func.HttpSession) and self.uuid is not None:
-                http_uuid = copy.deepcopy(self.uuid)
-                session_writer = S3SessionWriter(
-                                        read_session,
-                                        write_session,
-                                        read_db_key,
-                                        write_db_key,
-                                        object_lock,
-                                        break_other_locks,
-                                        lock_timeout,
-                                        )
-                if http_uuid != session_writer.uuid:
+                if self.uuid != session_writer.uuid:
                     raise ValueError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
 
             return session_writer

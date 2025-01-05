@@ -27,8 +27,8 @@ import concurrent.futures
 # from collections.abc import Mapping, MutableMapping
 # from __init__ import __version__ as version
 
-import remote
-# from . import remote
+# import remote
+from . import remote
 
 ############################################
 ### Parameters
@@ -110,17 +110,18 @@ def s3session_finalizer(session, lock):
 #         lock.release()
 
 
-def ebooklet_finalizer(local_file, remote_index, read_conn, write_conn):
+def ebooklet_finalizer(local_file, remote_index, remote_session):
     """
     The finalizer function for book instances.
     """
     local_file.close()
-    if remote_index is not None:
-        remote_index.close()
-    if read_conn is not None:
-        read_conn.close()
-    if write_conn is not None:
-        write_conn.close()
+    # if remote_index is not None:
+    remote_index.close()
+    remote_session.close()
+    # if read_conn is not None:
+    #     read_conn.close()
+    # if write_conn is not None:
+    #     write_conn.close()
     # if lock is not None:
     #     lock.release()
 
@@ -176,63 +177,35 @@ def check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_tim
 
     """
     if isinstance(remote_conn, str):
-        remote_conn = remote.HttpConn(remote_conn)
-        read_conn_open = remote_conn.open()
-        write_conn_open = None
+        if flag != 'r':
+            raise ValueError('If remote_conn is a url string, then flag must be r.')
+        remote_conn = remote.S3Connection(db_url=remote_conn)
+        remote_session = remote_conn.open('r')
 
-    elif 's3_conn' in remote_conn.type:
-        if remote_conn.type == 's3_conn':
-            if object_lock and (flag != 'r'):
-                remote_conn_open = remote_conn.open(object_lock, break_other_locks, lock_timeout)
-            else:
-                remote_conn_open = remote_conn.open()
+    elif isinstance(remote_conn, remote.S3Connection):
+        if object_lock and (flag != 'r'):
+            remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
         else:
-            remote_conn_open = remote_conn
-        read_conn_open = remote_conn_open
-        write_conn_open = remote_conn_open
-
-    elif 'http_conn' in remote_conn.type:
-        if remote_conn.type == 'http_conn':
-            read_conn_open = remote_conn.open()
-        else:
-            read_conn_open = remote_conn
-        write_conn_open = None
-
-    elif 'conn' in remote_conn.type:
-        if remote_conn.type == 'conn':
-            if object_lock and (flag != 'r'):
-                remote_conn_open = remote_conn.open(object_lock, break_other_locks, lock_timeout)
-            else:
-                remote_conn_open = remote_conn.open()
-        else:
-            remote_conn_open = remote_conn
-        read_conn_open = remote_conn_open.http_conn_open
-        write_conn_open = remote_conn_open.s3_conn_open
+            remote_session = remote_conn.open(flag)
 
     else:
-        raise TypeError('The remote must be either a Conn object or a url string.')
+        raise TypeError('The remote_conn must be either an S3Connection object or a url string.')
 
-    if flag in ('r', 'w') and (read_conn_open.uuid is None) and not local_file_exists:
+    if flag in ('r', 'w') and (remote_session.uuid is None) and not local_file_exists:
         raise ValueError('No file was found in the remote, but the local file was open for read and write without creating a new file.')
-    elif flag != 'r' and write_conn_open is None and not local_file_exists:
-        raise ValueError('If open for write, then an S3Remote object must be passed.')
+    # elif flag != 'r' and remote_session is None and not local_file_exists:
+    #     raise ValueError('If open for write, then an S3Remote object must be passed.')
 
-    # if lock_remote and (write_conn_open is not None) and (flag != 'r'):
-    #     lock = write_conn_open.lock()
-    #     lock.aquire()
-    # else:
-    #     lock = None
-
-    return read_conn_open, write_conn_open
+    return remote_session
 
 
-def check_local_remote_sync(local_file, read_conn, flag):
+def check_local_remote_sync(local_file, remote_session, flag):
     """
 
     """
     overwrite_remote_index = False
 
-    remote_uuid = read_conn.uuid
+    remote_uuid = remote_session.uuid
     if remote_uuid and flag != 'n':
         local_uuid = local_file.uuid
 
@@ -240,17 +213,17 @@ def check_local_remote_sync(local_file, read_conn, flag):
             raise ValueError('The local file has a different UUID than the remote. Use a different local file path or delete the existing one.')
 
         ## Check timestamp to determine if the local remote_index needs to be updated
-        if (read_conn.timestamp > local_file._file_timestamp):
+        if (remote_session.timestamp > local_file._file_timestamp):
             overwrite_remote_index = True
 
     return overwrite_remote_index
 
 
-def init_local_file(local_file_path, flag, read_conn, value_serializer, n_buckets, buffer_size):
+def init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size):
     """
 
     """
-    remote_uuid = read_conn.uuid
+    remote_uuid = remote_session.uuid
 
     if local_file_path.exists():
 
@@ -264,12 +237,12 @@ def init_local_file(local_file_path, flag, read_conn, value_serializer, n_bucket
             else:
                 local_file = booklet.open(local_file_path, 'w')
 
-            overwrite_remote_index = check_local_remote_sync(local_file, read_conn, flag)
+            overwrite_remote_index = check_local_remote_sync(local_file, remote_session, flag)
 
     else:
         if remote_uuid:
             ## Init with the remote bytes - keeps the remote uuid and timestamp
-            local_file = booklet.open(local_file_path, flag='n', init_bytes=read_conn._init_bytes)
+            local_file = booklet.open(local_file_path, flag='n', init_bytes=remote_session._init_bytes)
             local_file._n_keys = 0
 
             overwrite_remote_index = True
@@ -282,17 +255,17 @@ def init_local_file(local_file_path, flag, read_conn, value_serializer, n_bucket
     return local_file, overwrite_remote_index
 
 
-def get_remote_index_file(local_file_path, overwrite_remote_index, read_conn, flag):
+def get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag):
     """
 
     """
     remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
 
     if (not remote_index_path.exists() or overwrite_remote_index) and (flag != 'n'):
-        if read_conn.uuid:
+        if remote_session.uuid:
             # remote_index_key = read_conn.db_key + '.remote_index'
 
-            index0 = read_conn.get_db_object()
+            index0 = remote_session.get_db_object()
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
@@ -492,11 +465,11 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, read_conn, fl
 #     return remote_index_path
 
 
-def get_remote_value(local_file, key, read_conn):
+def get_remote_value(local_file, key, remote_session):
     """
 
     """
-    resp = read_conn.get_object(key)
+    resp = remote_session.get_object(key)
 
     if resp.status == 200:
         timestamp = int(resp.metadata['timestamp'])
@@ -647,7 +620,7 @@ def check_local_vs_remote(local_file, remote_time_bytes, key):
 #     return changelog_path
 
 
-def create_changelog(local_file_path, local_file, remote_index, read_conn_open):
+def create_changelog(local_file_path, local_file, remote_index, remote_session):
     """
     Only check and save by the microsecond timestamp. Might need to add in the md5 hash if this is not sufficient.
     """
@@ -657,8 +630,8 @@ def create_changelog(local_file_path, local_file, remote_index, read_conn_open):
     else:
         n_buckets = local_file._n_buckets
 
-    with booklet.FixedValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
-        if read_conn_open.uuid and remote_index is not None:
+    with booklet.FixedLengthValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
+        if remote_session.uuid and remote_index is not None:
             for key, local_int_us in local_file.timestamps():
                 remote_bytes_us = remote_index.get(key)
                 if remote_bytes_us:
@@ -681,7 +654,7 @@ def view_changelog(changelog_path):
     """
 
     """
-    with booklet.FixedValue(changelog_path) as f:
+    with booklet.FixedLengthValue(changelog_path) as f:
         for key, val in f.items():
             local_bytes_us = val[:7]
             remote_bytes_us = val[7:]
@@ -708,7 +681,7 @@ def view_changelog(changelog_path):
 ### Update remote
 
 
-def update_remote(local_file, remote_index, changelog_path, write_conn_open, executor, force_push, deletes, flag, ebooklet_type):
+def update_remote(local_file, remote_index, changelog_path, remote_session, executor, force_push, deletes, flag, ebooklet_type):
     """
 
     """
@@ -718,17 +691,17 @@ def update_remote(local_file, remote_index, changelog_path, write_conn_open, exe
 
     ## If file was open for replacement (n), then delete everything in the remote
     if flag == 'n':
-        write_conn_open.delete_remote()
+        remote_session.delete_remote()
 
     ## Upload data and update the remote_index file
-    remote_index.reopen('w')
+    # remote_index.reopen('w')
 
     futures = {}
-    with booklet.FixedValue(changelog_path) as cl:
+    with booklet.FixedLengthValue(changelog_path) as cl:
         for key in cl:
             # remote_key = base_remote_key + '/' + key
             time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
-            f = executor.submit(write_conn_open.put_object, key, valb, {'timestamp': str(time_int_us)})
+            f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
             futures[f] = key
 
     ## Check the uploads to see if any fail
@@ -769,9 +742,9 @@ def update_remote(local_file, remote_index, changelog_path, write_conn_open, exe
         # f = executor.submit(write_conn_open.put_db_object, remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.b64encode(local_init_bytes)})
         # futures[f] = write_conn_open.db_key
 
-        resp = write_conn_open.put_db_object(remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.b64encode(local_init_bytes).decode()})
+        resp = remote_session.put_db_object(remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
-        remote_index.reopen('r')
+        # remote_index.reopen('r')
 
         if resp.status // 100 != 2:
             urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
@@ -810,12 +783,12 @@ def update_remote(local_file, remote_index, changelog_path, write_conn_open, exe
 
         ## remove deletes in remote
         if deletes:
-            write_conn_open.delete_objects(deletes)
+            remote_session.delete_objects(deletes)
             deletes.clear()
 
         return True
     else:
-        remote_index.reopen('r')
+        # remote_index.reopen('r')
         return False
 
 
