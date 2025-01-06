@@ -29,7 +29,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "spyder-kernels==2.5",
+  "spyder-kernels==2.5.2",
   "black",
   "mypy",
   "ruff",

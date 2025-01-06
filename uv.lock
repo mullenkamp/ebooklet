@@ -294,7 +294,7 @@ wheels = [
 
 [[package]]
 name = "ebooklet"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "booklet" },
@@ -326,7 +326,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
-    { name = "spyder-kernels", specifier = "==2.5" },
+    { name = "spyder-kernels", specifier = "==2.5.2" },
 ]
 
 [[package]]
@@ -901,7 +901,7 @@ wheels = [
 
 [[package]]
 name = "spyder-kernels"
-version = "2.5.0"
+version = "2.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cloudpickle" },
@@ -911,9 +911,9 @@ dependencies = [
     { name = "pyzmq" },
     { name = "wurlitzer", marker = "sys_platform != 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0c/66/0411318c99c1de3660e1edf5526fe2b7397253405e6075b7aaf92b136960/spyder-kernels-2.5.0.tar.gz", hash = "sha256:3368426c04457e0211884e9274fa47eb556252ba4c073df275e83c65df7ba2a1", size = 99908 }
+sdist = { url = "https://files.pythonhosted.org/packages/2e/a9/f11bf896f5324f47ab45d5ee7cdd0de3e6b3a7c03157d40c359bc5e6cbcb/spyder_kernels-2.5.2.tar.gz", hash = "sha256:71f252900e02b0394820cc7049f89ed725243f6fccf640b76dd329203c413960", size = 99972 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/62/0742e741466426cb0575e36723d3c1213cf03e3c70dc16c668e08456ea8b/spyder_kernels-2.5.0-py2.py3-none-any.whl", hash = "sha256:b2697b5accd6c237b85c2f6e3a0872abc3199bef36800271f461278de5f97caa", size = 99520 },
+    { url = "https://files.pythonhosted.org/packages/ae/31/96c70d110b15bcee3b9fe23589e81d7c3fbe27522a5edfe00a40fb22a056/spyder_kernels-2.5.2-py2.py3-none-any.whl", hash = "sha256:1c95bc09ca20f54c981e7d923708df85c6d6583f683e23923e10d524628bc000", size = 99544 },
 ]
 
 [[package]]
