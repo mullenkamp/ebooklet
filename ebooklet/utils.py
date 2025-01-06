@@ -176,20 +176,25 @@ def check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_tim
     """
 
     """
-    if isinstance(remote_conn, str):
-        if flag != 'r':
-            raise ValueError('If remote_conn is a url string, then flag must be r.')
-        remote_conn = remote.S3Connection(db_url=remote_conn)
-        remote_session = remote_conn.open('r')
-
-    elif isinstance(remote_conn, remote.S3Connection):
-        if object_lock and (flag != 'r'):
-            remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
-        else:
-            remote_session = remote_conn.open(flag)
-
+    if object_lock and (flag != 'r'):
+        remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
     else:
-        raise TypeError('The remote_conn must be either an S3Connection object or a url string.')
+        remote_session = remote_conn.open(flag)
+
+    # if isinstance(remote_conn, str):
+    #     if flag != 'r':
+    #         raise ValueError('If remote_conn is a url string, then flag must be r.')
+    #     remote_conn = remote.S3Connection(db_url=remote_conn)
+    #     remote_session = remote_conn.open('r')
+
+    # elif isinstance(remote_conn, remote.S3Connection):
+    #     if object_lock and (flag != 'r'):
+    #         remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
+    #     else:
+    #         remote_session = remote_conn.open(flag)
+
+    # else:
+    #     raise TypeError('The remote_conn must be either an S3Connection object or a url string.')
 
     if flag in ('r', 'w') and (remote_session.uuid is None) and not local_file_exists:
         raise ValueError('No file was found in the remote, but the local file was open for read and write without creating a new file.')

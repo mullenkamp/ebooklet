@@ -50,7 +50,8 @@ def get_db_metadata(session, db_key):
         meta['uuid'] = uuid6.UUID(hex=meta['uuid'])
         # self.uuid = uuid6.UUID(hex=meta['uuid'])
         # self.ebooklet_type = meta['ebooklet_type']
-        # self.timestamp = int(meta['timestamp'])
+        meta['timestamp'] = int(meta['timestamp'])
+
         return meta
 
 
@@ -211,7 +212,7 @@ def create_s3_write_session(
 
 
 class JsonSerializer:
-    def dumps(self):
+    def to_dict(self):
         d1 = dict(db_key=self.db_key,
                   bucket=self.bucket,
                   endpoint_url=self.endpoint_url,
@@ -231,9 +232,10 @@ class JsonSerializer:
             db_meta['uuid'] = None
         d1['db_meta'] = db_meta
 
-        return orjson.dumps(
-            d1
-            )
+        return d1
+
+    def dumps(self):
+        return orjson.dumps(self.to_dict())
 
 
 class S3SessionReader:

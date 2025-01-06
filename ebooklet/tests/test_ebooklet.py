@@ -46,8 +46,9 @@ base_url = 'https://b2.tethys-ts.xyz/file/' + bucket + '/'
 db_url = base_url +  db_key
 value_serializer = 'pickle'
 remote_object_lock=False
-init_remote=True
-local_storage_kwargs = {}
+file_path_rcg = pathlib.Path(str(file_path) + '.rcg')
+db_key_rcg = db_key + '.rcg'
+db_url_rcg = db_url + '.rcg'
 
 data_dict = {str(key): key*2 for key in range(2, 30)}
 
@@ -302,15 +303,51 @@ def test_push():
 
 
 def test_read_remote():
-    # http_remote = remote.HttpConn(db_url)
+    http_remote = remote.S3Connection(db_url=db_url)
 
-    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
+    with ebooklet.open(file_path, remote_conn=http_remote) as f:
         value1 = f['10']
         assert value1 == data_dict['10']
 
         for key, value in f.items():
             source_value = data_dict[key]
             assert source_value == value
+
+
+############################################
+### RemoteConnGroup
+
+remote_conn_rcg = remote.S3Connection(access_key_id, access_key, db_key_rcg, bucket, endpoint_url=endpoint_url, db_url=db_url_rcg)
+
+def test_remote_conn_grp_set():
+    remote_conn.load_db_metadata()
+    remote_conn_uuid_hex = remote_conn.uuid.hex
+
+    with ebooklet.open(file_path_rcg, 'n', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+        f.add(remote_conn)
+
+    with ebooklet.open(file_path_rcg) as f:
+        conn_dict = f[remote_conn_uuid_hex]
+
+        assert isinstance(conn_dict, dict)
+
+def test_remote_conn_grp_push():
+    with ebooklet.open(file_path_rcg, 'w', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+        changes = f.changes()
+        # print(list(changes.iter_changes()))
+        changes.push()
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path_rcg.unlink()
+
+def test_remote_conn_grp_read_remote():
+    remote_conn_uuid_hex = remote_conn.uuid.hex
+    # http_remote = remote.S3Connection(db_url=db_url)
+
+    with ebooklet.open(file_path_rcg, remote_conn=db_url_rcg) as f:
+        conn_dict = f[remote_conn_uuid_hex]
+        assert isinstance(conn_dict, dict)
 
 
 ##################################
