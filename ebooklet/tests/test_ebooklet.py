@@ -225,13 +225,6 @@ def test_delete_len():
         assert new_len == len(data)
 
 
-# def test_items2():
-#     with EBooklet(s3_conn, file_path, init_check_remote=False) as f:
-#         for key, value in f.items():
-#             source_value = data[key]
-#             assert source_value == value
-
-
 def test_values():
     with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         for value in f.values():
@@ -360,6 +353,15 @@ def test_remove_remote_local():
     file_path.unlink()
     remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
     remote_index_path.unlink()
+
+    with remote_conn_rcg.open('w') as s3open:
+        s3open.delete_remote()
+
+    file_path_rcg.unlink()
+    remote_index_path = file_path.parent.joinpath(file_path_rcg.name + '.remote_index')
+    remote_index_path.unlink()
+
+
 
 
 
