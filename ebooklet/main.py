@@ -3,27 +3,14 @@
 """
 
 """
-import io
-import os
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Generic, Iterator, Union, List, Dict
 import pathlib
 import concurrent.futures
-import multiprocessing
-import threading
 import booklet
-import s3func
-# import zstandard as zstd
-import orjson
-import pprint
-import tempfile
 import weakref
-import shutil
-import uuid6 as uuid
-import urllib3
 from itertools import count
 from collections import deque
-# import portalocker
 
 # import utils
 from . import utils
@@ -35,8 +22,8 @@ from . import remote
 # version = 1
 # version_bytes = version.to_bytes(2, 'little', signed=False)
 
-lock_remote = False
-break_other_locks = False
+# lock_remote = False
+# break_other_locks = False
 
 #######################################################
 ### Classes
@@ -62,14 +49,14 @@ class Change:
         self._ebooklet.sync()
 
         ## update the remote timestamp
-        self._ebooklet._read_conn_open.get_timestamp()
+        self._ebooklet._remote_session.get_timestamp()
 
         ## Determine if a change has occurred
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._read_conn_open, self._ebooklet._flag)
+        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._remote_session, self._ebooklet._flag)
 
         ## Pull down the remote index
         if overwrite_remote_index:
-            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._read_conn_open, self._ebooklet._flag)
+            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._remote_session, self._ebooklet._flag)
 
 
     def update(self):
@@ -77,7 +64,7 @@ class Change:
 
         """
         self._ebooklet.sync()
-        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._read_conn_open)
+        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session)
 
         self._changelog_path = changelog_path
 
@@ -114,7 +101,7 @@ class Change:
         Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating).
         Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
         """
-        if not self._ebooklet._write_conn_open.writable:
+        if not self._ebooklet._remote_session.writable:
             raise ValueError('Remote is not writable.')
 
         if not self._ebooklet.writable:
@@ -129,15 +116,15 @@ class Change:
         #     self._finalizer.detach()
         #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
 
-        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._write_conn_open, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag)
+        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet._subtype)
 
         if success:
             self._changelog_path.unlink()
             self._changelog_path = None # Force a reset of the changelog
             self._ebooklet._deletes.clear()
 
-            if self._ebooklet._read_conn_open.uuid is None:
-                self._ebooklet._read_conn_open.get_init_bytes()
+            if self._ebooklet._remote_session.uuid is None:
+                self._ebooklet._remote_session.load_db_metadata()
 
         return success
 
@@ -498,21 +485,21 @@ class Change:
 #             return False
 
 
-class EBooklet(MutableMapping):
+class EVariableLengthValue(MutableMapping):
     """
 
     """
     def __init__(
             self,
-            remote_conn: Union[remote.BaseConn, str],
+            remote_conn: remote.S3Connection,
             file_path: Union[str, pathlib.Path],
             flag: str = "r",
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            # init_check_remote: bool=True,
-            # lock_remote: bool=True,
-            # break_other_locks=False,
+            object_lock: bool=False,
+            break_other_locks: bool=False,
+            lock_timeout: int=-1,
             # inherit_remote: Union[remotes.BaseRemote, str]=None,
             # inherit_data: bool=False,
             ):
@@ -535,25 +522,25 @@ class EBooklet(MutableMapping):
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
-        read_conn_open, write_conn_open, lock = utils.check_parse_remotes(remote_conn, flag, lock_remote, break_other_locks, local_file_exists)
+        remote_session = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
 
         ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, read_conn_open, value_serializer, n_buckets, buffer_size)
+        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, read_conn_open, flag)
+        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
         # Open remote index file
         if remote_index_path.exists():
             # remote_index = booklet.FixedValue(remote_index_path, 'r')
             if flag == 'r':
-                remote_index = booklet.FixedValue(remote_index_path, 'r')
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
             else:
-                remote_index = booklet.FixedValue(remote_index_path, 'w')
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
         else:
-            remote_index = booklet.FixedValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
+            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, read_conn_open, write_conn_open, None)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session)
 
         ## Assign properties
         if flag == 'r':
@@ -568,12 +555,15 @@ class EBooklet(MutableMapping):
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
         self._deletes = set()
-        self._read_conn_open = read_conn_open
-        self._write_conn_open = write_conn_open
+        # self._read_conn_open = read_conn_open
+        # self._write_conn_open = write_conn_open
+        self._remote_session = remote_session
         # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
-        self._clear = False
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=read_conn_open._threads)
+        # self._clear = False
+        # self._lock = lock
+        self._subtype = 'EVariableLengthValue'
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
 
     # def _pre_value(self, value) -> bytes:
@@ -779,14 +769,14 @@ class EBooklet(MutableMapping):
             for key, remote_time_bytes in self._remote_index.items():
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
         else:
             for key in keys:
                 remote_time_bytes = self._remote_index.get(key)
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._read_conn_open)
+                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
 
         for f in concurrent.futures.as_completed(futures):
@@ -814,10 +804,10 @@ class EBooklet(MutableMapping):
         if check:
             if not self._local_file.writable:
                 self._local_file.reopen('w')
-                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
+                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
                 self._local_file.reopen('r')
             else:
-                failure = utils.get_remote_value(self._local_file, key, self._read_conn_open)
+                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure
         else:
             return None
@@ -878,7 +868,7 @@ class EBooklet(MutableMapping):
     def sync(self):
         self._executor.shutdown()
         del self._executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -894,9 +884,12 @@ class EBooklet(MutableMapping):
         self._local_file.reopen(flag)
         self._remote_index.reopen(flag)
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._read_conn_open._threads)
+        # if self._lock is not None:
+        #     self._lock.aquire()
 
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._read_conn_open, self._write_conn_open, None)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
+
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._remote_session)
 
 
     # def pull(self):
@@ -956,52 +949,186 @@ class EBooklet(MutableMapping):
     #     return success
 
 
+class RemoteConnGroup(EVariableLengthValue):
+    """
+
+    """
+    def __init__(
+            self,
+            remote_conn: remote.S3Connection,
+            file_path: Union[str, pathlib.Path],
+            flag: str = "r",
+            n_buckets: int=12007,
+            buffer_size: int = 2**22,
+            object_lock: bool=False,
+            break_other_locks: bool=False,
+            lock_timeout: int=-1,
+            # inherit_remote: Union[remotes.BaseRemote, str]=None,
+            # inherit_data: bool=False,
+            ):
+        """
+
+        """
+        ## Inherit another remote
+        # if (inherit_remote is not None) and (flag in ('c', 'n')):
+        #     if isinstance(inherit_remote, str):
+        #         inherit_remote = remotes.HttpRemote(inherit_remote)
+        #     elif not isinstance(inherit_remote, remotes.BaseRemote):
+        #         raise TypeError('inherit_remote must be either a Remote or a url string.')
+
+            # TODO: Pull down the remote ebooklet and assign it to this new object
+
+        # check_timestamp = init_check_remote
+
+        local_file_path = pathlib.Path(file_path)
+
+        local_file_exists = local_file_path.exists()
+
+        ## Determine the remotes that read and write
+        remote_session = utils.check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists)
+
+        ## Init the local file
+        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, 'orjson', n_buckets, buffer_size)
+
+        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
+
+        # Open remote index file
+        if remote_index_path.exists():
+            # remote_index = booklet.FixedValue(remote_index_path, 'r')
+            if flag == 'r':
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
+            else:
+                remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
+        else:
+            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
+
+        ## Finalizer
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session)
+
+        ## Assign properties
+        if flag == 'r':
+            self.writable = False
+        else:
+            self.writable = True
+
+        self._flag = flag
+        self._remote_index_path = remote_index_path
+        self._local_file_path = local_file_path
+        self._local_file = local_file
+        self._remote_index_path = remote_index_path
+        self._remote_index = remote_index
+        self._deletes = set()
+        # self._read_conn_open = read_conn_open
+        # self._write_conn_open = write_conn_open
+        self._remote_session = remote_session
+        # self._changelog_path = None
+        self._n_buckets = local_file._n_buckets
+        # self._clear = False
+        # self._lock = lock
+        self._subtype = 'RemoteConnGroup'
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
+
+
+    def add(self, remote_conn: remote.S3Connection):
+        """
+
+        """
+        if self.writable:
+
+            if not isinstance(remote_conn, remote.S3Connection):
+                raise TypeError('remote_conn/value must be a remote.S3Connection')
+
+            ## Update remote_conn meta
+            remote_conn.load_db_metadata()
+            remote_conn.load_user_metadata()
+
+            uuid0 = remote_conn.uuid
+            if uuid0 is None:
+                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+
+            uuid_hex = uuid0.hex
+
+            value = remote_conn.to_dict()
+
+            self._local_file.set(uuid_hex, value, remote_conn.timestamp)
+
+        else:
+            raise ValueError('File is open for read only.')
+
+
+    def set(self, key, remote_conn: remote.S3Connection):
+        """
+
+        """
+        if self.writable:
+
+            if not isinstance(remote_conn, remote.S3Connection):
+                raise TypeError('remote_conn/value must be a remote.S3Connection')
+
+            ## Update remote_conn meta
+            remote_conn.load_db_metadata()
+            remote_conn.load_user_metadata()
+
+            uuid0 = remote_conn.uuid
+            if uuid0 is None:
+                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+
+            uuid_hex = uuid0.hex
+
+            if key != uuid_hex:
+                raise KeyError('The key must be the uuid hex.')
+
+            value = remote_conn.to_dict()
+
+            self._local_file.set(uuid_hex, value, remote_conn.timestamp)
+
+        else:
+            raise ValueError('File is open for read only.')
+
+
+
 def open(
     file_path: Union[str, pathlib.Path],
     flag: str = "r",
     value_serializer: str = None,
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    remote_conn: Union[remote.BaseConn, str]=None,
+    remote_conn: Union[remote.S3Connection, str]=None,
+    ebooklet_type: str='EVariableLengthValue',
     ):
     """
-    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. Lots of options including read caching.
+    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. If remote_conn is not passed, then it opens a normal booklet file.
 
     Parameters
     -----------
-    bucket : str
-        The S3 bucket with the objects.
-
-    client : botocore.client.BaseClient or None
-        The boto3 S3 client object that can be directly passed. This allows the user to include whatever client parameters they wish. It's recommended to use the s3_client function supplied with this package. If None, then connection_config must be passed.
-
-    connection_config: dict or None
-        If client is not passed to open, then the connection_config must be supplied. If both are passed, then client takes priority. connection_config should be a dict of service_name, endpoint_url, aws_access_key_id, and aws_secret_access_key.
-
-    public_url : HttpUrl or None
-        If the S3 bucket is publicly accessible, then supplying the public_url will download objects via normal http. The provider parameter is associated with public_url to specify the provider's public url style.
+    file_path : str or pathlib.Path
+        It must be a path to a local file location. If you want to use a tempfile, then use the name from the NamedTemporaryFile initialized class.
 
     flag : str
         Flag associated with how the file is opened according to the dbm style. See below for details.
 
+    key_serializer : str, class, or None
+        The serializer to use to convert the input value to bytes. Run the booklet.available_serializers to determine the internal serializers that are available. None will require bytes as input. A custom serializer class can also be used. If the objects can be serialized to json, then use orjson or msgpack. They are super fast and you won't have the pickle issues.
+
+    value_serializer : str, class, or None
+        Similar to the key_serializer, except for the values.
+
+    n_buckets : int
+        The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.
+
     buffer_size : int
-        The buffer memory size used for reading and writing. Defaults to 512000.
+        The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
+        This is only used when the file is open for writing.
 
-    retries : int
-        The number of http retries for reads and writes. Defaults to 3.
-
-    read_timeout : int
-        The http read timeout in seconds. Defaults to 120.
-
-    provider : str or None
-        Associated with public_url. If provider is None, then it will try to figure out the provider (in a very rough way). Options include, b2, r2, and contabo.
-
-    threads : int
-        The max number of threads to use when using several methods. Defaults to 30.
+    remote_conn : S3Connection, str, or None
+        The object to connect to a remote. It can either be a Conn type object, an http url string, or None. If None, no remote connection is made and the file is only opened locally.
+    
+    ebooklet_type : str
+        What type of ebooklet to create. Options are either EVariableLengthValue (default) or RemoteConnGroup.
 
     Returns
     -------
-    S3dbm
+    Ebooklet or Booklet
 
     The optional *flag* argument can be:
 
@@ -1022,7 +1149,28 @@ def open(
     +---------+-------------------------------------------+
 
     """
-    if remote is None:
-        return booklet.VariableValue(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+    if remote_conn is None:
+        return booklet.open(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
     else:
-        return EBooklet(remote=remote, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+        if isinstance(remote_conn, str):
+            if flag != 'r':
+                raise ValueError('If remote_conn is a url string, then flag must be r.')
+            remote_conn = remote.S3Connection(db_url=remote_conn)
+        elif not isinstance(remote_conn, remote.S3Connection):
+            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
+
+        if remote_conn.uuid is not None:
+            if isinstance(remote_conn.ebooklet_type, str):
+                if remote_conn.ebooklet_type == 'EVariableLengthValue':
+                    return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+                elif remote_conn.ebooklet_type == 'RemoteConnGroup':
+                    return RemoteConnGroup(remote_conn=remote_conn, file_path=file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
+                else:
+                    raise ValueError('What kind of EBooklet is this?!')
+        else:
+            if ebooklet_type == 'EVariableLengthValue':
+                return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+            elif ebooklet_type == 'RemoteConnGroup':
+                return RemoteConnGroup(remote_conn=remote_conn, file_path=file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
+            else:
+                raise ValueError('ebooklet_type must be either EVariableLengthValue or RemoteConnGroup.')

@@ -22,9 +22,19 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  's3func>=0.6',
+  's3func>=0.7',
   'urllib3>=2',
-  'booklet>=0.7.5',
+  'booklet>=0.7.6',
+]
+
+[dependency-groups]
+dev = [
+  "spyder-kernels==2.5.2",
+  "black",
+  "mypy",
+  "ruff",
+  "pytest",
+  "pytest-cov",
 ]
 
 # [tool.ruff]

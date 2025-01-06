@@ -8,7 +8,7 @@ except ImportError:
     import tomli as toml
 from s3func import S3Session, HttpSession, B2Session
 import booklet
-from ebooklet import EBooklet, remote
+# from ebooklet import EBooklet, remote
 
 #################################################
 ### Parameters
@@ -60,74 +60,74 @@ n_buckets = 12007
 ################################################
 ### Tests
 
-s3_conn = remote.S3Conn(db_key, bucket, **connection_config)
-http_conn = remote.HttpConn(db_url)
+# s3_conn = remote.S3Conn(db_key, bucket, **connection_config)
+# http_conn = remote.HttpConn(db_url)
 
-remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
+# remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
 
-self = EBooklet(
-    remote_conn,
-    file_path,
-    flag,
-    value_serializer,
-    buffer_size=524288,
-    )
+# self = EBooklet(
+#     remote_conn,
+#     file_path,
+#     flag,
+#     value_serializer,
+#     buffer_size=524288,
+#     )
 
-self = EBooklet(
-    remote_conn,
-    file_path,
-    'c',
-    )
+# self = EBooklet(
+#     remote_conn,
+#     file_path,
+#     'c',
+#     )
 
-self['test1'] = list(range(100))
-self['test2'] = 10
+# self['test1'] = list(range(100))
+# self['test2'] = 10
 
-self.close()
+# self.close()
 
-changes = self.changes()
+# changes = self.changes()
 
-changes.update()
+# changes.update()
 
-list(changes.iter_changes())
+# list(changes.iter_changes())
 
-changes.discard()
+# changes.discard()
 
-changes.push()
-changes.pull()
+# changes.push()
+# changes.pull()
 
-self = EBooklet(
-    remote_conn,
-    file_path,
-    'w',
-    )
+# self = EBooklet(
+#     remote_conn,
+#     file_path,
+#     'w',
+#     )
 
-self['test3'] = 999
+# self['test3'] = 999
 
-if self._remote_index is not None:
-    print('true')
+# if self._remote_index is not None:
+#     print('true')
 
-if s3_conn.uuid:
-    print('true')
-
-
-self = EBooklet(
-    http_conn,
-    file_path,
-    'r',
-    )
-
-iter1 = self.get_items(['test1', 'test2', 'test3'])
-
-failures = self.load_items(['test1', 'test2', 'test3'])
+# if s3_conn.uuid:
+#     print('true')
 
 
-with open(self._remote_index_path, 'rb') as ri:
-    b1 = ri.read()
+# self = EBooklet(
+#     http_conn,
+#     file_path,
+#     'r',
+#     )
+
+# iter1 = self.get_items(['test1', 'test2', 'test3'])
+
+# failures = self.load_items(['test1', 'test2', 'test3'])
 
 
-self = booklet.VariableValue(file_path)
+# with open(self._remote_index_path, 'rb') as ri:
+#     b1 = ri.read()
 
-del self['test3']
+
+# self = booklet.VariableValue(file_path)
+
+# del self['test3']
 
 
 

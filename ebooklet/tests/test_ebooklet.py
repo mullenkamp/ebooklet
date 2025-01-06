@@ -9,7 +9,7 @@ except ImportError:
 from s3func import S3Session, HttpSession, B2Session
 import booklet
 import ebooklet
-from ebooklet import __version__, EBooklet, remote
+from ebooklet import __version__, remote
 from copy import deepcopy
 
 #################################################
@@ -20,18 +20,20 @@ script_path = pathlib.Path(os.path.realpath(os.path.dirname(__file__)))
 try:
     with open(script_path.joinpath('s3_config.toml'), "rb") as f:
         conn_config = toml.load(f)['connection_config']
+
+    endpoint_url = conn_config['endpoint_url']
+    access_key_id = conn_config['access_key_id']
+    access_key = conn_config['access_key']
 except:
-    conn_config = {
-        # 'service_name': 's3',
-        'endpoint_url': os.environ['endpoint_url'],
-        'access_key_id': os.environ['aws_access_key_id'],
-        'access_key': os.environ['aws_secret_access_key'],
-        }
+    endpoint_url = os.environ['endpoint_url']
+    access_key_id = os.environ['access_key_id']
+    access_key = os.environ['access_key']
 
 # tf = NamedTemporaryFile()
 # file_path = tf.name
 
 # connection_config = conn_config
+
 bucket = 'achelous'
 flag = "n"
 buffer_size = 524288
@@ -44,8 +46,9 @@ base_url = 'https://b2.tethys-ts.xyz/file/' + bucket + '/'
 db_url = base_url +  db_key
 value_serializer = 'pickle'
 remote_object_lock=False
-init_remote=True
-local_storage_kwargs = {}
+file_path_rcg = pathlib.Path(str(file_path) + '.rcg')
+db_key_rcg = db_key + '.rcg'
+db_url_rcg = db_url + '.rcg'
 
 data_dict = {str(key): key*2 for key in range(2, 30)}
 
@@ -60,10 +63,10 @@ meta = {'test1': 'data'}
 
 print(__version__)
 
-s3_conn = remote.S3Conn(db_key, bucket, **conn_config)
-http_conn = remote.HttpConn(db_url)
+remote_conn = remote.S3Connection(access_key_id, access_key, db_key, bucket, endpoint_url=endpoint_url, db_url=db_url)
+# http_conn = remote.HttpConn(db_url)
 
-remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
+# remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
 
 
 ################################################
@@ -90,8 +93,8 @@ def get_logs(request):
         # Add code here to cleanup failure scenario
         print("executing test failed")
 
-        s3open = s3_conn.open()
-        s3open.delete_remote()
+        with remote_conn.open('w') as s3open:
+            s3open.delete_remote()
 
         file_path.unlink()
         remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
@@ -107,21 +110,21 @@ def get_logs(request):
 
 
 def test_set_items():
-    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(file_path, 'n', value_serializer='pickle', remote_conn=remote_conn) as f:
         for key, value in data_dict.items():
             f[key] = value
 
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         value = f['10']
 
     assert value == data_dict['10']
 
 
 def test_update():
-    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(file_path, 'n', value_serializer='pickle', remote_conn=remote_conn) as f:
         f.update(data_dict)
 
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         value = f['10']
 
     assert value == data_dict['10']
@@ -131,32 +134,32 @@ def test_set_get_metadata():
     """
 
     """
-    with EBooklet(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         old_meta = f.get_metadata()
         f.set_metadata(meta)
 
     assert old_meta is None
 
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         new_meta = f.get_metadata()
 
     assert new_meta == meta
 
 
 def test_set_get_timestamp():
-    with EBooklet(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         ts_old, value = f.get_timestamp('10', True)
         ts_new = booklet.utils.make_timestamp_int()
         f.set_timestamp('10', ts_new)
 
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         ts_new = f.get_timestamp('10')
 
     assert ts_new > ts_old and value == data_dict['10']
 
 
 def test_keys():
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         keys = set(list(f.keys()))
 
     source_keys = set(list(data_dict.keys()))
@@ -165,14 +168,14 @@ def test_keys():
 
 
 def test_items():
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         for key, value in f.items():
             source_value = data_dict[key]
             assert source_value == value
 
 
 def test_timestamps():
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         for key, ts, value in f.timestamps(True):
             source_value = data_dict[key]
             assert source_value == value
@@ -183,7 +186,7 @@ def test_timestamps():
 
 
 def test_contains():
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         for key in data_dict:
             if key not in f:
                 raise KeyError(key)
@@ -192,7 +195,7 @@ def test_contains():
 
 
 def test_len():
-    with EBooklet(http_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         new_len = len(f)
 
     assert len(data_dict) == new_len
@@ -204,7 +207,7 @@ def test_delete_len():
     for index in indexes:
         _ = data.pop(index)
 
-        with EBooklet(s3_conn, file_path, 'w') as f:
+        with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
             f[index] = 0
             f[index] = 0
             del f[index]
@@ -222,15 +225,8 @@ def test_delete_len():
         assert new_len == len(data)
 
 
-# def test_items2():
-#     with EBooklet(s3_conn, file_path, init_check_remote=False) as f:
-#         for key, value in f.items():
-#             source_value = data[key]
-#             assert source_value == value
-
-
 def test_values():
-    with EBooklet(s3_conn, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=remote_conn) as f:
         for value in f.values():
             pass
 
@@ -240,7 +236,7 @@ def test_values():
 
 
 def test_prune():
-    with EBooklet(s3_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         old_len = len(f)
         removed_items = f.prune()
         new_len = len(f)
@@ -249,7 +245,7 @@ def test_prune():
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
     # Reindex
-    with EBooklet(s3_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         old_len = len(f)
         old_n_buckets = f._n_buckets
         removed_items = f.prune(reindex=True)
@@ -262,7 +258,7 @@ def test_prune():
     # Remove the rest via timestamp filter
     timestamp = booklet.utils.make_timestamp_int()
 
-    with EBooklet(s3_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         removed_items = f.prune(timestamp=timestamp)
         new_len = len(f)
         meta = f.get_metadata()
@@ -270,28 +266,9 @@ def test_prune():
     assert (old_len == removed_items) and (new_len == 0) and isinstance(meta, dict)
 
 
-# def test_set_items_get_items():
-#     with EBooklet(remote, file_path, 'n', key_serializer='uint4', value_serializer='pickle') as f:
-#         for key, value in data_dict.items():
-#             f[key] = value
-
-#     with EBooklet(remote, file_path, 'w') as f:
-#         f[50] = [0, 0]
-#         value1 = f[10]
-#         value2 = f[50]
-
-#     assert (value1 == data_dict[10]) and (value2 == [0, 0])
-
-    # with EBooklet(file_path) as f:
-    #     value = f[50]
-    #     assert value == [0, 0]
-
-    #     value = f[10]
-    #     assert value == data_dict[10]
-
 ## Always make this last!!!
 def test_clear():
-    with EBooklet(s3_conn, file_path, 'w') as f:
+    with ebooklet.open(file_path, 'w', remote_conn=remote_conn) as f:
         f.clear()
         f_meta = f.get_metadata()
 
@@ -303,7 +280,7 @@ def test_clear():
 
 
 def test_push():
-    with EBooklet(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(file_path, 'n', value_serializer='pickle', remote_conn=remote_conn) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -319,9 +296,9 @@ def test_push():
 
 
 def test_read_remote():
-    http_remote = remote.HttpConn(db_url)
+    http_remote = remote.S3Connection(db_url=db_url)
 
-    with EBooklet(http_remote, file_path) as f:
+    with ebooklet.open(file_path, remote_conn=http_remote) as f:
         value1 = f['10']
         assert value1 == data_dict['10']
 
@@ -330,16 +307,61 @@ def test_read_remote():
             assert source_value == value
 
 
+############################################
+### RemoteConnGroup
+
+remote_conn_rcg = remote.S3Connection(access_key_id, access_key, db_key_rcg, bucket, endpoint_url=endpoint_url, db_url=db_url_rcg)
+
+def test_remote_conn_grp_set():
+    remote_conn.load_db_metadata()
+    remote_conn_uuid_hex = remote_conn.uuid.hex
+
+    with ebooklet.open(file_path_rcg, 'n', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+        f.add(remote_conn)
+
+    with ebooklet.open(file_path_rcg) as f:
+        conn_dict = f[remote_conn_uuid_hex]
+
+        assert isinstance(conn_dict, dict)
+
+def test_remote_conn_grp_push():
+    with ebooklet.open(file_path_rcg, 'w', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+        changes = f.changes()
+        # print(list(changes.iter_changes()))
+        changes.push()
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path_rcg.unlink()
+
+def test_remote_conn_grp_read_remote():
+    remote_conn_uuid_hex = remote_conn.uuid.hex
+    # http_remote = remote.S3Connection(db_url=db_url)
+
+    with ebooklet.open(file_path_rcg, remote_conn=db_url_rcg) as f:
+        conn_dict = f[remote_conn_uuid_hex]
+        assert isinstance(conn_dict, dict)
+
+
 ##################################
 ### Remove files
 
 def test_remove_remote_local():
-    s3open = s3_conn.open()
-    s3open.delete_remote()
+    with remote_conn.open('w') as s3open:
+        s3open.delete_remote()
 
     file_path.unlink()
     remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
     remote_index_path.unlink()
+
+    with remote_conn_rcg.open('w') as s3open:
+        s3open.delete_remote()
+
+    file_path_rcg.unlink()
+    remote_index_path = file_path.parent.joinpath(file_path_rcg.name + '.remote_index')
+    remote_index_path.unlink()
+
+
 
 
 
