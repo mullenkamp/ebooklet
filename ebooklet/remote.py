@@ -6,7 +6,7 @@ Created on Tue Oct 15 08:36:26 2024
 @author: mike
 """
 import os
-import uuid6
+import uuid6 as uuid
 import urllib3
 import booklet
 from typing import Any, Generic, Iterator, Union, List, Dict
@@ -47,8 +47,7 @@ def get_db_metadata(session, db_key):
     if meta is None:
         return dict(uuid=None, timestamp=None, ebooklet_type=None)
     else:
-        meta['uuid'] = uuid6.UUID(hex=meta['uuid'])
-        # self.uuid = uuid6.UUID(hex=meta['uuid'])
+        meta['uuid'] = uuid.UUID(hex=meta['uuid'])
         # self.ebooklet_type = meta['ebooklet_type']
         meta['timestamp'] = int(meta['timestamp'])
 
@@ -288,7 +287,7 @@ class S3SessionReader:
             meta = resp_obj.metadata
             self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
-            self.uuid = uuid6.UUID(hex=meta['uuid'])
+            self.uuid = uuid.UUID(hex=meta['uuid'])
             self.ebooklet_type = meta['ebooklet_type']
         elif resp_obj.status == 404:
             self._init_bytes = None
@@ -443,7 +442,7 @@ class S3SessionWriter(S3SessionReader):
         Should I include this? Or should I simply let the other methods fail if it's not writable? I do like having an explicit test...
         """
         if not self._writable_check:
-            test_key = self.write_db_key + uuid6.uuid6().hex[:13]
+            test_key = self.write_db_key + uuid.uuid6().hex[:13]
             put_resp = self._write_session.put_object(test_key, b'0')
             if put_resp.status // 100 == 2:
                 del_resp = self._write_session.delete_object(test_key, put_resp.metadata['version_id'])
@@ -595,9 +594,9 @@ class S3Connection(JsonSerializer):
             meta = get_db_metadata(read_session, key)
         elif all([k in db_meta for k in ('uuid', 'ebooklet_type', 'timestamp')]):
             uuid = db_meta['uuid']
-            if isinstance(uuid, (str, uuid6.UUID)):
+            if isinstance(uuid, (str, uuid.UUID)):
                 if isinstance(uuid, str):
-                    db_meta['uuid'] = uuid6.UUID(hex=uuid)
+                    db_meta['uuid'] = uuid.UUID(hex=uuid)
                 else:
                     raise TypeError('uuid in meta must be either a string or UUID')
 
