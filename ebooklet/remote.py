@@ -280,7 +280,7 @@ class S3SessionReader:
 
     def load_db_metadata(self):
         """
-
+        Load the db metadata from the remote.
         """
         resp_obj = self._read_session.head_object(self.read_db_key)
         if resp_obj.status == 200:
@@ -300,7 +300,7 @@ class S3SessionReader:
 
     def get_uuid(self):
         """
-
+        Get the UUID of the remote.
         """
         if self.uuid is None:
             self.load_metadata()
@@ -310,16 +310,17 @@ class S3SessionReader:
 
     def get_ebooklet_type(self):
         """
-
+        Get the EBooklet type of the remote.
         """
         if self.ebooklet_type is None:
             self.load_metadata()
 
         return self.ebooklet_type
 
+
     def get_timestamp(self):
         """
-
+        Get the metadata timestamp of the remote.
         """
         resp_obj = self.head_db_object()
         if resp_obj.status == 200:
@@ -361,7 +362,7 @@ class S3SessionReader:
 
     def get_db_object(self):
         """
-
+        Get the main db object from the remote and return an S3 response object.
         """
         return self._read_session.get_object(self.read_db_key)
 
@@ -400,9 +401,9 @@ class S3SessionWriter(S3SessionReader):
                  # uuid,
                  # ebooklet_type,
                  # init_bytes,
-                 object_lock=False,
-                 break_other_locks=False,
-                 lock_timeout=-1
+                 # object_lock=False,
+                 # break_other_locks=False,
+                 # lock_timeout=-1
                  ):
         self._read_session = read_session
         self._write_session = write_session
@@ -414,24 +415,25 @@ class S3SessionWriter(S3SessionReader):
         # self.ebooklet_type = ebooklet_type
         # self.init_bytes = init_bytes
 
-        if object_lock:
-            lock = write_session.s3lock(self.write_db_key)
+        # if object_lock:
+        #     lock = write_session.s3lock(self.write_db_key)
 
-            if break_other_locks:
-                lock.break_other_locks()
+        #     if break_other_locks:
+        #         lock.break_other_locks()
 
-            lock.aquire(timeout=lock_timeout)
+        #     if not lock.aquire(timeout=lock_timeout):
+        #         print('Lock could not be aquired...')
 
-            self._writable_check = True
-            self._writable = True
-        else:
-            lock = None
+        #     self._writable_check = True
+        #     self._writable = True
+        # else:
+        #     lock = None
 
-            self._writable_check = False
-            self._writable = False
+        self._writable_check = False
+        self._writable = False
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.s3session_finalizer, self._write_session, lock)
+        self._finalizer = weakref.finalize(self, utils.s3session_finalizer, self._write_session, None)
 
         ## Get latest metadata
         self.load_db_metadata()
@@ -439,6 +441,8 @@ class S3SessionWriter(S3SessionReader):
     @property
     def writable(self):
         """
+        Check to see if the remote is writable given the credentials.
+
         Should I include this? Or should I simply let the other methods fail if it's not writable? I do like having an explicit test...
         """
         if not self._writable_check:
@@ -456,7 +460,7 @@ class S3SessionWriter(S3SessionReader):
 
     def put_db_object(self, data: bytes, metadata):
         """
-
+        Upload the main db object to the remote.
         """
         if self.writable:
             return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
@@ -476,7 +480,7 @@ class S3SessionWriter(S3SessionReader):
 
     def put_object(self, key: str, data: bytes, metadata={}):
         """
-
+        Upload an object to the remote.
         """
         if self.writable:
             return self._write_session.put_object(self.write_db_key + '/' + key, data, metadata=metadata)
@@ -486,7 +490,7 @@ class S3SessionWriter(S3SessionReader):
 
     def delete_objects(self, keys):
         """
-        Delete objects
+        Delete specific objects.
         """
         if self.writable:
             del_list = []
@@ -507,7 +511,7 @@ class S3SessionWriter(S3SessionReader):
 
     def delete_remote(self):
         """
-
+        Delete the entire remote.
         """
         if self.writable:
             del_list = []
@@ -522,6 +526,7 @@ class S3SessionWriter(S3SessionReader):
         else:
             raise ValueError('Session is not writable.')
 
+    # TODO
     # def rebuild_index(self):
     #     """
     #     Rebuild the remote index file from all the objects in the remote.
@@ -534,24 +539,24 @@ class S3SessionWriter(S3SessionReader):
     #     """
 
     #     """
-    #     return self.write_session.list_objects(prefix=self.write_db_key)
+    #     return self.write_session.list_objects(prefix=self.write_db_key + '/')
 
 
     # def list_object_versions(self):
     #     """
 
     #     """
-    #     return self.write_session.list_object_versions(prefix=self.write_db_key)
+    #     return self.write_session.list_object_versions(prefix=self.write_db_key + '/')
 
-    # def lock(self):
-    #     """
-
-    #     """
-    #     if self.writable:
-    #         lock = self._session.s3lock(self.db_key)
-    #         return lock
-    #     else:
-    #         raise ValueError('Conn is not writable.')
+    def create_lock(self):
+        """
+        Initialise an S3 lock object. A lock is not immediately aquired. This must be done via the lock object (as well as releasing locks).
+        """
+        if self.writable:
+            lock = self._session.s3lock(self.db_key)
+            return lock
+        else:
+            raise ValueError('Session is not writable.')
 
 
 class S3Connection(JsonSerializer):
