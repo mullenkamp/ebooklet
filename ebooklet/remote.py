@@ -677,9 +677,6 @@ class S3Connection(JsonSerializer):
 
     def open(self,
              flag: str='r',
-             object_lock: bool=False,
-             break_other_locks: bool=False,
-             lock_timeout: int=-1,
              ):
         """
 
@@ -717,9 +714,6 @@ class S3Connection(JsonSerializer):
                                     read_db_key,
                                     write_db_key,
                                     self.threads,
-                                    object_lock,
-                                    break_other_locks,
-                                    lock_timeout,
                                     )
 
             # Check to make sure the uuids are the same if the read and write sessions are different
