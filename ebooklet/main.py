@@ -39,6 +39,8 @@ class Change:
         """
         self._ebooklet = ebooklet
 
+        self._changelog_path = None
+
         # self.update()
 
 
@@ -670,7 +672,7 @@ class EVariableLengthValue(MutableMapping):
 
     def set(self, key, value, timestamp=None):
         """
-        Set a value associated with a key.        
+        Set a value associated with a key.
         """
         if self.writable:
             self._local_file.set(key, value, timestamp)
@@ -1079,7 +1081,7 @@ class RemoteConnGroup(EVariableLengthValue):
 
     def set(self, key, remote_conn: remote.S3Connection):
         """
-        Use the add method to add remote connections to the group. 
+        Use the add method to add remote connections to the group.
         """
         raise NotImplementedError('Use the add method to add remote connections to the group.')
 
