@@ -316,7 +316,7 @@ def test_remote_conn_grp_set():
     remote_conn.load_db_metadata()
     remote_conn_uuid_hex = remote_conn.uuid.hex
 
-    with ebooklet.open(file_path_rcg, 'n', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+    with ebooklet.RemoteConnGroup(remote_conn_rcg, file_path_rcg, 'n') as f:
         f.add(remote_conn)
 
     with ebooklet.open(file_path_rcg) as f:
@@ -325,7 +325,7 @@ def test_remote_conn_grp_set():
         assert isinstance(conn_dict, dict)
 
 def test_remote_conn_grp_push():
-    with ebooklet.open(file_path_rcg, 'w', remote_conn=remote_conn_rcg, ebooklet_type='RemoteConnGroup') as f:
+    with ebooklet.RemoteConnGroup(remote_conn_rcg, file_path_rcg, 'w') as f:
         changes = f.changes()
         # print(list(changes.iter_changes()))
         changes.push()
@@ -338,7 +338,7 @@ def test_remote_conn_grp_read_remote():
     remote_conn_uuid_hex = remote_conn.uuid.hex
     # http_remote = remote.S3Connection(db_url=db_url)
 
-    with ebooklet.open(file_path_rcg, remote_conn=db_url_rcg) as f:
+    with ebooklet.RemoteConnGroup(db_url_rcg, file_path_rcg) as f:
         conn_dict = f[remote_conn_uuid_hex]
         assert isinstance(conn_dict, dict)
 
