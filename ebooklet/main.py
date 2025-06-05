@@ -978,7 +978,7 @@ class RemoteConnGroup(EVariableLengthValue):
     """
     def __init__(
             self,
-            remote_conn: remote.S3Connection,
+            remote_conn: remote.S3Connection | str,
             file_path: Union[str, pathlib.Path],
             flag: str = "r",
             n_buckets: int=12007,
@@ -1008,6 +1008,11 @@ class RemoteConnGroup(EVariableLengthValue):
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
+        if isinstance(remote_conn, str):
+            if flag != 'r':
+                raise ValueError('If remote_conn is a url string, then flag must be r.')
+            remote_conn = remote.S3Connection(db_url=remote_conn)
+
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
 
         ## Init the local file
@@ -1198,3 +1203,4 @@ def open(
         #         return RemoteConnGroup(remote_conn=remote_conn, file_path=file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
         #     else:
         #         raise ValueError('ebooklet_type must be either EVariableLengthValue or RemoteConnGroup.')
+
