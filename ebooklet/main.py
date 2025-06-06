@@ -496,7 +496,7 @@ class EVariableLengthValue(MutableMapping):
     """
     def __init__(
             self,
-            remote_conn: remote.S3Connection,
+            remote_conn: remote.S3Connection | str,
             file_path: Union[str, pathlib.Path],
             flag: str = "r",
             value_serializer: str = None,
@@ -527,6 +527,13 @@ class EVariableLengthValue(MutableMapping):
         local_file_exists = local_file_path.exists()
 
         ## Determine the remotes that read and write
+        if isinstance(remote_conn, str):
+            if flag != 'r':
+                raise ValueError('If remote_conn is a url string, then flag must be r.')
+            remote_conn = remote.S3Connection(db_url=remote_conn)
+        elif not isinstance(remote_conn, remote.S3Connection):
+            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
+
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
 
         ## Init the local file
@@ -1012,6 +1019,8 @@ class RemoteConnGroup(EVariableLengthValue):
             if flag != 'r':
                 raise ValueError('If remote_conn is a url string, then flag must be r.')
             remote_conn = remote.S3Connection(db_url=remote_conn)
+        elif not isinstance(remote_conn, remote.S3Connection):
+            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
 
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
 
@@ -1179,13 +1188,6 @@ def open(
     if remote_conn is None:
         return booklet.open(file_path, flag=flag, key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
     else:
-        if isinstance(remote_conn, str):
-            if flag != 'r':
-                raise ValueError('If remote_conn is a url string, then flag must be r.')
-            remote_conn = remote.S3Connection(db_url=remote_conn)
-        elif not isinstance(remote_conn, remote.S3Connection):
-            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
-
         return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
 
         # if remote_conn.uuid is not None:
