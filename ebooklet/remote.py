@@ -15,6 +15,7 @@ import weakref
 import orjson
 import base64
 import copy
+import concurrent.futures
 # import msgspec
 
 # import utils
@@ -525,6 +526,99 @@ class S3SessionWriter(S3SessionReader):
             self.uuid = None
         else:
             raise ValueError('Session is not writable.')
+
+    def copy_remote(self, remote_conn):
+        """
+        Copy an entire remote dataset to another remote location. The new location must be empty.
+        """
+        writer = remote_conn.open('w')
+
+        if not writer.writable:
+            raise ValueError('target remote is not writable.')
+
+        ## Check if source exists
+        source_uuid = self.get_uuid()
+        if source_uuid is None:
+            raise ValueError('The source remote does not exist.')
+
+        ## Check is target exists
+        target_uuid = writer.get_uuid()
+        if target_uuid is not None:
+            raise ValueError('The target remote already exists. Either delete_remote or use a different target remote.')
+
+        ## Get a list of all source objects
+        source_resp = self._write_session.list_objects(prefix=self.write_db_key + '/')
+        if source_resp.status // 100 != 2:
+            raise urllib3.exceptions.HTTPError(source_resp.error)
+
+        ## Get all target objects
+        target_resp = writer._write_session.list_objects(prefix=writer.write_db_key + '/')
+        if target_resp.status // 100 != 2:
+            raise urllib3.exceptions.HTTPError(target_resp.error)
+
+        target_exist_keys = set(obj['key'] for obj in target_resp.iter_objects())
+
+        ## Buckets
+        source_bucket = self._read_session.bucket
+        target_bucket = writer._read_session.bucket
+
+        ## Determine if the s3 copy_object method can be used
+        if (self._read_session._access_key_id == writer._read_session._access_key_id) and (self._read_session._access_key == writer._read_session._access_key):
+            print('Both the source and target remotes use the same credentials, so copying objects is efficient.')
+
+            futures = {}
+            failures = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+                for obj in source_resp.iter_objects():
+                    source_key = obj['key']
+                    target_key = writer.write_db_key + source_key.lstrip(self.write_db_key)
+                    if target_key not in target_exist_keys:
+                        f = executor.submit(self._write_session.copy_object, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                        futures[f] = target_key
+
+                for f in concurrent.futures.as_completed(futures):
+                    target_key = futures[f]
+                    resp = f.result()
+                    if resp.status // 100 != 2:
+                        failures[target_key] = resp.error
+
+            if failures:
+                print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
+                return failures
+            else:
+                resp = self._write_session.copy_object(self.write_db_key, writer.write_db_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                if resp.status // 100 != 2:
+                    raise urllib3.exceptions.HTTPError(resp.error)
+
+        else:
+            print('The source and target remotes use different credentials, so copying objects must be first downloaded than uploaded. Less efficient than if both remotes had the same credentials.')
+
+            futures = {}
+            failures = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+                for obj in source_resp.iter_objects():
+                    source_key = obj['key']
+                    target_key = writer.write_db_key + source_key.lstrip(self.write_db_key)
+                    if target_key not in target_exist_keys:
+                        f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                        futures[f] = target_key
+
+                for f in concurrent.futures.as_completed(futures):
+                    target_key = futures[f]
+                    resp = f.result()
+                    if resp.status // 100 != 2:
+                        failures[target_key] = resp.error
+
+            if failures:
+                print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
+                return failures
+            else:
+                resp = self._write_session.copy_object(utils.indirect_copy_remote, self._read_session, writer._write_session, writer.write_db_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                if resp.status // 100 != 2:
+                    raise urllib3.exceptions.HTTPError(resp.error)
+
+
+
 
     # TODO
     # def rebuild_index(self):

@@ -40,7 +40,8 @@ buffer_size = 524288
 read_timeout = 60
 threads = 10
 # db_key = 'test.blt'
-db_key = uuid.uuid8().hex[:13]
+db_key = uuid.uuid8().hex[-13:]
+db_key2 = uuid.uuid8().hex[-13:]
 file_path = script_path.joinpath(db_key)
 base_url = 'https://b2.tethys-ts.xyz/file/' + bucket + '/'
 db_url = base_url +  db_key
@@ -64,6 +65,9 @@ meta = {'test1': 'data'}
 print(__version__)
 
 remote_conn = remote.S3Connection(access_key_id, access_key, db_key, bucket, endpoint_url=endpoint_url, db_url=db_url)
+
+remote_conn2 = remote.S3Connection(access_key_id, access_key, db_key2, bucket, endpoint_url=endpoint_url)
+
 # http_conn = remote.HttpConn(db_url)
 
 # remote_conn = remote.Conn(s3_conn=s3_conn, http_conn=http_conn)
@@ -308,6 +312,21 @@ def test_read_remote():
 
 
 ############################################
+### Test remote methods
+
+
+def test_copy_remote():
+    """
+
+    """
+    with remote_conn2.open('w') as source_session:
+        resp = source_session.copy_remote(remote_conn2)
+
+    assert resp is None
+
+
+
+############################################
 ### RemoteConnGroup
 
 remote_conn_rcg = remote.S3Connection(access_key_id, access_key, db_key_rcg, bucket, endpoint_url=endpoint_url, db_url=db_url_rcg)
@@ -343,11 +362,15 @@ def test_remote_conn_grp_read_remote():
         assert isinstance(conn_dict, dict)
 
 
+
 ##################################
 ### Remove files
 
 def test_remove_remote_local():
     with remote_conn.open('w') as s3open:
+        s3open.delete_remote()
+
+    with remote_conn2.open('w') as s3open:
         s3open.delete_remote()
 
     file_path.unlink()

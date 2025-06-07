@@ -402,6 +402,18 @@ def determine_file_obj_size(file_obj):
     return size
 
 
+def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
+    """
+
+    """
+    source_resp = source_session.get_object(source_key)
+
+    if source_resp.status // 100 != 2:
+        return source_resp
+
+    target_resp = target_session.put_object(target_key, source_resp.stream, source_resp.metadata)
+
+    return target_resp
 
 
 
