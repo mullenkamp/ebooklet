@@ -559,8 +559,8 @@ class S3SessionWriter(S3SessionReader):
         target_exist_keys = set(obj['key'] for obj in target_resp.iter_objects())
 
         ## Buckets
-        source_bucket = self._read_session.bucket
-        target_bucket = writer._read_session.bucket
+        source_bucket = self._write_session.bucket
+        target_bucket = writer._write_session.bucket
 
         ## Determine if the s3 copy_object method can be used
         if (self._read_session._access_key_id == writer._read_session._access_key_id) and (self._read_session._access_key == writer._read_session._access_key):
