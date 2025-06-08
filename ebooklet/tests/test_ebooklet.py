@@ -319,7 +319,7 @@ def test_copy_remote():
     """
 
     """
-    with remote_conn2.open('w') as source_session:
+    with remote_conn.open('w') as source_session:
         resp = source_session.copy_remote(remote_conn2)
 
     assert resp is None
