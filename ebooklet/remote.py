@@ -304,7 +304,7 @@ class S3SessionReader:
         Get the UUID of the remote.
         """
         if self.uuid is None:
-            self.load_metadata()
+            self.load_db_metadata()
 
         return self.uuid
 
@@ -314,7 +314,7 @@ class S3SessionReader:
         Get the EBooklet type of the remote.
         """
         if self.ebooklet_type is None:
-            self.load_metadata()
+            self.load_db_metadata()
 
         return self.ebooklet_type
 
