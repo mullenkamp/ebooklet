@@ -563,7 +563,7 @@ class S3SessionWriter(S3SessionReader):
         target_bucket = writer._write_session.bucket
 
         ## Determine if the s3 copy_object method can be used
-        if (self._read_session._access_key_id == writer._read_session._access_key_id) and (self._read_session._access_key == writer._read_session._access_key):
+        if (self._write_session._access_key_id == writer._write_session._access_key_id) and (self._write_session._access_key == writer._write_session._access_key):
             print('Both the source and target remotes use the same credentials, so copying objects is efficient.')
 
             futures = {}
