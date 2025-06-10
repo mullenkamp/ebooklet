@@ -129,7 +129,7 @@ class Change:
             self._ebooklet._deletes.clear()
 
             if self._ebooklet._remote_session.uuid is None:
-                self._ebooklet._remote_session.load_db_metadata()
+                self._ebooklet._remote_session._load_db_metadata()
 
         return success
 
@@ -534,7 +534,15 @@ class EVariableLengthValue(MutableMapping):
         elif not isinstance(remote_conn, remote.S3Connection):
             raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
 
+        ## Set up the remote session
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
+
+        ## Lock the remote if file is opened for write
+        if flag != 'r':
+            lock = remote_session.create_lock()
+            lock.aquire()
+        else:
+            lock = None
 
         ## Init the local file
         local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
@@ -552,7 +560,7 @@ class EVariableLengthValue(MutableMapping):
             remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
 
         ## Assign properties
         if flag == 'r':
@@ -561,6 +569,7 @@ class EVariableLengthValue(MutableMapping):
             self.writable = True
 
         self._flag = flag
+        self.lock = lock
         self._remote_index_path = remote_index_path
         self._local_file_path = local_file_path
         self._local_file = local_file
@@ -876,24 +885,22 @@ class EVariableLengthValue(MutableMapping):
         else:
             raise ValueError('File is open for read only.')
 
-    def close(self, force_close=False):
+    def close(self, force_shutdown=False):
         """
-        Close all open objects. If force_close is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
+        Close all open objects. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
         self.sync()
-        self._executor.shutdown(cancel_futures=force_close)
-        # self._manager.shutdown()
         self._finalizer()
 
 
     # def __del__(self):
     #     self.close()
 
-    def sync(self):
+    def sync(self, force_shutdown=False):
         """
-        Syncronize all cache to disk. This ensures all data has been saved to disk properly.
+        Syncronize all cache to disk. This ensures all data has been saved to disk properly. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
-        self._executor.shutdown()
+        self._executor.shutdown(cancel_futures=force_shutdown)
         del self._executor
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
         self._remote_index.sync()
@@ -908,75 +915,44 @@ class EVariableLengthValue(MutableMapping):
 
     def reopen(self, flag):
         """
-        Reopen a file with a different flag.
+        Reopen a file with a different flag. The flag must be either r or w.
         """
-        self.close()
+        if flag not in ('r', 'w'):
+            raise ValueError('The flag must be either r or w.')
+
+        self.sync()
         self._local_file.reopen(flag)
         self._remote_index.reopen(flag)
 
-        # if self._lock is not None:
-        #     self._lock.aquire()
+        if self._flag == 'r' and flag != 'r':
+            lock = self._remote_session.create_lock()
+            lock.aquire()
+            self.lock = lock
+        elif self._flag != 'r' and flag == 'r':
+            self.lock.release()
+            self.lock = None
 
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
-
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index, self._remote_session)
-
-
-    # def pull(self):
-    #     """
-
-    #     """
-    #     self.sync()
-    #     self._read_conn._parse_db_object()
-    #     overwrite_remote_index = utils.check_local_remote_sync(self._local_file, self._read_conn)
-    #     if overwrite_remote_index:
-    #         utils.get_remote_index_file(self._local_file_path, overwrite_remote_index, self._read_conn)
+        self._flag = flag
 
 
-    # def update_changelog(self):
-    #     """
-
-    #     """
-    #     self.sync()
-    #     changelog_path = utils.create_changelog(self._local_file_path, self._local_file, self._remote_index, self._read_conn)
-
-    #     self._changelog_path = changelog_path
-
-
-    # def changelog(self):
-    #     if not self._changelog_path:
-    #         self.update_changelog()
-    #     return utils.view_changelog(self._changelog_path)
+    def delete_remote(self):
+        """
+        Completely delete the remote file, but keep the local file.
+        """
+        if self.writable:
+            self._remote_session.delete_remote()
+        else:
+            raise ValueError('File is open for read only.')
 
 
-    # def push(self, force_push=False):
-    #     """
-    #     Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating).
-    #     Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
-    #     """
-    #     if not self._write_conn.writable:
-    #         raise ValueError('Remote is not writable.')
-
-    #     self.update_changelog()
-
-    #     # if self._remote_index is None:
-    #     #     remote_index = booklet.FixedValue(self._remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=self._local_file._n_buckets, buffer_size=self._local_file._write_buffer_size)
-
-    #     #     self._remote_index = remote_index
-    #     #     self._finalizer.detach()
-    #     #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
-
-    #     success = utils.update_remote(self._local_file_path, self._remote_index_path, self._local_file, self._remote_index, self._changelog_path, self._write_conn, self._executor, force_push, self._deletes, self._flag)
-
-    #     if success:
-    #         self._changelog_path.unlink()
-    #         self._changelog_path = None # Force a reset of the changelog
-
-    #         if self._read_conn.uuid is None:
-    #             self._read_conn._parse_db_object()
-    #             self._write_conn._parse_db_object()
-
-    #     return success
+    def copy_remote(self, remote_conn):
+        """
+        Copy the entire remote file to another remote location. The new location must be empty.
+        """
+        if self.writable:
+            self._remote_session.copy_remote(remote_conn)
+        else:
+            raise ValueError('File is open for read only.')
 
 
 class RemoteConnGroup(EVariableLengthValue):
@@ -1049,7 +1025,6 @@ class RemoteConnGroup(EVariableLengthValue):
             self.writable = True
 
         self._flag = flag
-        self._remote_index_path = remote_index_path
         self._local_file_path = local_file_path
         self._local_file = local_file
         self._remote_index_path = remote_index_path
@@ -1075,19 +1050,21 @@ class RemoteConnGroup(EVariableLengthValue):
             if not isinstance(remote_conn, remote.S3Connection):
                 raise TypeError('remote_conn/value must be a remote.S3Connection')
 
-            ## Update remote_conn meta
-            remote_conn.load_db_metadata()
-            remote_conn.load_user_metadata()
+            ## Get remote_conn metadata
+            with remote_conn.open() as rc:
+                uuid0 = rc.get_uuid()
+                if uuid0 is None:
+                    raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
 
-            uuid0 = remote_conn.uuid
-            if uuid0 is None:
-                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+                uuid_hex = uuid0.hex
 
-            uuid_hex = uuid0.hex
+                user_meta = rc.get_user_metadata()
+                ts = rc.get_timestamp()
 
-            value = remote_conn.to_dict()
+            conn_dict = remote_conn.to_dict()
+            conn_dict['user_meta'] = user_meta
 
-            self._local_file.set(uuid_hex, value, remote_conn.timestamp)
+            self._local_file.set(uuid_hex, conn_dict, ts)
 
         else:
             raise ValueError('File is open for read only.')
@@ -1099,30 +1076,30 @@ class RemoteConnGroup(EVariableLengthValue):
         """
         raise NotImplementedError('Use the add method to add remote connections to the group.')
 
-        if self.writable:
+        # if self.writable:
 
-            if not isinstance(remote_conn, remote.S3Connection):
-                raise TypeError('remote_conn/value must be a remote.S3Connection')
+        #     if not isinstance(remote_conn, remote.S3Connection):
+        #         raise TypeError('remote_conn/value must be a remote.S3Connection')
 
-            ## Update remote_conn meta
-            remote_conn.load_db_metadata()
-            remote_conn.load_user_metadata()
+        #     ## Update remote_conn meta
+        #     remote_conn.load_db_metadata()
+        #     remote_conn.load_user_metadata()
 
-            uuid0 = remote_conn.uuid
-            if uuid0 is None:
-                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+        #     uuid0 = remote_conn.uuid
+        #     if uuid0 is None:
+        #         raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
 
-            uuid_hex = uuid0.hex
+        #     uuid_hex = uuid0.hex
 
-            if key != uuid_hex:
-                raise KeyError('The key must be the uuid hex.')
+        #     if key != uuid_hex:
+        #         raise KeyError('The key must be the uuid hex.')
 
-            value = remote_conn.to_dict()
+        #     value = remote_conn.to_dict()
 
-            self._local_file.set(uuid_hex, value, remote_conn.timestamp)
+        #     self._local_file.set(uuid_hex, value, remote_conn.timestamp)
 
-        else:
-            raise ValueError('File is open for read only.')
+        # else:
+        #     raise ValueError('File is open for read only.')
 
 
 
