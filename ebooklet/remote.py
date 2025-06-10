@@ -15,6 +15,7 @@ import weakref
 import orjson
 import base64
 import copy
+import datetime
 import concurrent.futures
 # import msgspec
 
@@ -286,6 +287,7 @@ class S3SessionReader:
         resp_obj = self.head_object()
         if resp_obj.status == 200:
             meta = resp_obj.metadata
+            # print(meta)
             self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
@@ -490,14 +492,14 @@ class S3SessionWriter(S3SessionReader):
         return self._writable
 
 
-    # def put_db_object(self, data: bytes, metadata):
-    #     """
-    #     Upload the main db object to the remote.
-    #     """
-    #     if self.writable:
-    #         return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
-    #     else:
-    #         raise ValueError('Session is not writable.')
+    def put_db_object(self, data: bytes, metadata):
+        """
+        Upload the main db object to the remote.
+        """
+        if self.writable:
+            return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
+        else:
+            raise ValueError('Session is not writable.')
 
 
     # def put_db_index_object(self, data: bytes, metadata={}):
@@ -510,15 +512,12 @@ class S3SessionWriter(S3SessionReader):
     #         raise ValueError('Conn is not writable.')
 
 
-    def put_object(self, data: bytes, key: str=None, metadata={}):
+    def put_object(self, key: str, data: bytes, metadata={}):
         """
         Upload an object to the remote.
         """
         if self.writable:
-            if key is None:
-                key1 = self.write_db_key
-            else:
-                key1 = self.write_db_key + '/' + key
+            key1 = self.write_db_key + '/' + key
             return self._write_session.put_object(key1, data, metadata=metadata)
         else:
             raise ValueError('Session is not writable.')
@@ -686,6 +685,28 @@ class S3SessionWriter(S3SessionReader):
             return lock
         else:
             raise ValueError('Session is not writable.')
+
+    def break_other_locks(self, timestamp: str | datetime.datetime=None):
+        """
+        Removes all locks that are on the object older than specified timestamp. This is only meant to be used in deadlock circumstances.
+
+        Parameters
+        ----------
+        timestamp : str or datetime.datetime
+            All locks older than the timestamp will be removed. The default is now.
+
+        Returns
+        -------
+        list of dict of the removed keys/versions
+        """
+        if self.writable:
+            with self._write_session.s3lock(self.write_db_key) as lock:
+                other_keys = lock.break_other_locks(timestamp)
+
+            return other_keys
+        else:
+            raise ValueError('Session is not writable.')
+
 
     def _head_object_writer(self, key: str=None):
         """

@@ -12,9 +12,7 @@ from datetime import datetime, timezone
 import base64
 import portalocker
 import concurrent.futures
-
-# import remote
-# from . import remote
+import shutil
 
 ############################################
 ### Parameters
@@ -203,7 +201,7 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
-                    # shutil.copyfileobj(index0.data, f)
+                    # shutil.copyfileobj(index0.stream, f)
             elif index0.status != 404:
                 raise urllib3.exceptions.HTTPError(index0.error)
 
@@ -334,7 +332,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
     with booklet.FixedLengthValue(changelog_path) as cl:
         for key in cl:
             time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
-            f = executor.submit(remote_session.put_object, valb, key, {'timestamp': str(time_int_us)})
+            f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
             futures[f] = key
 
     ## Check the uploads to see if any fail
@@ -370,7 +368,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
 
         remote_index._file.seek(0)
 
-        resp = remote_session.put_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
+        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
         # remote_index.reopen('r')
 

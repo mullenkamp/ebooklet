@@ -114,13 +114,6 @@ class Change:
 
         self.update()
 
-        # if self._remote_index is None:
-        #     remote_index = booklet.FixedValue(self._remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=self._local_file._n_buckets, buffer_size=self._local_file._write_buffer_size)
-
-        #     self._remote_index = remote_index
-        #     self._finalizer.detach()
-        #     self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, self._remote_index)
-
         success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet._subtype)
 
         if success:
@@ -532,7 +525,7 @@ class EVariableLengthValue(MutableMapping):
                 raise ValueError('If remote_conn is a url string, then flag must be r.')
             remote_conn = remote.S3Connection(db_url=remote_conn)
         elif not isinstance(remote_conn, remote.S3Connection):
-            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
+            raise TypeError('remote_conn must be either a url string or a remote.S3Connection.')
 
         ## Set up the remote session
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
@@ -996,9 +989,16 @@ class RemoteConnGroup(EVariableLengthValue):
                 raise ValueError('If remote_conn is a url string, then flag must be r.')
             remote_conn = remote.S3Connection(db_url=remote_conn)
         elif not isinstance(remote_conn, remote.S3Connection):
-            raise TypeError('remote_conn must be either a url string or aremote.S3Connection.')
+            raise TypeError('remote_conn must be either a url string or a remote.S3Connection.')
 
         remote_session = utils.check_parse_conn(remote_conn, flag, local_file_exists)
+
+        ## Lock the remote if file is opened for write
+        if flag != 'r':
+            lock = remote_session.create_lock()
+            lock.aquire()
+        else:
+            lock = None
 
         ## Init the local file
         local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, 'orjson', n_buckets, buffer_size)
@@ -1016,7 +1016,7 @@ class RemoteConnGroup(EVariableLengthValue):
             remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
 
         ## Assign properties
         if flag == 'r':
@@ -1025,6 +1025,7 @@ class RemoteConnGroup(EVariableLengthValue):
             self.writable = True
 
         self._flag = flag
+        self.lock = lock
         self._local_file_path = local_file_path
         self._local_file = local_file
         self._remote_index_path = remote_index_path
