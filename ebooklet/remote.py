@@ -845,8 +845,8 @@ class S3Connection(JsonSerializer):
                                     )
 
             # Check to make sure the uuids are the same if the read and write sessions are different
-            if isinstance(read_session, s3func.HttpSession) and self.uuid is not None:
-                if self.uuid != session_writer.uuid:
+            if isinstance(read_session, s3func.HttpSession) and read_session.uuid is not None:
+                if read_session.uuid != session_writer.uuid:
                     raise ValueError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
 
             return session_writer
