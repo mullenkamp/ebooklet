@@ -687,6 +687,31 @@ class S3SessionWriter(S3SessionReader):
         else:
             raise ValueError('Session is not writable.')
 
+    def _head_object_writer(self, key: str=None):
+        """
+        Get the header for a remote object/file. The input should be a key as a str. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
+        """
+        if key is None:
+            resp = self._write_session.head_object(self.read_db_key)
+        else:
+            resp = self._write_session.head_object(self.read_db_key + '/' + key)
+
+        return resp
+
+    def _get_uuid_writer(self):
+        """
+        Get the uuid of the remote file.
+        """
+        resp_obj = self._head_object_writer()
+        if resp_obj.status == 200:
+            uuid1 = uuid.UUID(hex=resp_obj.metadata['uuid'])
+        elif resp_obj.status == 404:
+            uuid1 = None
+        else:
+            raise urllib3.exceptions.HTTPError(resp_obj.error)
+
+        return uuid1
+
 
 class S3Connection(JsonSerializer):
     """
@@ -845,8 +870,8 @@ class S3Connection(JsonSerializer):
                                     )
 
             # Check to make sure the uuids are the same if the read and write sessions are different
-            if isinstance(read_session, s3func.HttpSession) and read_session.uuid is not None:
-                if read_session.uuid != session_writer.uuid:
+            if isinstance(read_session, s3func.HttpSession) and session_writer.uuid is not None:
+                if session_writer._get_uuid_writer() != session_writer.uuid:
                     raise ValueError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
 
             return session_writer
