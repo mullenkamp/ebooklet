@@ -12,9 +12,7 @@ from datetime import datetime, timezone
 import base64
 import portalocker
 import concurrent.futures
-
-# import remote
-# from . import remote
+import shutil
 
 ############################################
 ### Parameters
@@ -75,23 +73,24 @@ def fake_finalizer():
     """
 
 
-def s3session_finalizer(session, lock):
+def s3session_finalizer(session):
     """
     The finalizer function for S3Remote instances.
     """
     session.client.close()
-    if lock is not None:
-        lock.release()
+    # if lock is not None:
+    #     lock.release()
 
 
-def ebooklet_finalizer(local_file, remote_index, remote_session):
+def ebooklet_finalizer(local_file, remote_index, remote_session, lock):
     """
     The finalizer function for book instances.
     """
     local_file.close()
-    # if remote_index is not None:
     remote_index.close()
     remote_session.close()
+    if lock is not None:
+        lock.release()
     # if read_conn is not None:
     #     read_conn.close()
     # if write_conn is not None:
@@ -100,14 +99,14 @@ def ebooklet_finalizer(local_file, remote_index, remote_session):
     #     lock.release()
 
 
-def check_parse_conn(remote_conn, flag, object_lock, break_other_locks, lock_timeout, local_file_exists):
+def check_parse_conn(remote_conn, flag, local_file_exists):
     """
 
     """
-    if object_lock and (flag != 'r'):
-        remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
-    else:
-        remote_session = remote_conn.open(flag)
+    # if object_lock and (flag != 'r'):
+    #     remote_session = remote_conn.open(flag, object_lock, break_other_locks, lock_timeout)
+    # else:
+    remote_session = remote_conn.open(flag)
 
     # if isinstance(remote_conn, str):
     #     if flag != 'r':
@@ -198,11 +197,11 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
         if remote_session.uuid:
             # remote_index_key = read_conn.db_key + '.remote_index'
 
-            index0 = remote_session.get_db_object()
+            index0 = remote_session.get_object()
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
-                    # shutil.copyfileobj(index0.data, f)
+                    # shutil.copyfileobj(index0.stream, f)
             elif index0.status != 404:
                 raise urllib3.exceptions.HTTPError(index0.error)
 
@@ -310,9 +309,6 @@ def view_changelog(changelog_path):
             yield dict1
 
 
-# def check_changelog_keys(
-
-
 ##############################################
 ### Update remote
 
@@ -335,7 +331,6 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
     futures = {}
     with booklet.FixedLengthValue(changelog_path) as cl:
         for key in cl:
-            # remote_key = base_remote_key + '/' + key
             time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
             f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
             futures[f] = key
@@ -353,7 +348,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
                 failures.append(key)
 
         if failures:
-            print(f"These items failed to upload: {', '.join(failures)}")
+            print(f"There were {len(failures)} items that failed to upload. Please run this again.")
 
     ## Upload the remote_index file
     remote_index.sync()
@@ -371,123 +366,28 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
         n_keys_pos = booklet.utils.n_keys_pos
         local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
 
-        # remote_index_key = write_conn_open.db_key + '.remote_index'
         remote_index._file.seek(0)
 
-        # futures = {}
-        # f = executor.submit(write_conn_open.put_db_object, remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.b64encode(local_init_bytes)})
-        # futures[f] = write_conn_open.db_key
-
-        resp = remote_session.put_db_object(remote_index._file.read(), {'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
+        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
         # remote_index.reopen('r')
 
         if resp.status // 100 != 2:
             urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
 
-
-        # ## remove deletes in remote
-        # if deletes:
-        #     write_conn_open.delete_objects(deletes)
-        #     for key in deletes:
-        #         del remote_index[key]
-        #     remote_index.sync()
-
-        ## Save main file init bytes
-        # local_file._set_file_timestamp(time_int_us)
-        # local_file._file.seek(0)
-        # local_init_bytes = bytearray(local_file._file.read(200))
-        # if local_init_bytes[:16] != booklet.utils.uuid_variable_blt:
-        #     raise ValueError(local_init_bytes)
-
-        # n_keys_pos = booklet.utils.n_keys_pos
-        # local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
-
-        # ## Upload the init bytes
-        # f = executor.submit(write_conn_open.put_db_object, local_init_bytes, {'timestamp': str(time_int_us), 'uuid': local_file.uuid.hex})
-        # futures[f] = write_conn_open.db_key
-
-        # failures = []
-        # for future in concurrent.futures.as_completed(futures):
-        #     key = futures[future]
-        #     run_result = future.result()
-        #     if run_result.status // 100 == 2:
-        #         failures.append(key)
-
-        # if failures:
-        #     urllib3.exceptions.HTTPError(f"These items failed to upload: {', '.join(failures)}. You need to rerun the push with force_push=True or the remote will be corrupted.")
-
         ## remove deletes in remote
         if deletes:
             remote_session.delete_objects(deletes)
             deletes.clear()
 
-        return True
+        updated = True
+
+    # remote_index.reopen('r')
+
+    if failures:
+        return failures
     else:
-        # remote_index.reopen('r')
-        return False
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# def attach_prefix(prefix, key):
-#     """
-
-#     """
-#     if key == '':
-#         new_key = prefix
-#     elif not prefix.startswith('/'):
-#         new_key = prefix + '/' + prefix
-
-
-# def test_path(path: pathlib.Path):
-#     """
-
-#     """
-#     return path
+        return updated
 
 
 def determine_file_obj_size(file_obj):
@@ -501,23 +401,18 @@ def determine_file_obj_size(file_obj):
     return size
 
 
-# def check_local_storage_kwargs(local_storage, local_storage_kwargs, local_file_path):
-#     """
+def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
+    """
 
-#     """
-#     if local_storage == 'blt':
-#         if 'flag' in local_storage_kwargs:
-#             if local_storage_kwargs['flag'] not in ('w', 'c', 'n'):
-#                 local_storage_kwargs['flag'] = 'c'
-#         else:
-#             local_storage_kwargs['flag'] = 'c'
+    """
+    source_resp = source_session.get_object(source_key)
 
-#         local_storage_kwargs['file_path'] = local_file_path
+    if source_resp.status // 100 != 2:
+        return source_resp
 
-#     return local_storage_kwargs
+    target_resp = target_session.put_object(target_key, source_resp.stream, source_resp.metadata)
 
-
-
+    return target_resp
 
 
 
