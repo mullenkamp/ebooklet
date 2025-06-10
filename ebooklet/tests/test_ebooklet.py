@@ -332,8 +332,8 @@ def test_copy_remote():
 remote_conn_rcg = remote.S3Connection(access_key_id, access_key, db_key_rcg, bucket, endpoint_url=endpoint_url, db_url=db_url_rcg)
 
 def test_remote_conn_grp_set():
-    remote_conn._load_db_metadata()
-    remote_conn_uuid_hex = remote_conn.uuid.hex
+    with remote_conn.open('w') as source_session:
+        remote_conn_uuid_hex = source_session.uuid.hex
 
     with ebooklet.RemoteConnGroup(remote_conn_rcg, file_path_rcg, 'n') as f:
         f.add(remote_conn)
