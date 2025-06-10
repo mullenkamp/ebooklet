@@ -682,7 +682,7 @@ class S3SessionWriter(S3SessionReader):
         Initialise an S3 lock object. A lock is not immediately aquired. This must be done via the lock object (as well as releasing locks).
         """
         if self.writable:
-            lock = self._session.s3lock(self.db_key)
+            lock = self._write_session.s3lock(self.db_key)
             return lock
         else:
             raise ValueError('Session is not writable.')
