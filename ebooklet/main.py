@@ -18,12 +18,6 @@ from . import utils
 # import remote
 from . import remote
 
-# uuid_s3dbm = b'K=d:\xa89F(\xbc\xf5 \xd7$\xbd;\xf2'
-# version = 1
-# version_bytes = version.to_bytes(2, 'little', signed=False)
-
-# lock_remote = False
-# break_other_locks = False
 
 #######################################################
 ### Classes
@@ -127,362 +121,6 @@ class Change:
         return success
 
 
-# class UserMetadata(MutableMapping):
-#     """
-
-#     """
-#     def __init__(self, bookcase, book_hash: str=None):
-#         """
-
-#         """
-#         if isinstance(book_hash, str):
-#             user_meta = bookcase._meta['books'][book_hash]['user_metadata']
-#         else:
-#             user_meta = bookcase._meta['user_metadata']
-
-#         self._bookcase = bookcase
-#         self._user_meta = user_meta
-#         self._book_hash = book_hash
-#         self._modified = False
-#         # self._local_meta_path = local_meta_path
-#         # self._remote_s3_access = remote_s3_access
-
-#     def __repr__(self):
-#         """
-
-#         """
-#         return pprint.pformat(self._user_meta)
-
-#     def __setitem__(self, key, value):
-#         """
-
-#         """
-#         self._user_meta[key] = value
-#         self._modified = True
-
-
-#     def __getitem__(self, key: str):
-#         """
-
-#         """
-#         return self._user_meta[key]
-
-#     def __delitem__(self, key):
-#         """
-
-#         """
-#         del self._user_meta[key]
-#         self._modified = True
-
-#     def clear(self):
-#         """
-
-#         """
-#         self._user_meta.clear()
-#         self._modified = True
-
-
-#     def keys(self):
-#         """
-
-#         """
-#         return self._user_meta.keys()
-
-
-#     def items(self):
-#         """
-
-#         """
-#         return self._user_meta.items()
-
-
-#     def values(self, keys: List[str]=None):
-#         return self._user_meta.values()
-
-
-#     def __iter__(self):
-#         return self._user_meta.keys()
-
-#     def __len__(self):
-#         """
-#         """
-#         return len(self._user_meta)
-
-
-#     def __contains__(self, key):
-#         return key in self._user_meta
-
-
-#     def get(self, key, default=None):
-#         return self._user_meta.get(key)
-
-
-#     def update(self, key_value_dict: Union[Dict[str, bytes], Dict[str, io.IOBase]]):
-#         """
-
-#         """
-#         self._user_meta.update(key_value_dict)
-#         self._modified = True
-
-#     def __enter__(self):
-#         return self
-
-#     def __exit__(self, *args):
-#         self.close()
-
-#     def close(self):
-#         self.sync()
-
-#     def sync(self):
-#         """
-
-#         """
-#         if self._modified:
-#             int_us = utils.make_timestamp()
-
-#             if isinstance(self._book_hash, str):
-#                 if not self._bookcase.remote_s3_access:
-#                     self._bookcase._meta['books'][self._book_hash]['last_modified'] += 1
-#                 else:
-#                     self._bookcase._meta['books'][self._book_hash]['last_modified'] = int_us
-#                 # self._bookcase._meta['books'][self._book_hash]['last_modified'] = int_us
-#                 self._bookcase._meta['books'][self._book_hash]['user_metadata'] = self._user_meta
-#             else:
-#                 if not self._bookcase.remote_s3_access:
-#                     self._bookcase._meta['last_modified'] += 1
-#                 else:
-#                     self._bookcase._meta['last_modified'] = int_us
-
-#                 self._bookcase._meta['user_metadata'] = self._user_meta
-
-#             utils.write_metadata(self._bookcase._local_meta_path, self._bookcase._meta)
-
-
-
-
-    # def sync(self):
-    #     """
-
-    #     """
-    #     if self._modified:
-    #         int_us = utils.make_timestamp()
-    #         self._metadata['last_modified'] = int_us
-    #         if self._version_date:
-    #             self._metadata['versions'][self._version_position] = {'versions_date': self._version_date, 'user_metadata': self._user_meta}
-    #         else:
-    #             self._metadata['user_metadata'] = self._user_meta
-
-    #         with io.open(self._local_meta_path, 'wb') as f:
-    #             f.write(zstd.compress(orjson.dumps(self._metadata, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)))
-
-
-
-
-
-# class Bookcase:
-#     """
-
-#     """
-#     def __init__(self,
-#                  file_path: Union[str, pathlib.Path],
-#                  flag: str = "r",
-#                  value_serializer: str = None,
-#                  n_buckets: int=12007,
-#                  buffer_size: int = 2**22,
-#                  remote: Union[remotes.BaseRemote, str]=None
-#                  ):
-#         """
-
-#         """
-#         ## Pre-processing
-#         if file_path is None:
-#             temp_path = pathlib.Path(tempfile.TemporaryDirectory().name)
-#             local_meta_path = temp_path.joinpath('temp.bcs')
-#             self._finalizer = weakref.finalize(self, shutil.rmtree, temp_path, True)
-#         else:
-#             local_meta_path = pathlib.Path(file_path)
-#             temp_path = None
-
-#         # local_meta_path = pathlib.Path(local_db_path)
-#         remote_keys_name = local_meta_path.name + '.remote_keys'
-#         remote_keys_path = local_meta_path.parent.joinpath(remote_keys_name)
-
-#         for key, value in local_storage_kwargs.items():
-#             if key not in utils.local_storage_options:
-#                 raise ValueError(f'{key} in local_storage_kwargs, but it must only contain {utils.local_storage_options}.')
-#         if 'n_buckets' not in local_storage_kwargs:
-#             n_buckets = utils.default_n_buckets
-#             local_storage_kwargs['n_buckets'] = n_buckets
-#         else:
-#             n_buckets = int(local_storage_kwargs['n_buckets'])
-#         local_storage_kwargs.update({'key_serializer': 'str', 'value_serializer': 'bytes'})
-#         if value_serializer in booklet.serializers.serial_name_dict:
-#             value_serializer_code = booklet.serializers.serial_name_dict[value_serializer]
-#         else:
-#             raise ValueError(f'value_serializer must be one of {booklet.available_serializers}.')
-
-#         ## Create S3 lock for writes
-#         if write and remote_s3_access:
-#             lock = s3func.s3.S3Lock(connection_config, bucket, remote_db_key, read_timeout=read_timeout)
-#             if break_other_locks:
-#                 lock.break_other_locks()
-#             if not lock.aquire(timeout=lock_timeout):
-#                 raise TimeoutError('S3Lock timed out')
-#         else:
-#             lock = None
-
-#         ## Finalizer
-#         self._finalizer = weakref.finalize(self, utils.bookcase_finalizer, temp_path, lock)
-
-#         ## Init metadata
-#         meta, meta_in_remote = utils.init_metadata(local_meta_path, remote_keys_path, write, http_session, s3_session, remote_s3_access, remote_http_access, remote_url, remote_db_key, value_serializer, local_storage_kwargs)
-
-#         ## Init local storage
-#         # local_data_path = utils.init_local_storage(local_meta_path, flag, meta)
-
-#         ## Assign properties
-#         # self._temp_path = temp_path
-#         self._meta_in_remote = meta_in_remote
-#         self._remote_db_key = remote_db_key
-#         self._n_buckets = n_buckets
-#         self._write = write
-#         self._buffer_size = buffer_size
-#         self._connection_config = connection_config
-#         self._read_timeout = read_timeout
-#         self._lock = lock
-#         self.remote_s3_access = remote_s3_access
-#         self.remote_http_access = remote_http_access
-#         self._bucket = bucket
-#         self._meta = meta
-#         self._threads = threads
-#         self._local_meta_path = local_meta_path
-#         self._remote_keys_path = remote_keys_path
-#         self._value_serializer = value_serializer
-#         self._value_serializer_code = value_serializer_code
-#         self._local_storage_kwargs = local_storage_kwargs
-#         self._host_url = host_url
-#         self._remote_base_url = remote_base_url
-#         self._remote_url = remote_url
-#         self._s3_session = s3_session
-#         self._http_session = http_session
-
-#         ## Assign the metadata object for global
-#         self.metadata = UserMetadata(self)
-
-
-#     @property
-#     def default_book_name(self):
-#         """
-
-#         """
-#         if self._meta['default_book']:
-#             return self._meta['books'][self._meta['default_book']]['name']
-
-#     def list_book_names(self):
-#         """
-
-#         """
-#         for key, val in self._meta['books'].items():
-#             yield val['name']
-
-
-#     def set_default_book_name(self, book_name):
-#         """
-
-#         """
-#         book_hash = utils.hash_book_name(book_name)
-#         if book_hash in self._meta['books']:
-#             self._meta['default_book'] = book_hash
-#             # meta_bytes = zstd.compress(orjson.dumps(self._meta, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY), level=1)
-#             # with io.open(self._local_meta_path, 'wb') as f:
-#             #     f.write(meta_bytes)
-#         else:
-#             raise KeyError(book_name)
-
-
-#     # def create_book(self, book_name):
-#     #     """
-#     #     Remove
-#     #     """
-#     #     meta = utils.create_book(self._local_meta_path, self._meta, book_name, self.remote_s3_access)
-#     #     self._meta = meta
-
-#     #     return True
-
-
-#     def open_book(self, book_name: str=None, flag: str='r'):
-#         """
-#         Remove the create_book method and include a flag parameter.
-#         """
-#         if book_name is None:
-#             if flag == 'r':
-#                 book_hash = self._meta['default_book']
-#                 if book_hash is None:
-#                     raise KeyError('No books exist. Open with write permissions to create a book.')
-#             else:
-#                 raise KeyError('book_name must be specified when open for writing.')
-#         else:
-#             book_hash = utils.hash_book_name(book_name)
-
-#         if flag in ('n', 'c'):
-#             if flag == 'c':
-#                 if book_hash in self._meta['books']:
-#                     raise KeyError(f'{book_name} already exists as a book.')
-#             meta = utils.create_book(self._local_meta_path, self._meta, book_name, book_hash, self.remote_s3_access)
-#             self._meta = meta
-
-#         book = Book(self, book_hash)
-
-#         return book
-
-
-#     def close(self):
-#         """
-
-#         """
-#         if self._flag != 'r':
-#             self.metadata.close()
-
-#         self._finalizer()
-
-#     def __enter__(self):
-#         return self
-
-#     def __exit__(self, *args):
-#         self.close()
-
-#     def pull_remote_index(self, book_name):
-#         """
-
-#         """
-#         ## Get base path for the book
-#         if book_name is None:
-#             book_hash = self._meta['default_book']
-#         else:
-#             book_hash = utils.hash_book_name(book_name)
-#             if book_hash not in self._meta['books']:
-#                 raise KeyError(book_name)
-
-#         book_file_name = self._local_meta_path.name + f'.{book_hash}.'
-#         book_base_path = self._local_meta_path.parent.joinpath(book_file_name)
-
-#         remote_index_path = utils.get_remote_index_file(book_base_path, book_hash, self._remote_db_key, self._remote_url, self._http_session, self._s3_session, self.remote_http_access, self.remote_s3_access, True)
-
-#         return remote_index_path
-
-
-#     def pull_metadata(self):
-#         """
-
-#         """
-#         if self._meta_in_remote:
-#             self.metadata.sync()
-#             meta, meta_in_remote = utils.init_metadata(self._local_meta_path, self._remote_keys_path, self._flag, self._write, self._http_session, self._s3_session, self._remote_s3_access, self._remote_http_access, self._remote_url, self._remote_db_key, self._value_serializer, self._local_storage_kwargs)
-#             return True
-#         else:
-#             return False
-
-
 class EVariableLengthValue(MutableMapping):
     """
 
@@ -495,26 +133,10 @@ class EVariableLengthValue(MutableMapping):
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            # object_lock: bool=False,
-            # break_other_locks: bool=False,
-            # lock_timeout: int=-1,
-            # inherit_remote: Union[remotes.BaseRemote, str]=None,
-            # inherit_data: bool=False,
             ):
         """
 
         """
-        ## Inherit another remote
-        # if (inherit_remote is not None) and (flag in ('c', 'n')):
-        #     if isinstance(inherit_remote, str):
-        #         inherit_remote = remotes.HttpRemote(inherit_remote)
-        #     elif not isinstance(inherit_remote, remotes.BaseRemote):
-        #         raise TypeError('inherit_remote must be either a Remote or a url string.')
-
-            # TODO: Pull down the remote ebooklet and assign it to this new object
-
-        # check_timestamp = init_check_remote
-
         local_file_path = pathlib.Path(file_path)
 
         local_file_exists = local_file_path.exists()
@@ -569,33 +191,11 @@ class EVariableLengthValue(MutableMapping):
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
         self._deletes = set()
-        # self._read_conn_open = read_conn_open
-        # self._write_conn_open = write_conn_open
         self._remote_session = remote_session
-        # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
-        # self._clear = False
-        # self._lock = lock
         self._subtype = 'EVariableLengthValue'
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
-
-    # def _pre_value(self, value) -> bytes:
-
-    #     ## Serialize to bytes
-    #     try:
-    #         value = self._value_serializer.dumps(value)
-    #     except Exception as error:
-    #         raise error
-
-    #     return value
-
-    # def _post_value(self, value: bytes):
-
-    #     ## Serialize from bytes
-    #     value = self._value_serializer.loads(value)
-
-    #     return value
 
     def set_metadata(self, data, timestamp=None):
         """
@@ -686,20 +286,8 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self._local_file.set(key, value, timestamp)
 
-            # if self._read_conn.uuid:
-            #     int_us = utils.make_timestamp()
-            # else:
-            #     old_val = self._local_index.get(key)
-            #     if old_val:
-            #         int_us = utils.bytes_to_int(old_val) + 1
-            #     else:
-            #         int_us = 0
-            # val_bytes = self._pre_value(value)
-            # self._local_data[key] = val_bytes
-            # self._local_index[key] = utils.int_to_bytes(int_us, 7)
         else:
             raise ValueError('File is open for read only.')
-
 
 
     def __iter__(self):
@@ -865,16 +453,13 @@ class EVariableLengthValue(MutableMapping):
     def __exit__(self, *args):
         self.close()
 
-    def clear(self, local_only=True):
+    def clear(self):
         """
         Remove all keys and values from the local file.
         """
         if self.writable:
             self._local_file.clear()
 
-            # if not local_only:
-            #     if self._remote_index is not None:
-            #         self._remote_index.clear()
         else:
             raise ValueError('File is open for read only.')
 
@@ -959,26 +544,10 @@ class RemoteConnGroup(EVariableLengthValue):
             flag: str = "r",
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            # object_lock: bool=False,
-            # break_other_locks: bool=False,
-            # lock_timeout: int=-1,
-            # inherit_remote: Union[remotes.BaseRemote, str]=None,
-            # inherit_data: bool=False,
             ):
         """
 
         """
-        ## Inherit another remote
-        # if (inherit_remote is not None) and (flag in ('c', 'n')):
-        #     if isinstance(inherit_remote, str):
-        #         inherit_remote = remotes.HttpRemote(inherit_remote)
-        #     elif not isinstance(inherit_remote, remotes.BaseRemote):
-        #         raise TypeError('inherit_remote must be either a Remote or a url string.')
-
-            # TODO: Pull down the remote ebooklet and assign it to this new object
-
-        # check_timestamp = init_check_remote
-
         local_file_path = pathlib.Path(file_path)
 
         local_file_exists = local_file_path.exists()
@@ -1031,13 +600,8 @@ class RemoteConnGroup(EVariableLengthValue):
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
         self._deletes = set()
-        # self._read_conn_open = read_conn_open
-        # self._write_conn_open = write_conn_open
         self._remote_session = remote_session
-        # self._changelog_path = None
         self._n_buckets = local_file._n_buckets
-        # self._clear = False
-        # self._lock = lock
         self._subtype = 'RemoteConnGroup'
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
@@ -1077,32 +641,6 @@ class RemoteConnGroup(EVariableLengthValue):
         """
         raise NotImplementedError('Use the add method to add remote connections to the group.')
 
-        # if self.writable:
-
-        #     if not isinstance(remote_conn, remote.S3Connection):
-        #         raise TypeError('remote_conn/value must be a remote.S3Connection')
-
-        #     ## Update remote_conn meta
-        #     remote_conn.load_db_metadata()
-        #     remote_conn.load_user_metadata()
-
-        #     uuid0 = remote_conn.uuid
-        #     if uuid0 is None:
-        #         raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
-
-        #     uuid_hex = uuid0.hex
-
-        #     if key != uuid_hex:
-        #         raise KeyError('The key must be the uuid hex.')
-
-        #     value = remote_conn.to_dict()
-
-        #     self._local_file.set(uuid_hex, value, remote_conn.timestamp)
-
-        # else:
-        #     raise ValueError('File is open for read only.')
-
-
 
 def open(
     file_path: Union[str, pathlib.Path],
@@ -1111,7 +649,6 @@ def open(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     remote_conn: Union[remote.S3Connection, str]=None,
-    # ebooklet_type: str='EVariableLengthValue',
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. If remote_conn is not passed, then it opens a normal booklet file.
@@ -1168,19 +705,4 @@ def open(
     else:
         return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
 
-        # if remote_conn.uuid is not None:
-        #     if isinstance(remote_conn.ebooklet_type, str):
-        #         if remote_conn.ebooklet_type == 'EVariableLengthValue':
-        #             return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
-        #         elif remote_conn.ebooklet_type == 'RemoteConnGroup':
-        #             return RemoteConnGroup(remote_conn=remote_conn, file_path=file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
-        #         else:
-        #             raise ValueError('What kind of EBooklet is this?!')
-        # else:
-        #     if ebooklet_type == 'EVariableLengthValue':
-        #         return EVariableLengthValue(remote_conn=remote_conn, file_path=file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
-        #     elif ebooklet_type == 'RemoteConnGroup':
-        #         return RemoteConnGroup(remote_conn=remote_conn, file_path=file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
-        #     else:
-        #         raise ValueError('ebooklet_type must be either EVariableLengthValue or RemoteConnGroup.')
 

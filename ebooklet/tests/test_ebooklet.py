@@ -373,7 +373,6 @@ def test_remote_conn_grp_read_remote():
     assert isinstance(conn_dict, dict)
 
 
-
 ##################################
 ### Remove files
 
