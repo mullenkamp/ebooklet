@@ -682,7 +682,7 @@ class S3SessionWriter(S3SessionReader):
         Initialise an S3 lock object. A lock is not immediately aquired. This must be done via the lock object (as well as releasing locks).
         """
         if self.writable:
-            lock = self._write_session.s3lock(self.db_key)
+            lock = self._write_session.s3lock(self.write_db_key)
             return lock
         else:
             raise ValueError('Session is not writable.')
@@ -692,9 +692,9 @@ class S3SessionWriter(S3SessionReader):
         Get the header for a remote object/file. The input should be a key as a str. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
         """
         if key is None:
-            resp = self._write_session.head_object(self.read_db_key)
+            resp = self._write_session.head_object(self.write_db_key)
         else:
-            resp = self._write_session.head_object(self.read_db_key + '/' + key)
+            resp = self._write_session.head_object(self.write_db_key + '/' + key)
 
         return resp
 
