@@ -468,7 +468,7 @@ class S3SessionWriter(S3SessionReader):
         self._finalizer = weakref.finalize(self, utils.s3session_finalizer, self._write_session)
 
         ## Get latest metadata
-        self._load_metadata()
+        self._load_db_metadata()
 
     @property
     def writable(self):
