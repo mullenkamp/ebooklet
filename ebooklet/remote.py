@@ -763,23 +763,23 @@ class S3Connection(JsonSerializer):
         # self.user_meta = user_meta
 
 
-    # def _make_read_session(self):
-    #     """
+    def _make_read_session(self):
+        """
 
-    #     """
-    #     read_session, key = create_s3_read_session(
-    #             self.access_key_id,
-    #             self.access_key,
-    #             self.db_key,
-    #             self.bucket,
-    #             self.endpoint_url,
-    #             self.db_url,
-    #             self.threads,
-    #             self.read_timeout,
-    #             self.retries,
-    #             )
+        """
+        read_session, key = create_s3_read_session(
+                self.access_key_id,
+                self.access_key,
+                self.db_key,
+                self.bucket,
+                self.endpoint_url,
+                self.db_url,
+                self.threads,
+                self.read_timeout,
+                self.retries,
+                )
 
-    #     return read_session, key
+        return read_session, key
 
 
     # def load_db_metadata(self):
