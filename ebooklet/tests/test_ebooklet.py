@@ -8,7 +8,7 @@ except ImportError:
     import tomli as toml
 from s3func import S3Session, HttpSession, B2Session
 import booklet
-# import ebooklet
+import ebooklet
 from ebooklet import __version__, remote, RemoteConnGroup, EVariableLengthValue
 from copy import deepcopy
 
@@ -117,21 +117,21 @@ def get_logs(request):
 
 
 def test_set_items():
-    with EVariableLengthValue(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         for key, value in data_dict.items():
             f[key] = value
 
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         value = f['10']
 
     assert value == data_dict['10']
 
 
 def test_update():
-    with EVariableLengthValue(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         f.update(data_dict)
 
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         value = f['10']
 
     assert value == data_dict['10']
@@ -141,32 +141,32 @@ def test_set_get_metadata():
     """
 
     """
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         old_meta = f.get_metadata()
         f.set_metadata(meta)
 
     assert old_meta is None
 
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         new_meta = f.get_metadata()
 
     assert new_meta == meta
 
 
 def test_set_get_timestamp():
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         ts_old, value = f.get_timestamp('10', True)
         ts_new = booklet.utils.make_timestamp_int()
         f.set_timestamp('10', ts_new)
 
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         ts_new = f.get_timestamp('10')
 
     assert ts_new > ts_old and value == data_dict['10']
 
 
 def test_keys():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         keys = set(list(f.keys()))
 
     source_keys = set(list(data_dict.keys()))
@@ -175,14 +175,14 @@ def test_keys():
 
 
 def test_items():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         for key, value in f.items():
             source_value = data_dict[key]
             assert source_value == value
 
 
 def test_timestamps():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         for key, ts, value in f.timestamps(True):
             source_value = data_dict[key]
             assert source_value == value
@@ -193,7 +193,7 @@ def test_timestamps():
 
 
 def test_contains():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         for key in data_dict:
             if key not in f:
                 raise KeyError(key)
@@ -202,7 +202,7 @@ def test_contains():
 
 
 def test_len():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         new_len = len(f)
 
     assert len(data_dict) == new_len
@@ -214,7 +214,7 @@ def test_delete_len():
     for index in indexes:
         _ = data.pop(index)
 
-        with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+        with ebooklet.open(remote_conn, file_path, 'w') as f:
             f[index] = 0
             f[index] = 0
             del f[index]
@@ -233,7 +233,7 @@ def test_delete_len():
 
 
 def test_values():
-    with EVariableLengthValue(remote_conn, file_path) as f:
+    with ebooklet.open(remote_conn, file_path) as f:
         for value in f.values():
             pass
 
@@ -243,7 +243,7 @@ def test_values():
 
 
 def test_prune():
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         old_len = len(f)
         removed_items = f.prune()
         new_len = len(f)
@@ -252,7 +252,7 @@ def test_prune():
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
     # Reindex
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         old_len = len(f)
         old_n_buckets = f._n_buckets
         removed_items = f.prune(reindex=True)
@@ -265,7 +265,7 @@ def test_prune():
     # Remove the rest via timestamp filter
     timestamp = booklet.utils.make_timestamp_int()
 
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         removed_items = f.prune(timestamp=timestamp)
         new_len = len(f)
         meta = f.get_metadata()
@@ -275,7 +275,7 @@ def test_prune():
 
 ## Always make this last!!!
 def test_clear():
-    with EVariableLengthValue(remote_conn, file_path, 'w') as f:
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
         f.clear()
         f_meta = f.get_metadata()
 
@@ -287,7 +287,7 @@ def test_clear():
 
 
 def test_push():
-    with EVariableLengthValue(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -305,7 +305,7 @@ def test_push():
 def test_read_remote():
     http_remote = remote.S3Connection(db_url=db_url)
 
-    with EVariableLengthValue(http_remote, file_path) as f:
+    with ebooklet.open(http_remote, file_path) as f:
         value1 = f['10']
         assert value1 == data_dict['10']
 
@@ -338,7 +338,7 @@ def test_remote_conn_grp_set():
     with remote_conn.open() as source_session:
         remote_conn_uuid_hex = source_session.uuid.hex
 
-    with RemoteConnGroup(remote_conn_rcg, file_path_rcg, 'n') as f:
+    with ebooklet.open(remote_conn_rcg, file_path_rcg, 'n', remote_conn_group=True) as f:
         f.add(remote_conn)
 
     with booklet.open(file_path_rcg) as f:
@@ -347,7 +347,7 @@ def test_remote_conn_grp_set():
         assert isinstance(conn_dict, dict)
 
 def test_remote_conn_grp_push():
-    with RemoteConnGroup(remote_conn_rcg, file_path_rcg, 'w') as f:
+    with ebooklet.open(remote_conn_rcg, file_path_rcg, 'w') as f:
         changes = f.changes()
         # print(list(changes.iter_changes()))
         changes.push()
@@ -363,7 +363,7 @@ def test_remote_conn_grp_read_remote():
         remote_conn_uuid_hex = source_session.uuid.hex
     # http_remote = remote.S3Connection(db_url=db_url)
 
-    with RemoteConnGroup(db_url_rcg, file_path_rcg) as f:
+    with ebooklet.open(db_url_rcg, file_path_rcg) as f:
         conn_dict = f[remote_conn_uuid_hex]
         ri_path = f._remote_index_path
 

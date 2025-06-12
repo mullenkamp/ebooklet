@@ -128,7 +128,9 @@ def check_parse_conn(remote_conn, flag, local_file_exists):
     # elif flag != 'r' and remote_session is None and not local_file_exists:
     #     raise ValueError('If open for write, then an S3Remote object must be passed.')
 
-    return remote_session
+    ebooklet_type = remote_session.type
+
+    return remote_session, ebooklet_type
 
 
 def check_local_remote_sync(local_file, remote_session, flag):
@@ -368,7 +370,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
 
         remote_index._file.seek(0)
 
-        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'ebooklet_type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
+        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
         # remote_index.reopen('r')
 

@@ -291,12 +291,12 @@ class S3SessionReader:
             self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
-            self.ebooklet_type = meta['ebooklet_type']
+            self.type = meta['type']
         elif resp_obj.status == 404:
             self._init_bytes = None
             self.uuid = None
             self.timestamp = None
-            self.ebooklet_type = None
+            self.type = None
         else:
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
@@ -311,14 +311,14 @@ class S3SessionReader:
         return self.uuid
 
 
-    def get_ebooklet_type(self):
+    def get_type(self):
         """
         Get the EBooklet type of the remote.
         """
-        if self.ebooklet_type is None:
+        if self.type is None:
             self._load_db_metadata()
 
-        return self.ebooklet_type
+        return self.type
 
 
     def get_timestamp(self):
