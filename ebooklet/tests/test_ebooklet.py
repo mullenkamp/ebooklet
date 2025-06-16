@@ -313,6 +313,11 @@ def test_read_remote():
             source_value = data_dict[key]
             assert source_value == value
 
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path.unlink()
+
 
 ############################################
 ### Test remote methods
