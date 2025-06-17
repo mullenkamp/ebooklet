@@ -33,6 +33,25 @@ ebooklet_types = ('EVariableLengthValue', 'RemoteConnGroup')
 ### Functions
 
 
+def check_remote_conn(remote_conn, flag):
+    """
+
+    """
+    if isinstance(remote_conn, str):
+        if flag != 'r':
+            raise ValueError('If remote_conn is a url string, then flag must be r.')
+        remote_conn = S3Connection(db_url=remote_conn)
+    elif isinstance(remote_conn, dict):
+        if 'remote_conn' in remote_conn:
+            remote_conn = S3Connection(**remote_conn['remote_conn'])
+        else:
+            remote_conn = S3Connection(**remote_conn)
+    elif not isinstance(remote_conn, S3Connection):
+        raise TypeError('remote_conn must be either a url string or a remote.S3Connection.')
+
+    return remote_conn
+
+
 def get_db_metadata(session, db_key):
     """
 
@@ -291,12 +310,12 @@ class S3SessionReader:
             self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
-            self.ebooklet_type = meta['ebooklet_type']
+            self.type = meta['type']
         elif resp_obj.status == 404:
             self._init_bytes = None
             self.uuid = None
             self.timestamp = None
-            self.ebooklet_type = None
+            self.type = None
         else:
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
@@ -311,14 +330,14 @@ class S3SessionReader:
         return self.uuid
 
 
-    def get_ebooklet_type(self):
+    def get_type(self):
         """
         Get the EBooklet type of the remote.
         """
-        if self.ebooklet_type is None:
+        if self.type is None:
             self._load_db_metadata()
 
-        return self.ebooklet_type
+        return self.type
 
 
     def get_timestamp(self):
@@ -564,42 +583,44 @@ class S3SessionWriter(S3SessionReader):
     def copy_remote(self, remote_conn):
         """
         Copy an entire remote dataset to another remote location. The new location must be empty.
+
+        There's still a question of whether this method should be in the Reader rather than the writer. As a matter of API concept, this should be in the Reader as you only need to read something to copy it somewhere else (the target). But as a matter of implementation, the thing doing the copying would need to know all of the files to copy. This can be either known through a list_objects call (currently used and requires write permissions as defined in this API) or to parse the index file for all of the appropriate keys. Parsing the index file requires the file to be saved to disk and this API does not have that capability. Consequently, if the index file must be used, then it must be implemented in the EVariableLengthValue class instead of the session classes. Using the index file instead of the list_objects method would have the advantage of only copying over the objects that are actually used by ebooklet rather than other dangling objects. On the other hand, requiring the source session being a Writer would more likely cause the copy to be an effecient S3 to S3 copy rather than a slower routing through the user's network.
         """
         with remote_conn.open('w') as writer:
 
             if not writer.writable:
                 raise ValueError('target remote is not writable.')
-    
+
             ## Check if source exists
             source_uuid = self.get_uuid()
             if source_uuid is None:
                 raise ValueError('The source remote does not exist.')
-    
+
             ## Check is target exists
             target_uuid = writer.get_uuid()
             if target_uuid is not None:
-                raise ValueError('The target remote already exists. Either delete_remote or use a different target remote.')
-    
+                raise ValueError('The target remote already exists. Either delete_remote or use a different target.')
+
             ## Get a list of all source objects
             source_resp = self._write_session.list_objects(prefix=self.write_db_key + '/')
             if source_resp.status // 100 != 2:
                 raise urllib3.exceptions.HTTPError(source_resp.error)
-    
+
             ## Get all target objects
             target_resp = writer._write_session.list_objects(prefix=writer.write_db_key + '/')
             if target_resp.status // 100 != 2:
                 raise urllib3.exceptions.HTTPError(target_resp.error)
-    
+
             target_exist_keys = set(obj['key'] for obj in target_resp.iter_objects())
-    
+
             ## Buckets
             source_bucket = self._write_session.bucket
             target_bucket = writer._write_session.bucket
-    
+
             ## Determine if the s3 copy_object method can be used
             if (self._write_session._access_key_id == writer._write_session._access_key_id) and (self._write_session._access_key == writer._write_session._access_key):
                 print('Both the source and target remotes use the same credentials, so copying objects is efficient.')
-    
+
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -609,13 +630,13 @@ class S3SessionWriter(S3SessionReader):
                         if target_key not in target_exist_keys:
                             f = executor.submit(self._write_session.copy_object, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
-    
+
                     for f in concurrent.futures.as_completed(futures):
                         target_key = futures[f]
                         resp = f.result()
                         if resp.status // 100 != 2:
                             failures[target_key] = resp.error
-    
+
                 if failures:
                     print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
                     return failures
@@ -623,10 +644,10 @@ class S3SessionWriter(S3SessionReader):
                     resp = self._write_session.copy_object(self.write_db_key, writer.write_db_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                     if resp.status // 100 != 2:
                         raise urllib3.exceptions.HTTPError(resp.error)
-    
+
             else:
                 print('The source and target remotes use different credentials, so copying objects must be first downloaded than uploaded. Less efficient than if both remotes had the same credentials.')
-    
+
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
@@ -636,13 +657,13 @@ class S3SessionWriter(S3SessionReader):
                         if target_key not in target_exist_keys:
                             f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
-    
+
                     for f in concurrent.futures.as_completed(futures):
                         target_key = futures[f]
                         resp = f.result()
                         if resp.status // 100 != 2:
                             failures[target_key] = resp.error
-    
+
                 if failures:
                     print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
                     return failures
@@ -652,29 +673,18 @@ class S3SessionWriter(S3SessionReader):
                         raise urllib3.exceptions.HTTPError(resp.error)
 
 
+    def list_objects(self):
+        """
+
+        """
+        return self._write_session.list_objects(prefix=self.write_db_key + '/')
 
 
-    # TODO
-    # def rebuild_index(self):
-    #     """
-    #     Rebuild the remote index file from all the objects in the remote.
-    #     """
-    #     if self.writable:
-    #         resp = self._session.list_object_versions(prefix=self.db_key + '/')
+    def list_object_versions(self):
+        """
 
-
-    # def list_objects(self):
-    #     """
-
-    #     """
-    #     return self.write_session.list_objects(prefix=self.write_db_key + '/')
-
-
-    # def list_object_versions(self):
-    #     """
-
-    #     """
-    #     return self.write_session.list_object_versions(prefix=self.write_db_key + '/')
+        """
+        return self._write_session.list_object_versions(prefix=self.write_db_key + '/')
 
     def create_lock(self):
         """
@@ -752,7 +762,26 @@ class S3Connection(JsonSerializer):
                 # user_meta: dict=None,
                 ):
         """
+        Establishes an S3 client connection with an S3 account.
 
+        Parameters
+        ----------
+        access_key_id : str
+            The access key id also known as aws_access_key_id.
+        access_key : str
+            The access key also known as aws_secret_access_key.
+        db_key : str
+            The key name of the database.
+        bucket : str
+            The bucket to be used when performing S3 operations.
+        endpoint_url : str
+            The nedpoint http(s) url for the s3 service.
+        threads : int
+            The number of simultaneous connections for the S3 connection.
+        read_timeout: int
+            The read timeout in seconds passed to the "retries" option in the S3 config.
+        retries: int
+            The number of max attempts passed to the "retries" option in the S3 config.
         """
         ## temp read session
         read_session, key = create_s3_read_session(
@@ -853,7 +882,16 @@ class S3Connection(JsonSerializer):
              flag: str='r',
              ):
         """
+        Opens a connection to the S3 remote.
 
+        Parameters
+        ----------
+        flag : str
+            The open flag for the remote. These are the same for booklet and ebooklet.
+
+        Returns
+        -------
+        S3SessionReader or S3SessionWriter
         """
         if (flag != 'r') and (self.access_key_id is None or self.access_key is None):
             raise ValueError("access_key_id and access_key must be assigned to open a connection for writing.")

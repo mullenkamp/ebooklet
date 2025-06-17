@@ -117,3 +117,5 @@ ENV/
 /ebooklet/tests/*.yml
 
 .ruff*
+
+uv.lock
