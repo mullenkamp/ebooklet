@@ -9,7 +9,7 @@ authors = [
 ]
 license-expression = "Apache-2.0"
 description = "Organise all your data in key/value booklets and sync them with S3"
-readme = "README.md"
+readme = {file = "README.rst", content-type = "text/x-rst"}
 dynamic = ["version"]
 classifiers = [
     "Programming Language :: Python :: 3 :: Only",

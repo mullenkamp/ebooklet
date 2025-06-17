@@ -33,6 +33,7 @@ To interact with remote S3 systems, you'll need to create an S3Connection object
 
 
 .. code:: python
+  
   import ebooklet
 
   access_key_id = 'my key id associated with the access key'
