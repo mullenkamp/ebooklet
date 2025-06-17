@@ -142,12 +142,17 @@ class EVariableLengthValue(MutableMapping):
         """
 
         """
+        ## Remove the remote database if flag == 'n'
         ## Lock the remote if file is opened for write
         if flag != 'r':
+            if flag == 'n' and (remote_session.uuid is not None):
+                remote_session.delete_remote()
             lock = remote_session.create_lock()
             lock.aquire()
+            self.writable = True
         else:
             lock = None
+            self.writable = False
 
         ## Init the local file
         local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
@@ -168,11 +173,6 @@ class EVariableLengthValue(MutableMapping):
         self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
 
         ## Assign properties
-        if flag == 'r':
-            self.writable = False
-        else:
-            self.writable = True
-
         self._flag = flag
         self.lock = lock
         self._remote_index_path = remote_index_path

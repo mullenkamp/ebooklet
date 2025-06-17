@@ -20,9 +20,9 @@ I'll probably put it on conda-forge once I feel appropriately motivated...
 
 Booklet vs EBooklet
 -------------------
-The `Booklet python package <https://github.com/mullenkamp/booklet>`_ is a single file key/value database and is used as the foundation for EBooklet. Booklet manages the local data, while EBooklet manages the remote data. It is best to familiarize yourself with booklet before using EBooklet. This is especially true when you're not collaborating with others on a project and simply need to save and retrieve data occasionally from your remote.
+The `Booklet python package <https://github.com/mullenkamp/booklet>`_ is a single file key/value database and is used as the foundation for EBooklet. Booklet manages the local data, while EBooklet manages the interaction between the remote data and the local data. It is best to familiarize yourself with Booklet before using EBooklet. This is especially true when you're not collaborating with others on a project and simply need to save and retrieve data occasionally from your remote.
 
-EBooklet has been designed in a way that allows the user to primarily work using Booklet and then have their local files pushed up to the S3 remote later via EBooklet. I.e. you don't have to always open your file using EBooklet whenever you're doing work. If you're actively collaborating with others and data is being modified, then it is best to open the data using EBooklet to ensure data conflicts do not occur.
+EBooklet has been designed in a way that allows the user to primarily work using Booklet and then have their local files pushed up to the S3 remote later via EBooklet. In other words, you don't have to always open your file using EBooklet whenever you're doing work. If you're actively collaborating with others and data is being modified, then it is best to open the data using EBooklet to ensure data conflicts do not occur.
 
 Unlike Booklet which uses threading and OS-level file locks (which are very fast), EBooklet uses an S3 locking method when a file is open for writing. This ensures that only a single process has write access to a remote database at a time, but it's also relatively slow (compared to file locks).
 
@@ -52,12 +52,12 @@ Once you have the S3Connection object, then you can pass it to the ebooklet.open
 
   local_file_path = '/path_to_file/big_data.blt'
 
-  db = ebooklet.open(remote_conn, local_file_path, flag='n', value_serializer='pickle')
-
-  db['key1'] = ['one', 2, 'three', 4]
+  db = ebooklet.open(remote_conn, local_file_path, flag='c', value_serializer='pickle')
 
 
 If you're only going to open a database for reading and you have the db_url, then you don't even need to create the S3Connection object. You can simply pass the db_url string to the remote_conn parameter of the ebooklet.open function.
+
+Be careful with the flags. Using the 'n' flag with ebooklet.open will delete the remote database in addition to the local database.
 
 
 .. code:: python
