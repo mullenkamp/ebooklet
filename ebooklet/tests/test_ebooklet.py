@@ -385,15 +385,18 @@ def test_remove_remote_local():
     with remote_conn.open('w') as s3open:
         s3open.delete_remote()
 
-    with remote_conn2.open('w') as s3open:
-        s3open.delete_remote()
+    with ebooklet.open(remote_conn2, file_path, 'n', value_serializer='pickle') as db:
+       uuid1 = db._remote_session.get_uuid()
+       assert uuid1 is None
+    # with remote_conn2.open('w') as s3open:
+    #     s3open.delete_remote()
 
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()
 
-    # file_path.unlink()
-    # remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
-    # remote_index_path.unlink()
+    file_path.unlink()
+    remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
+    remote_index_path.unlink()
 
     # with remote_conn_rcg.open('w') as s3open:
     #     s3open.delete_remote()
