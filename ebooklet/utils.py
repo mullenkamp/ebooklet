@@ -142,10 +142,13 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
 
             overwrite_remote_index = True
         else:
-            if flag == 'r':
-                local_file = booklet.open(local_file_path, 'r')
-            else:
-                local_file = booklet.open(local_file_path, 'w')
+            # if flag == 'r':
+            #     local_file = booklet.open(local_file_path, 'r')
+            # else:
+            #     local_file = booklet.open(local_file_path, 'w')
+
+            ## The local file will need to always be open for write since data will be loaded from the remote regardless if the user has only opened it for read-only
+            local_file = booklet.open(local_file_path, 'w')
 
             overwrite_remote_index = check_local_remote_sync(local_file, remote_session, flag)
 
@@ -348,8 +351,6 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
 
         resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
-        # remote_index.reopen('r')
-
         if resp.status // 100 != 2:
             urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
 
@@ -359,8 +360,6 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
             deletes.clear()
 
         updated = True
-
-    # remote_index.reopen('r')
 
     if failures:
         return failures

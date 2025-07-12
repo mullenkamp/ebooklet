@@ -232,6 +232,11 @@ class EVariableLengthValue(MutableMapping):
 
         return self._local_file.items()
 
+        # for key in self.load_items():
+        #     value = self._local_file.get(key)
+        #     yield key, value
+
+
     def values(self):
         """
         Returns an iterator of the values.
@@ -240,6 +245,10 @@ class EVariableLengthValue(MutableMapping):
 
         return self._local_file.values()
 
+        # for key in self.load_items():
+        #     value = self._local_file.get(key)
+        #     yield value
+
     def timestamps(self, include_value=False):
         """
         Return an iterator for timestamps for all keys. Optionally add values to the iterator.
@@ -247,6 +256,10 @@ class EVariableLengthValue(MutableMapping):
         _ = self.load_items()
 
         return self._local_file.timestamps(include_value=include_value)
+
+        # for key in self.load_items():
+        #     value = self._local_file.timestamps(include_value=include_value)
+        #     yield value
 
 
     def get_timestamp(self, key, include_value=False, decode_value=True, default=None):
@@ -340,24 +353,26 @@ class EVariableLengthValue(MutableMapping):
         """
         Return an iterator of the values associated with the input keys. Missing keys will return the default.
         """
-        _ = self.load_items(keys)
+        # _ = self.load_items(keys)
 
-        for key in keys:
+        for key in self.load_items(keys):
             output = self._local_file.get(key, default=default)
             yield key, output
 
 
     def load_items(self, keys=None):
         """
-        Loads items into the local file without returning the values. If keys is None, then it loads all of the values in the remote. Returns a dict of keys with the errors trying to access the remote.
+        Loads items into the local file without returning the values. If keys is None, then it loads all of the values in the remote. Returns a generator which yields keys as they are loaded into the local file.
         """
         futures = {}
+
+        ## What to do with failures?!
         failure_dict = {}
 
-        writable = self._local_file.writable
+        # writable = self._local_file.writable
 
-        if not writable:
-            self._local_file.reopen('w')
+        # if not writable:
+        #     self._local_file.reopen('w')
 
         if keys is None:
             for key, remote_time_bytes in self._remote_index.items():
@@ -373,16 +388,22 @@ class EVariableLengthValue(MutableMapping):
                     f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
 
+        keys = []
         for f in concurrent.futures.as_completed(futures):
             key = futures[f]
             error = f.result()
             if error is not None:
                 failure_dict[key] = error
+            else:
+                keys.append(key)
+                # yield key
 
-        if not writable:
-            self._local_file.reopen('r')
+        ## It's too risky to change the flag before/after in case the load process is cancelled part way
+        # if not writable:
+        #     self._local_file.reopen('r')
 
-        return failure_dict
+        # return failure_dict
+        return keys
 
 
     def _load_item(self, key):
@@ -396,12 +417,13 @@ class EVariableLengthValue(MutableMapping):
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
-            if not self._local_file.writable:
-                self._local_file.reopen('w')
-                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
-                self._local_file.reopen('r')
-            else:
-                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
+            # if not self._local_file.writable:
+            #     self._local_file.reopen('w')
+            #     failure = utils.get_remote_value(self._local_file, key, self._remote_session)
+            #     self._local_file.reopen('r')
+            # else:
+            #     failure = utils.get_remote_value(self._local_file, key, self._remote_session)
+            failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure
         else:
             return None
@@ -477,26 +499,27 @@ class EVariableLengthValue(MutableMapping):
         return Change(self)
 
 
-    def reopen(self, flag):
-        """
-        Reopen a file with a different flag. The flag must be either r or w.
-        """
-        if flag not in ('r', 'w'):
-            raise ValueError('The flag must be either r or w.')
+    ## I don't think this is necessary...could be more of a problem...
+    # def reopen(self, flag):
+    #     """
+    #     Reopen a file with a different flag. The flag must be either r or w.
+    #     """
+    #     if flag not in ('r', 'w'):
+    #         raise ValueError('The flag must be either r or w.')
 
-        self.sync()
-        self._local_file.reopen(flag)
-        self._remote_index.reopen(flag)
+    #     self.sync()
+    #     self._local_file.reopen(flag)
+    #     self._remote_index.reopen(flag)
 
-        if self._flag == 'r' and flag != 'r':
-            lock = self._remote_session.create_lock()
-            lock.aquire()
-            self.lock = lock
-        elif self._flag != 'r' and flag == 'r':
-            self.lock.release()
-            self.lock = None
+    #     if self._flag == 'r' and flag != 'r':
+    #         lock = self._remote_session.create_lock()
+    #         lock.aquire()
+    #         self.lock = lock
+    #     elif self._flag != 'r' and flag == 'r':
+    #         self.lock.release()
+    #         self.lock = None
 
-        self._flag = flag
+    #     self._flag = flag
 
 
     def delete_remote(self):
