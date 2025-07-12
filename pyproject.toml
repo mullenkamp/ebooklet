@@ -23,7 +23,7 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  's3func>=0.7.1',
+  's3func>=0.7.2',
   'urllib3>=2',
   'booklet>=0.7.6',
 ]
