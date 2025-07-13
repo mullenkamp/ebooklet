@@ -99,8 +99,10 @@ def open_remote_conn(remote_conn, flag, local_file_exists):
     """
     remote_session = remote_conn.open(flag)
 
-    if flag in ('r', 'w') and (remote_session.uuid is None) and not local_file_exists:
-        raise ValueError('No file was found in the remote, but the local file was open for read and write without creating a new file.')
+    if flag == 'r' and (remote_session.uuid is None) and not local_file_exists:
+        raise ValueError('No file was found in the remote, but the local file was open for read without creating a new file.')
+    # if flag in ('r', 'w') and (remote_session.uuid is None) and not local_file_exists:
+    #     raise ValueError('No file was found in the remote, but the local file was open for read and write without creating a new file.')
     # elif flag != 'r' and remote_session is None and not local_file_exists:
     #     raise ValueError('If open for write, then an S3Remote object must be passed.')
 
