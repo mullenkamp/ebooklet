@@ -6,4 +6,4 @@ from ebooklet.remote import S3Connection
 
 __all__ = ["open", "EVariableLengthValue", 'RemoteConnGroup', 'S3Connection']
 
-__version__ = '0.5.4'
+__version__ = '0.5.5'

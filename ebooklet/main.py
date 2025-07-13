@@ -675,7 +675,7 @@ def open(
     remote_conn_group: bool=False,
     ):
     """
-    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. If remote_conn is not passed, then it opens a normal booklet file.
+    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. 
 
     Parameters
     -----------
