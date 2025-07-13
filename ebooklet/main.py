@@ -11,6 +11,7 @@ import booklet
 import weakref
 from itertools import count
 from collections import deque
+import urllib3
 
 # import utils
 from . import utils
@@ -228,7 +229,10 @@ class EVariableLengthValue(MutableMapping):
         """
         Returns an iterator of the keys, values.
         """
-        _ = self.load_items()
+        failure_dict = self.load_items()
+
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
 
         return self._local_file.items()
 
@@ -241,7 +245,10 @@ class EVariableLengthValue(MutableMapping):
         """
         Returns an iterator of the values.
         """
-        _ = self.load_items()
+        failure_dict = self.load_items()
+
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
 
         return self._local_file.values()
 
@@ -253,7 +260,10 @@ class EVariableLengthValue(MutableMapping):
         """
         Return an iterator for timestamps for all keys. Optionally add values to the iterator.
         """
-        _ = self.load_items()
+        failure_dict = self.load_items()
+
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
 
         return self._local_file.timestamps(include_value=include_value)
 
@@ -268,7 +278,7 @@ class EVariableLengthValue(MutableMapping):
         """
         failure = self._load_item(key)
         if failure:
-            return failure
+            raise urllib3.exceptions.HTTPError(failure)
 
         return self._local_file.get_timestamp(key, include_value=include_value, decode_value=decode_value, default=default)
 
@@ -318,7 +328,7 @@ class EVariableLengthValue(MutableMapping):
         """
         failure = self._load_item(key)
         if failure:
-            return failure
+            raise urllib3.exceptions.HTTPError(failure)
 
         return self._local_file.get(key, default=default)
 
@@ -353,20 +363,25 @@ class EVariableLengthValue(MutableMapping):
         """
         Return an iterator of the values associated with the input keys. Missing keys will return the default.
         """
-        # _ = self.load_items(keys)
+        if not isinstance(keys, (list, tuple, set)):
+            keys = tuple(keys)
 
-        for key in self.load_items(keys):
+        failure_dict = self.load_items(keys)
+
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
+
+        for key in keys:
             output = self._local_file.get(key, default=default)
             yield key, output
 
 
     def load_items(self, keys=None):
         """
-        Loads items into the local file without returning the values. If keys is None, then it loads all of the values in the remote. Returns a generator which yields keys as they are loaded into the local file.
+        Loads items into the local file from the remote. If keys is None, then it loads all of the values from the remote in to the local file. Returns a dict of failed transfers.
         """
         futures = {}
 
-        ## What to do with failures?!
         failure_dict = {}
 
         # writable = self._local_file.writable
@@ -382,28 +397,28 @@ class EVariableLengthValue(MutableMapping):
                     futures[f] = key
         else:
             for key in keys:
-                remote_time_bytes = self._remote_index.get(key)
+                remote_time_bytes = self._remote_index[key]
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
                     f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                     futures[f] = key
 
-        keys = []
+        # keys = []
         for f in concurrent.futures.as_completed(futures):
             key = futures[f]
             error = f.result()
             if error is not None:
                 failure_dict[key] = error
-            else:
-                keys.append(key)
+            # else:
+            #     keys.append(key)
                 # yield key
 
         ## It's too risky to change the flag before/after in case the load process is cancelled part way
         # if not writable:
         #     self._local_file.reopen('r')
 
-        # return failure_dict
-        return keys
+        return failure_dict
+        # return keys
 
 
     def _load_item(self, key):
