@@ -216,7 +216,7 @@ class EVariableLengthValue(MutableMapping):
         """
         Returns a generator of the keys.
         """
-        overlap = set()
+        overlap = set([utils.metadata_key_str])
         for key in self._local_file.keys():
             if key in self._remote_index:
                 overlap.add(key)
@@ -404,7 +404,7 @@ class EVariableLengthValue(MutableMapping):
                     if check:
                         f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                         futures[f] = key
-    
+
             # keys = []
             for f in as_completed(futures):
                 key = futures[f]
@@ -677,7 +677,7 @@ def open(
     remote_conn_group: bool=False,
     ):
     """
-    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object. 
+    Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
 
     Parameters
     -----------
