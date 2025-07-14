@@ -397,7 +397,7 @@ class EVariableLengthValue(MutableMapping):
                     futures[f] = key
         else:
             for key in keys:
-                remote_time_bytes = self._remote_index[key]
+                remote_time_bytes = self._remote_index.get(key)
                 check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                 if check:
                     f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)

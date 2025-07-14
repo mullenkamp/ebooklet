@@ -291,6 +291,8 @@ def test_push():
         for key, value in data_dict.items():
             f[key] = value
 
+        f.set_metadata({'test': 'meta'})
+
         f.sync()
 
         changes = f.changes()
@@ -312,6 +314,9 @@ def test_read_remote():
         for key, value in f.items():
             source_value = data_dict[key]
             assert source_value == value
+
+        meta = f.get_metadata()
+        assert len(meta) > 0
 
         ri_path = f._remote_index_path
 
