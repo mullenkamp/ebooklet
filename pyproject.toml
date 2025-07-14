@@ -25,7 +25,7 @@ requires-python = ">=3.10"
 dependencies = [
   's3func>=0.7.2',
   'urllib3>=2',
-  'booklet>=0.7.6',
+  'booklet>=0.9.2',
 ]
 
 [dependency-groups]

@@ -322,6 +322,18 @@ def view_changelog(changelog_path):
 ### Update remote
 
 
+def upload_value(key, local_file, remote_session):
+    """
+
+    """
+    time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
+    resp = remote_session.put_object(key, valb, {'timestamp': str(time_int_us)})
+    if resp.status // 100 != 2:
+        return resp.error
+    else:
+        return None
+
+
 def update_remote(local_file, remote_index, changelog_path, remote_session, force_push, deletes, flag, ebooklet_type):
     """
 
@@ -341,21 +353,20 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         futures = {}
         with booklet.FixedLengthValue(changelog_path) as cl:
             for key in cl:
-                time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
-                f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
+                f = executor.submit(upload_value, key, local_file, remote_session)
                 futures[f] = key
     
             ## Check the uploads to see if any fail
             updated = False
-            failures = []
+            failures = {}
             for future in as_completed(futures):
                 key = futures[future]
                 run_result = future.result()
-                if run_result.status // 100 == 2:
+                if run_result is None:
                     remote_index[key] = cl[key][:7]
                     updated = True
                 else:
-                    failures.append(key)
+                    failures[key] = run_result
 
         if failures:
             print(f"There were {len(failures)} items that failed to upload. Please run this again.")
