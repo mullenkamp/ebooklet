@@ -373,7 +373,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
 
         remote_index._file.seek(0)
 
-        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': remote_index.uuid.hex, 'type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
+        resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': local_file.uuid.hex, 'type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
         if resp.status // 100 != 2:
             urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")

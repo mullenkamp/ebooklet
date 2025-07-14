@@ -203,9 +203,11 @@ class EVariableLengthValue(MutableMapping):
         Get the metadata. Optionally include the timestamp in the output.
         Will return None if no metadata has been assigned.
         """
-        _ = self._load_item(booklet.utils.metadata_key_bytes.decode())
-        # if failure:
-        #     return failure
+        failure = self._load_item(booklet.utils.metadata_key_bytes.decode())
+        if failure:
+            raise urllib3.exceptions.HTTPError(failure)
+
+        self._local_file.sync()
 
         return self._local_file.get_metadata(include_timestamp=include_timestamp)
 

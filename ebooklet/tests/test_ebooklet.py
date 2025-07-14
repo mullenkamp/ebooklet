@@ -320,6 +320,9 @@ def test_read_remote():
 
         ri_path = f._remote_index_path
 
+    with ebooklet.open(http_remote, file_path) as f:
+        pass
+
     ri_path.unlink()
     file_path.unlink()
 
