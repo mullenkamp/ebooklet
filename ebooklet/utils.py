@@ -260,8 +260,30 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session):
                 else:
                     local_bytes_us = int_to_bytes(local_int_us, 7)
                     f[key] = local_bytes_us + int_to_bytes(0, 7)
+
+            # Metadata
+            key = booklet.utils.metadata_key_bytes.decode()
+            local_int_us = local_file.get_timestamp(key)
+            if local_int_us:
+                remote_bytes_us = remote_index.get(key)
+                if remote_bytes_us:
+                    remote_int_us = bytes_to_int(remote_bytes_us)
+                    local_int_us = local_file.get_timestamp(key)
+                    if local_int_us > remote_int_us:
+                        local_bytes_us = int_to_bytes(local_int_us, 7)
+                        f[key] = local_bytes_us + remote_bytes_us
+                else:
+                    local_bytes_us = int_to_bytes(local_int_us, 7)
+                    f[key] = local_bytes_us + int_to_bytes(0, 7)
         else:
             for key, local_int_us in local_file.timestamps():
+                local_bytes_us = int_to_bytes(local_int_us, 7)
+                f[key] = local_bytes_us + int_to_bytes(0, 7)
+
+            # Metadata
+            key = booklet.utils.metadata_key_bytes.decode()
+            local_int_us = local_file.get_timestamp(key)
+            if local_int_us:
                 local_bytes_us = int_to_bytes(local_int_us, 7)
                 f[key] = local_bytes_us + int_to_bytes(0, 7)
 

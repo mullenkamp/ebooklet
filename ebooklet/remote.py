@@ -710,8 +710,8 @@ class S3SessionWriter(S3SessionReader):
         list of dict of the removed keys/versions
         """
         if self.writable:
-            with self._write_session.s3lock(self.write_db_key) as lock:
-                other_keys = lock.break_other_locks(timestamp)
+            lock = self._write_session.s3lock(self.write_db_key)
+            other_keys = lock.break_other_locks(timestamp)
 
             return other_keys
         else:
