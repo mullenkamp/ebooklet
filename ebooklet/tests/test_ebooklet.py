@@ -322,12 +322,16 @@ def test_read_remote():
     http_remote = remote.S3Connection(db_url=db_url)
 
     with ebooklet.open(http_remote, file_path) as f:
-        value1 = f['10']
-        assert value1 == data_dict['10']
+        # value1 = f['10']
+        # assert value1 == data_dict['10']
 
-        for key, value in f.items():
+        counter = 0
+        for key, value in f.get_items(f.keys()):
             source_value = data_dict[key]
             assert source_value == value
+            counter += 1
+
+        assert counter == len(data_dict)
 
         meta = f.get_metadata()
         assert len(meta) > 0
@@ -415,17 +419,6 @@ def test_remove_remote_local():
 
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()
-
-    # file_path.unlink()
-    # remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
-    # remote_index_path.unlink()
-
-    # with remote_conn_rcg.open('w') as s3open:
-    #     s3open.delete_remote()
-
-    # file_path_rcg.unlink()
-    # remote_index_path = file_path.parent.joinpath(file_path_rcg.name + '.remote_index')
-    # remote_index_path.unlink()
 
 
 

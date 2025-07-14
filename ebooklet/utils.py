@@ -13,6 +13,7 @@ import base64
 import portalocker
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
+import orjson
 
 ############################################
 ### Parameters
@@ -25,6 +26,7 @@ import shutil
 
 int_to_bytes = booklet.utils.int_to_bytes
 bytes_to_int = booklet.utils.bytes_to_int
+metadata_key_str = booklet.utils.metadata_key_bytes.decode()
 
 ############################################
 ### Exception classes
@@ -204,8 +206,10 @@ def get_remote_value(local_file, key, remote_session):
         # print(resp.data)
 
         # val_bytes = resp.data
-
-        local_file.set(key, resp.data, timestamp, encode_value=False)
+        if key == metadata_key_str:
+            local_file.set_metadata(orjson.loads(resp.data), timestamp=timestamp)
+        else:
+            local_file.set(key, resp.data, timestamp, encode_value=False)
     # elif resp.status == 404:
     #     raise KeyError(f'{key} not found in remote.')
     else:
