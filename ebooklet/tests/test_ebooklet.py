@@ -92,20 +92,34 @@ def pytest_runtest_makereport(item, call):
     setattr(item, "rep_" + rep.when, rep)
 
 
-@pytest.fixture
-def get_logs(request):
-    yield
-
-    if request.node.rep_call.failed:
-        # Add code here to cleanup failure scenario
-        print("executing test failed")
-
+@pytest.fixture(scope="session", autouse=True)
+def cleanup(request):
+    """Cleanup a test data."""
+    def remove_test_data():
         with remote_conn.open('w') as s3open:
             s3open.delete_remote()
 
         file_path.unlink()
         remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
         remote_index_path.unlink()
+
+    request.addfinalizer(remove_test_data)
+
+
+# @pytest.fixture
+# def get_logs(request):
+#     yield
+
+#     if request.node.rep_call.failed:
+#         # Add code here to cleanup failure scenario
+#         print("executing test failed")
+
+#         with remote_conn.open('w') as s3open:
+#             s3open.delete_remote()
+
+#         file_path.unlink()
+#         remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
+#         remote_index_path.unlink()
 
 
     # elif request.node.rep_call.passed:
@@ -402,9 +416,9 @@ def test_remove_remote_local():
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()
 
-    file_path.unlink()
-    remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
-    remote_index_path.unlink()
+    # file_path.unlink()
+    # remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
+    # remote_index_path.unlink()
 
     # with remote_conn_rcg.open('w') as s3open:
     #     s3open.delete_remote()

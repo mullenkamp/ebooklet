@@ -6,7 +6,7 @@
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Generic, Iterator, Union, List, Dict
 import pathlib
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
 import weakref
 from itertools import count
@@ -114,7 +114,7 @@ class Change:
 
         self.update()
 
-        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, self._ebooklet._executor, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
+        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
 
         if success:
             self._changelog_path.unlink()
@@ -185,7 +185,7 @@ class EVariableLengthValue(MutableMapping):
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
         self.type = 'EVariableLengthValue'
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
+        # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
 
     def set_metadata(self, data, timestamp=None):
@@ -390,30 +390,30 @@ class EVariableLengthValue(MutableMapping):
 
         # if not writable:
         #     self._local_file.reopen('w')
-
-        if keys is None:
-            for key, remote_time_bytes in self._remote_index.items():
-                check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                    futures[f] = key
-        else:
-            for key in keys:
-                remote_time_bytes = self._remote_index.get(key)
-                check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                if check:
-                    f = self._executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                    futures[f] = key
-
-        # keys = []
-        for f in concurrent.futures.as_completed(futures):
-            key = futures[f]
-            error = f.result()
-            if error is not None:
-                failure_dict[key] = error
-            # else:
-            #     keys.append(key)
-                # yield key
+        with ThreadPoolExecutor(max_workers=self._remote_session.threads) as executor:
+            if keys is None:
+                for key, remote_time_bytes in self._remote_index.items():
+                    check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
+                    if check:
+                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                        futures[f] = key
+            else:
+                for key in keys:
+                    remote_time_bytes = self._remote_index.get(key)
+                    check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
+                    if check:
+                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                        futures[f] = key
+    
+            # keys = []
+            for f in as_completed(futures):
+                key = futures[f]
+                error = f.result()
+                if error is not None:
+                    failure_dict[key] = error
+                # else:
+                #     keys.append(key)
+                    # yield key
 
         ## It's too risky to change the flag before/after in case the load process is cancelled part way
         # if not writable:
@@ -503,9 +503,9 @@ class EVariableLengthValue(MutableMapping):
         """
         Syncronize all cache to disk. This ensures all data has been saved to disk properly. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
-        self._executor.shutdown(cancel_futures=force_shutdown)
-        del self._executor
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
+        # self._executor.shutdown(cancel_futures=force_shutdown)
+        # # del self._executor
+        # # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -623,7 +623,7 @@ class RemoteConnGroup(EVariableLengthValue):
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
         self.type = 'RemoteConnGroup'
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
+        # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
 
 
     def add(self, remote_conn: remote.S3Connection):

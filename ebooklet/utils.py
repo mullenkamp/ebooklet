@@ -11,7 +11,7 @@ import urllib3
 from datetime import datetime, timezone
 import base64
 import portalocker
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 
 ############################################
@@ -318,7 +318,7 @@ def view_changelog(changelog_path):
 ### Update remote
 
 
-def update_remote(local_file, remote_index, changelog_path, remote_session, executor, force_push, deletes, flag, ebooklet_type):
+def update_remote(local_file, remote_index, changelog_path, remote_session, force_push, deletes, flag, ebooklet_type):
     """
 
     """
@@ -333,24 +333,25 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, exec
     ## Upload data and update the remote_index file
     # remote_index.reopen('w')
 
-    futures = {}
-    with booklet.FixedLengthValue(changelog_path) as cl:
-        for key in cl:
-            time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
-            f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
-            futures[f] = key
-
-    ## Check the uploads to see if any fail
-        updated = False
-        failures = []
-        for future in concurrent.futures.as_completed(futures):
-            key = futures[future]
-            run_result = future.result()
-            if run_result.status // 100 == 2:
-                remote_index[key] = cl[key][:7]
-                updated = True
-            else:
-                failures.append(key)
+    with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
+        futures = {}
+        with booklet.FixedLengthValue(changelog_path) as cl:
+            for key in cl:
+                time_int_us, valb = local_file.get_timestamp(key, include_value=True, decode_value=False)
+                f = executor.submit(remote_session.put_object, key, valb, {'timestamp': str(time_int_us)})
+                futures[f] = key
+    
+            ## Check the uploads to see if any fail
+            updated = False
+            failures = []
+            for future in as_completed(futures):
+                key = futures[future]
+                run_result = future.result()
+                if run_result.status // 100 == 2:
+                    remote_index[key] = cl[key][:7]
+                    updated = True
+                else:
+                    failures.append(key)
 
         if failures:
             print(f"There were {len(failures)} items that failed to upload. Please run this again.")
