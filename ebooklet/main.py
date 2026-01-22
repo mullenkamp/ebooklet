@@ -363,7 +363,7 @@ class EVariableLengthValue(MutableMapping):
 
     def get_items(self, keys, default=None):
         """
-        Return an iterator of the values associated with the input keys. Missing keys will return the default.
+        Return an iterator of the values associated with the input keys. It will first load all of the keys/values into the local file. Missing keys will return the default.
         """
         if not isinstance(keys, (list, tuple, set)):
             keys = tuple(keys)
@@ -691,7 +691,8 @@ def open(
         Flag associated with how the file is opened according to the dbm style. See below for details.
 
     value_serializer : str, class, or None
-        Similar to the key_serializer, except for the values. Does not apply for the remote connection group.
+        The serializer to use to convert the input value to bytes. Run the booklet.available_serializers to determine the internal serializers that are available. None will require bytes as input.
+        Does not apply for the remote connection group.
 
     n_buckets : int
         The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.
