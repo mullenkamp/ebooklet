@@ -4,7 +4,7 @@
 
 """
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Generic, Iterator, Union, List, Dict
+from typing import Union
 import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
@@ -13,15 +13,15 @@ from itertools import count
 from collections import deque
 import urllib3
 
-# import utils
 from . import utils
-
-# import remote
 from . import remote
 
 
 #######################################################
 ### Classes
+
+
+_MISSING = object()
 
 
 class Change:
@@ -37,8 +37,6 @@ class Change:
         self._ebooklet = ebooklet
 
         self._changelog_path = None
-
-        # self.update()
 
 
     def pull(self):
@@ -87,7 +85,7 @@ class Change:
         if not self._changelog_path:
             self.update()
 
-        with booklet.FixedValue(self._changelog_path) as f:
+        with booklet.FixedLengthValue(self._changelog_path) as f:
             if keys is None:
                 rm_keys = f.keys()
             else:
@@ -114,17 +112,21 @@ class Change:
 
         self.update()
 
-        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
+        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
 
-        if success:
+        if isinstance(result, dict):
+            # Partial failure — don't clean up changelog so push can be retried
+            return result
+
+        if result:
             self._changelog_path.unlink()
-            self._changelog_path = None # Force a reset of the changelog
+            self._changelog_path = None
             self._ebooklet._deletes.clear()
 
             if self._ebooklet._remote_session.uuid is None:
                 self._ebooklet._remote_session._load_db_metadata()
 
-        return success
+        return result
 
 
 class EVariableLengthValue(MutableMapping):
@@ -144,12 +146,19 @@ class EVariableLengthValue(MutableMapping):
 
         """
         ## Remove the remote database if flag == 'n'
+        if flag == 'n' and remote_session.uuid is not None:
+            remote_session.delete_remote()
+
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue')
+
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type):
+        """
+        Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
+        """
         ## Lock the remote if file is opened for write
         if flag != 'r':
-            if flag == 'n' and (remote_session.uuid is not None):
-                remote_session.delete_remote()
             lock = remote_session.create_lock()
-            lock.aquire()
+            lock.acquire()
             self.writable = True
         else:
             lock = None
@@ -160,9 +169,8 @@ class EVariableLengthValue(MutableMapping):
 
         remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
-        # Open remote index file
+        ## Open remote index file
         if remote_index_path.exists():
-            # remote_index = booklet.FixedValue(remote_index_path, 'r')
             if flag == 'r':
                 remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
             else:
@@ -176,7 +184,6 @@ class EVariableLengthValue(MutableMapping):
         ## Assign properties
         self._flag = flag
         self.lock = lock
-        self._remote_index_path = remote_index_path
         self._local_file_path = local_file_path
         self._local_file = local_file
         self._remote_index_path = remote_index_path
@@ -184,8 +191,7 @@ class EVariableLengthValue(MutableMapping):
         self._deletes = set()
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
-        self.type = 'EVariableLengthValue'
-        # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
+        self.type = ebooklet_type
 
 
     def set_metadata(self, data, timestamp=None):
@@ -216,7 +222,7 @@ class EVariableLengthValue(MutableMapping):
         """
         Returns a generator of the keys.
         """
-        overlap = set([utils.metadata_key_str])
+        overlap = {utils.metadata_key_str}
         for key in self._local_file.keys():
             if key in self._remote_index:
                 overlap.add(key)
@@ -238,10 +244,6 @@ class EVariableLengthValue(MutableMapping):
 
         return self._local_file.items()
 
-        # for key in self.load_items():
-        #     value = self._local_file.get(key)
-        #     yield key, value
-
 
     def values(self):
         """
@@ -254,10 +256,6 @@ class EVariableLengthValue(MutableMapping):
 
         return self._local_file.values()
 
-        # for key in self.load_items():
-        #     value = self._local_file.get(key)
-        #     yield value
-
     def timestamps(self, include_value=False):
         """
         Return an iterator for timestamps for all keys. Optionally add values to the iterator.
@@ -268,10 +266,6 @@ class EVariableLengthValue(MutableMapping):
             raise urllib3.exceptions.HTTPError(failure_dict)
 
         return self._local_file.timestamps(include_value=include_value)
-
-        # for key in self.load_items():
-        #     value = self._local_file.timestamps(include_value=include_value)
-        #     yield value
 
 
     def get_timestamp(self, key, include_value=False, decode_value=True, default=None):
@@ -346,15 +340,15 @@ class EVariableLengthValue(MutableMapping):
             raise ValueError('File is open for read only.')
 
 
-    def prune(self, timestamp=None, reindex=False):
+    def prune(self, timestamp=None):
         """
         Prunes the old keys and associated values. Returns the number of removed items. The method can also prune remove keys/values older than the timestamp. The user can also reindex the booklet file. False does no reindexing, True increases the n_buckets to a preassigned value, or an int of the n_buckets. True can only be used if the default n_buckets were used at original initialisation.
         """
         if self.writable:
-            removed = self._local_file.prune(timestamp=timestamp, reindex=reindex)
+            removed = self._local_file.prune(timestamp=timestamp)
             self._n_buckets = self._local_file._n_buckets
 
-            _ = self._remote_index.prune(reindex)
+            _ = self._remote_index.prune()
 
             return removed
         else:
@@ -363,7 +357,7 @@ class EVariableLengthValue(MutableMapping):
 
     def get_items(self, keys, default=None):
         """
-        Return an iterator of the values associated with the input keys. Missing keys will return the default.
+        Return an iterator of the values associated with the input keys. It will first load all of the keys/values into the local file. Missing keys will return the default.
         """
         if not isinstance(keys, (list, tuple, set)):
             keys = tuple(keys)
@@ -386,10 +380,6 @@ class EVariableLengthValue(MutableMapping):
 
         failure_dict = {}
 
-        # writable = self._local_file.writable
-
-        # if not writable:
-        #     self._local_file.reopen('w')
         with ThreadPoolExecutor(max_workers=self._remote_session.threads) as executor:
             if keys is None:
                 for key, remote_time_bytes in self._remote_index.items():
@@ -405,41 +395,23 @@ class EVariableLengthValue(MutableMapping):
                         f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                         futures[f] = key
 
-            # keys = []
             for f in as_completed(futures):
                 key = futures[f]
                 error = f.result()
                 if error is not None:
                     failure_dict[key] = error
-                # else:
-                #     keys.append(key)
-                    # yield key
-
-        ## It's too risky to change the flag before/after in case the load process is cancelled part way
-        # if not writable:
-        #     self._local_file.reopen('r')
 
         return failure_dict
-        # return keys
 
 
     def _load_item(self, key):
         """
 
         """
-        # if key in self._deletes:
-        #     raise KeyError(key)
-
         remote_time_bytes = self._remote_index.get(key)
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
-            # if not self._local_file.writable:
-            #     self._local_file.reopen('w')
-            #     failure = utils.get_remote_value(self._local_file, key, self._remote_session)
-            #     self._local_file.reopen('r')
-            # else:
-            #     failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure
         else:
@@ -447,9 +419,9 @@ class EVariableLengthValue(MutableMapping):
 
 
     def __getitem__(self, key: str):
-        value = self.get(key)
+        value = self.get(key, default=_MISSING)
 
-        if value is None:
+        if value is _MISSING:
             raise KeyError(f'{key}')
         else:
             return value
@@ -496,16 +468,10 @@ class EVariableLengthValue(MutableMapping):
         self._finalizer()
 
 
-    # def __del__(self):
-    #     self.close()
-
     def sync(self, force_shutdown=False):
         """
         Syncronize all cache to disk. This ensures all data has been saved to disk properly. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
-        # self._executor.shutdown(cancel_futures=force_shutdown)
-        # # del self._executor
-        # # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._remote_session.threads)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -514,29 +480,6 @@ class EVariableLengthValue(MutableMapping):
         Return a Change object of the changes that have occurred during this session.
         """
         return Change(self)
-
-
-    ## I don't think this is necessary...could be more of a problem...
-    # def reopen(self, flag):
-    #     """
-    #     Reopen a file with a different flag. The flag must be either r or w.
-    #     """
-    #     if flag not in ('r', 'w'):
-    #         raise ValueError('The flag must be either r or w.')
-
-    #     self.sync()
-    #     self._local_file.reopen(flag)
-    #     self._remote_index.reopen(flag)
-
-    #     if self._flag == 'r' and flag != 'r':
-    #         lock = self._remote_session.create_lock()
-    #         lock.aquire()
-    #         self.lock = lock
-    #     elif self._flag != 'r' and flag == 'r':
-    #         self.lock.release()
-    #         self.lock = None
-
-    #     self._flag = flag
 
 
     def delete_remote(self):
@@ -558,14 +501,6 @@ class EVariableLengthValue(MutableMapping):
         else:
             raise ValueError('File is open for read only.')
 
-    # TODO
-    # def rebuild_index(self):
-    #     """
-    #     Rebuild the remote index file from all the objects in the remote.
-    #     """
-    #     if self.writable:
-    #         resp = self._session.list_object_versions(prefix=self.db_key + '/')
-
 
 class RemoteConnGroup(EVariableLengthValue):
     """
@@ -582,48 +517,7 @@ class RemoteConnGroup(EVariableLengthValue):
         """
 
         """
-        ## Lock the remote if file is opened for write
-        if flag != 'r':
-            lock = remote_session.create_lock()
-            lock.aquire()
-        else:
-            lock = None
-
-        ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, 'orjson', n_buckets, buffer_size)
-
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
-
-        # Open remote index file
-        if remote_index_path.exists():
-            # remote_index = booklet.FixedValue(remote_index_path, 'r')
-            if flag == 'r':
-                remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
-            else:
-                remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
-        else:
-            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
-
-        ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
-
-        ## Assign properties
-        if flag == 'r':
-            self.writable = False
-        else:
-            self.writable = True
-
-        self._flag = flag
-        self.lock = lock
-        self._local_file_path = local_file_path
-        self._local_file = local_file
-        self._remote_index_path = remote_index_path
-        self._remote_index = remote_index
-        self._deletes = set()
-        self._remote_session = remote_session
-        self._n_buckets = local_file._n_buckets
-        self.type = 'RemoteConnGroup'
-        # self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=remote_session.threads)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup')
 
 
     def add(self, remote_conn: remote.S3Connection):
@@ -691,7 +585,8 @@ def open(
         Flag associated with how the file is opened according to the dbm style. See below for details.
 
     value_serializer : str, class, or None
-        Similar to the key_serializer, except for the values. Does not apply for the remote connection group.
+        The serializer to use to convert the input value to bytes. Run the booklet.available_serializers to determine the internal serializers that are available. None will require bytes as input.
+        Does not apply for the remote connection group.
 
     n_buckets : int
         The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.

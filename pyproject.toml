@@ -23,7 +23,7 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  's3func>=0.7.2',
+  "s3func>=0.8",
   'urllib3>=2',
   'booklet>=0.9.2',
 ]
@@ -36,6 +36,8 @@ dev = [
   "ruff",
   "pytest",
   "pytest-cov",
+  "moto[s3]",
+  "pytest-mock",
 ]
 
 # [tool.ruff]

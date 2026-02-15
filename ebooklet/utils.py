@@ -5,83 +5,33 @@ Created on Thu Jan  5 11:04:13 2023
 
 @author: mike
 """
-import io
+import logging
 import booklet
 import urllib3
 from datetime import datetime, timezone
 import base64
 import portalocker
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import shutil
 import orjson
+
+logger = logging.getLogger(__name__)
 
 ############################################
 ### Parameters
-
-# default_n_buckets = 100003
-
-# blt_files = ('.local_data', '.remote_index')
-
-# local_storage_options = ('write_buffer_size', 'n_bytes_file', 'n_bytes_key', 'n_bytes_value', 'n_buckets')
 
 int_to_bytes = booklet.utils.int_to_bytes
 bytes_to_int = booklet.utils.bytes_to_int
 metadata_key_str = booklet.utils.metadata_key_bytes.decode()
 
 ############################################
-### Exception classes
-
-
-# class BaseError(Exception):
-#     def __init__(self, message, objs=[], temp_path=None, *args):
-#         self.message = message # without this you may get DeprecationWarning
-#         # Special attribute you desire with your Error,
-#         # for file in blt_files:
-#         #     f = getattr(obj, file)
-#         #     if f is not None:
-#         #         f.close()
-#         for obj in objs:
-#             if obj:
-#                 obj.close()
-#         if temp_path:
-#             temp_path.cleanup()
-#         # allow users initialize misc. arguments as any other builtin Error
-#         super(BaseError, self).__init__(message, *args)
-
-
-# class S3dbmValueError(BaseError):
-#     pass
-
-# class S3dbmTypeError(BaseError):
-#     pass
-
-# class S3dbmKeyError(BaseError):
-#     pass
-
-# class S3dbmHttpError(BaseError):
-#     pass
-
-# class S3dbmSerializeError(BaseError):
-#     pass
-
-
-############################################
 ### Functions
-
-
-def fake_finalizer():
-    """
-    The finalizer function for S3Remote instances.
-    """
 
 
 def s3session_finalizer(session):
     """
     The finalizer function for S3Remote instances.
     """
-    session.client.close()
-    # if lock is not None:
-    #     lock.release()
+    session._session.clear()
 
 
 def ebooklet_finalizer(local_file, remote_index, remote_session, lock):
@@ -103,10 +53,6 @@ def open_remote_conn(remote_conn, flag, local_file_exists):
 
     if flag == 'r' and (remote_session.uuid is None) and not local_file_exists:
         raise ValueError('No file was found in the remote, but the local file was open for read without creating a new file.')
-    # if flag in ('r', 'w') and (remote_session.uuid is None) and not local_file_exists:
-    #     raise ValueError('No file was found in the remote, but the local file was open for read and write without creating a new file.')
-    # elif flag != 'r' and remote_session is None and not local_file_exists:
-    #     raise ValueError('If open for write, then an S3Remote object must be passed.')
 
     ebooklet_type = remote_session.type
 
@@ -146,11 +92,6 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
 
             overwrite_remote_index = True
         else:
-            # if flag == 'r':
-            #     local_file = booklet.open(local_file_path, 'r')
-            # else:
-            #     local_file = booklet.open(local_file_path, 'w')
-
             ## The local file will need to always be open for write since data will be loaded from the remote regardless if the user has only opened it for read-only
             local_file = booklet.open(local_file_path, 'w')
 
@@ -180,13 +121,10 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
 
     if (not remote_index_path.exists() or overwrite_remote_index) and (flag != 'n'):
         if remote_session.uuid:
-            # remote_index_key = read_conn.db_key + '.remote_index'
-
             index0 = remote_session.get_object()
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
-                    # shutil.copyfileobj(index0.stream, f)
             elif index0.status != 404:
                 raise urllib3.exceptions.HTTPError(index0.error)
 
@@ -202,19 +140,12 @@ def get_remote_value(local_file, key, remote_session):
     if resp.status == 200:
         timestamp = int(resp.metadata['timestamp'])
 
-        # print(timestamp)
-        # print(resp.data)
-
-        # val_bytes = resp.data
         if key == metadata_key_str:
             local_file.set_metadata(orjson.loads(resp.data), timestamp=timestamp)
         else:
             local_file.set(key, resp.data, timestamp, encode_value=False)
-    # elif resp.status == 404:
-    #     raise KeyError(f'{key} not found in remote.')
     else:
         return resp.error
-        # return urllib3.exceptions.HttpError(f'{key} returned the http error {resp.status}.')
 
     return None
 
@@ -223,8 +154,6 @@ def check_local_vs_remote(local_file, remote_time_bytes, key):
     """
 
     """
-    # remote_time_bytes = remote_index.get(key)
-
     if remote_time_bytes is None:
         return None
 
@@ -338,17 +267,11 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
     """
 
     """
-    ## Make sure the files are synced
-    # local_file.sync()
-    # remote_index.sync()
-
     ## If file was open for replacement (n), then delete everything in the remote
     if flag == 'n':
         remote_session.delete_remote()
 
     ## Upload data and update the remote_index file
-    # remote_index.reopen('w')
-
     with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
         futures = {}
         with booklet.FixedLengthValue(changelog_path) as cl:
@@ -369,7 +292,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                     failures[key] = run_result
 
         if failures:
-            print(f"There were {len(failures)} items that failed to upload. Please run this again.")
+            logger.warning(f"There were {len(failures)} items that failed to upload. Please run this again.")
 
     ## Upload the remote_index file
     remote_index.sync()
@@ -392,7 +315,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         resp = remote_session.put_db_object(remote_index._file.read(), metadata={'timestamp': str(time_int_us), 'uuid': local_file.uuid.hex, 'type': ebooklet_type, 'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode()})
 
         if resp.status // 100 != 2:
-            urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
+            raise urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
 
         ## remove deletes in remote
         if deletes:
@@ -407,17 +330,6 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         return updated
 
 
-def determine_file_obj_size(file_obj):
-    """
-
-    """
-    pos = file_obj.tell()
-    size = file_obj.seek(0, io.SEEK_END)
-    file_obj.seek(pos)
-
-    return size
-
-
 def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
     """
 
@@ -430,10 +342,6 @@ def indirect_copy_remote(source_session, target_session, source_key, target_key,
     target_resp = target_session.put_object(target_key, source_resp.stream, source_resp.metadata)
 
     return target_resp
-
-
-
-
 
 
 
