@@ -340,15 +340,15 @@ class EVariableLengthValue(MutableMapping):
             raise ValueError('File is open for read only.')
 
 
-    def prune(self, timestamp=None, reindex=False):
+    def prune(self, timestamp=None):
         """
         Prunes the old keys and associated values. Returns the number of removed items. The method can also prune remove keys/values older than the timestamp. The user can also reindex the booklet file. False does no reindexing, True increases the n_buckets to a preassigned value, or an int of the n_buckets. True can only be used if the default n_buckets were used at original initialisation.
         """
         if self.writable:
-            removed = self._local_file.prune(timestamp=timestamp, reindex=reindex)
+            removed = self._local_file.prune(timestamp=timestamp)
             self._n_buckets = self._local_file._n_buckets
 
-            _ = self._remote_index.prune(reindex)
+            _ = self._remote_index.prune()
 
             return removed
         else:

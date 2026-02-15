@@ -266,15 +266,15 @@ def test_prune():
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
     # Reindex
-    with ebooklet.open(remote_conn, file_path, 'w') as f:
-        old_len = len(f)
-        old_n_buckets = f._n_buckets
-        removed_items = f.prune(reindex=True)
-        new_n_buckets = f._n_buckets
-        new_len = len(f)
-        test_value = f['2']
+    # with ebooklet.open(remote_conn, file_path, 'w') as f:
+    #     old_len = len(f)
+    #     old_n_buckets = f._n_buckets
+    #     removed_items = f.prune(reindex=True)
+    #     new_n_buckets = f._n_buckets
+    #     new_len = len(f)
+    #     test_value = f['2']
 
-    assert (removed_items == 0) and (new_n_buckets > old_n_buckets) and (new_len == old_len) and isinstance(test_value, int)
+    # assert (removed_items == 0) and (new_n_buckets > old_n_buckets) and (new_len == old_len) and isinstance(test_value, int)
 
     # Remove the rest via timestamp filter
     timestamp = booklet.utils.make_timestamp_int()
