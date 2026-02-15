@@ -34,8 +34,7 @@
 The project uses `uv` for development tasks.
 
 ### Environment Management
-- `uv env create`: Create the default development environment.
-- `uv shell`: Enter the development shell.
+- `uv sync`: Update the environment dependencies.
 
 ### Testing
 - `uv run test`: Run all tests.
@@ -45,8 +44,6 @@ The project uses `uv` for development tasks.
 ### Linting and Formatting
 - `uv run lint:all`: Run both style and typing checks.
 - `uv run lint:fmt`: Apply formatting (black) and lint fixes (ruff).
-- `black .`: Run formatting.
-- `ruff check .`: Run linting.
 
 ## Development Conventions
 

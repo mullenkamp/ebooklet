@@ -5,18 +5,19 @@ Created on Tue Oct 15 08:36:26 2024
 
 @author: mike
 """
-import os
+import logging
 import uuid6 as uuid
 import urllib3
 import booklet
-from typing import Any, Generic, Iterator, Union, List, Dict
+from typing import Union
 import s3func
 import weakref
 import orjson
 import base64
-import copy
 import datetime
 import concurrent.futures
+
+logger = logging.getLogger(__name__)
 from . import utils
 
 
@@ -47,44 +48,6 @@ def check_remote_conn(remote_conn, flag):
         raise TypeError('remote_conn must be either a url string or a remote.S3Connection.')
 
     return remote_conn
-
-
-def get_db_metadata(session, db_key):
-    """
-
-    """
-    resp_obj = session.head_object(db_key)
-    if resp_obj.status == 200:
-
-        meta = resp_obj.metadata
-    elif resp_obj.status == 404:
-        meta = None
-    else:
-        raise urllib3.exceptions.HTTPError(resp_obj.error)
-
-    if meta is None:
-        return dict(uuid=None, timestamp=None, ebooklet_type=None)
-    else:
-        meta['uuid'] = uuid.UUID(hex=meta['uuid'])
-        meta['timestamp'] = int(meta['timestamp'])
-
-        return meta
-
-
-def get_user_metadata(session, db_key):
-    """
-
-    """
-    resp_obj = session.get_object(f'{db_key}/{booklet.utils.metadata_key_bytes.decode()}')
-    if resp_obj.status == 200:
-
-        meta = orjson.loads(resp_obj.data)
-    elif resp_obj.status == 404:
-        meta = None
-    else:
-        raise urllib3.exceptions.HTTPError(resp_obj.error)
-
-    return meta
 
 
 def check_write_config(
@@ -231,7 +194,6 @@ class S3SessionReader:
             self.timestamp = None
             self.type = None
         else:
-            print(f"DEBUG: status={resp_obj.status}, error={resp_obj.error}")
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
 
@@ -364,10 +326,12 @@ class S3SessionWriter(S3SessionReader):
             raise ValueError('Session is not writable.')
 
 
-    def put_object(self, key: str, data: bytes, metadata={}):
+    def put_object(self, key: str, data: bytes, metadata=None):
         """
         Upload an object to the remote.
         """
+        if metadata is None:
+            metadata = {}
         if self.writable:
             key1 = self.write_db_key + '/' + key
             return self._write_session.put_object(key1, data, metadata=metadata)
@@ -452,14 +416,14 @@ class S3SessionWriter(S3SessionReader):
 
             ## Determine if the s3 copy_object method can be used
             if (self._write_session._access_key_id == writer._write_session._access_key_id) and (self._write_session._access_key == writer._write_session._access_key):
-                print('Both the source and target remotes use the same credentials, so copying objects is efficient.')
+                logger.info('Both the source and target remotes use the same credentials, so copying objects is efficient.')
 
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
                     for obj in source_resp.iter_objects():
                         source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.lstrip(self.write_db_key)
+                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
                         if target_key not in target_exist_keys:
                             f = executor.submit(self._write_session.copy_object, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
@@ -471,7 +435,7 @@ class S3SessionWriter(S3SessionReader):
                             failures[target_key] = resp.error
 
                 if failures:
-                    print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
+                    logger.warning('Copy failures have occurred. Rerun copy_remote or delete_remote.')
                     return failures
                 else:
                     resp = self._write_session.copy_object(self.write_db_key, writer.write_db_key, source_bucket=source_bucket, dest_bucket=target_bucket)
@@ -479,14 +443,14 @@ class S3SessionWriter(S3SessionReader):
                         raise urllib3.exceptions.HTTPError(resp.error)
 
             else:
-                print('The source and target remotes use different credentials, so copying objects must be first downloaded than uploaded. Less efficient than if both remotes had the same credentials.')
+                logger.info('The source and target remotes use different credentials, so copying objects must be first downloaded then uploaded. Less efficient than if both remotes had the same credentials.')
 
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
                     for obj in source_resp.iter_objects():
                         source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.lstrip(self.write_db_key)
+                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
                         if target_key not in target_exist_keys:
                             f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
@@ -498,10 +462,10 @@ class S3SessionWriter(S3SessionReader):
                             failures[target_key] = resp.error
 
                 if failures:
-                    print('Copy failures have occurred. Rerun copy_remote or delete_remote.')
+                    logger.warning('Copy failures have occurred. Rerun copy_remote or delete_remote.')
                     return failures
                 else:
-                    resp = self._write_session.copy_object(utils.indirect_copy_remote, self._read_session, writer._write_session, writer.write_db_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                    resp = utils.indirect_copy_remote(self._read_session, writer._write_session, self.write_db_key, writer.write_db_key, source_bucket, target_bucket)
                     if resp.status // 100 != 2:
                         raise urllib3.exceptions.HTTPError(resp.error)
 
@@ -702,8 +666,6 @@ class S3Connection(JsonSerializer):
                     raise ValueError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
 
             return session_writer
-
-
 
 
 

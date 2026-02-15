@@ -65,12 +65,3 @@ def test_create_changelog(tmp_path):
                 assert "same_key" not in cl
             
             cl_path.unlink()
-
-def test_determine_file_obj_size():
-    import io
-    data = b"hello world"
-    f = io.BytesIO(data)
-    assert utils.determine_file_obj_size(f) == len(data)
-    f.seek(5)
-    assert utils.determine_file_obj_size(f) == len(data)
-    assert f.tell() == 5

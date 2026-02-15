@@ -5,15 +5,16 @@ Created on Thu Jan  5 11:04:13 2023
 
 @author: mike
 """
-import io
+import logging
 import booklet
 import urllib3
 from datetime import datetime, timezone
 import base64
 import portalocker
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import shutil
 import orjson
+
+logger = logging.getLogger(__name__)
 
 ############################################
 ### Parameters
@@ -91,11 +92,6 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
 
             overwrite_remote_index = True
         else:
-            # if flag == 'r':
-            #     local_file = booklet.open(local_file_path, 'r')
-            # else:
-            #     local_file = booklet.open(local_file_path, 'w')
-
             ## The local file will need to always be open for write since data will be loaded from the remote regardless if the user has only opened it for read-only
             local_file = booklet.open(local_file_path, 'w')
 
@@ -125,13 +121,10 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
 
     if (not remote_index_path.exists() or overwrite_remote_index) and (flag != 'n'):
         if remote_session.uuid:
-            # remote_index_key = read_conn.db_key + '.remote_index'
-
             index0 = remote_session.get_object()
             if index0.status == 200:
                 with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
                     f.write(index0.data)
-                    # shutil.copyfileobj(index0.stream, f)
             elif index0.status != 404:
                 raise urllib3.exceptions.HTTPError(index0.error)
 
@@ -147,17 +140,12 @@ def get_remote_value(local_file, key, remote_session):
     if resp.status == 200:
         timestamp = int(resp.metadata['timestamp'])
 
-        # print(timestamp)
-        # print(resp.data)
-
-        # val_bytes = resp.data
         if key == metadata_key_str:
             local_file.set_metadata(orjson.loads(resp.data), timestamp=timestamp)
         else:
             local_file.set(key, resp.data, timestamp, encode_value=False)
     else:
         return resp.error
-        # return urllib3.exceptions.HttpError(f'{key} returned the http error {resp.status}.')
 
     return None
 
@@ -304,7 +292,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                     failures[key] = run_result
 
         if failures:
-            print(f"There were {len(failures)} items that failed to upload. Please run this again.")
+            logger.warning(f"There were {len(failures)} items that failed to upload. Please run this again.")
 
     ## Upload the remote_index file
     remote_index.sync()
@@ -342,17 +330,6 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         return updated
 
 
-def determine_file_obj_size(file_obj):
-    """
-
-    """
-    pos = file_obj.tell()
-    size = file_obj.seek(0, io.SEEK_END)
-    file_obj.seek(pos)
-
-    return size
-
-
 def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
     """
 
@@ -365,8 +342,6 @@ def indirect_copy_remote(source_session, target_session, source_key, target_key,
     target_resp = target_session.put_object(target_key, source_resp.stream, source_resp.metadata)
 
     return target_resp
-
-
 
 
 

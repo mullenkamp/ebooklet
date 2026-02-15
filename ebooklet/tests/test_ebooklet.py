@@ -497,5 +497,3 @@ def test_remove_remote_local():
 
 
 
-
-

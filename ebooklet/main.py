@@ -4,7 +4,7 @@
 
 """
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Iterator, Union, List, Dict
+from typing import Union
 import pathlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
@@ -21,6 +21,9 @@ from . import remote
 ### Classes
 
 
+_MISSING = object()
+
+
 class Change:
     """
 
@@ -34,8 +37,6 @@ class Change:
         self._ebooklet = ebooklet
 
         self._changelog_path = None
-
-        # self.update()
 
 
     def pull(self):
@@ -84,7 +85,7 @@ class Change:
         if not self._changelog_path:
             self.update()
 
-        with booklet.FixedValue(self._changelog_path) as f:
+        with booklet.FixedLengthValue(self._changelog_path) as f:
             if keys is None:
                 rm_keys = f.keys()
             else:
@@ -111,17 +112,21 @@ class Change:
 
         self.update()
 
-        success = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
+        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
 
-        if success:
+        if isinstance(result, dict):
+            # Partial failure — don't clean up changelog so push can be retried
+            return result
+
+        if result:
             self._changelog_path.unlink()
-            self._changelog_path = None # Force a reset of the changelog
+            self._changelog_path = None
             self._ebooklet._deletes.clear()
 
             if self._ebooklet._remote_session.uuid is None:
                 self._ebooklet._remote_session._load_db_metadata()
 
-        return success
+        return result
 
 
 class EVariableLengthValue(MutableMapping):
@@ -141,7 +146,7 @@ class EVariableLengthValue(MutableMapping):
 
         """
         ## Remove the remote database if flag == 'n'
-        if flag != 'r' and flag == 'n' and (remote_session.uuid is not None):
+        if flag == 'n' and remote_session.uuid is not None:
             remote_session.delete_remote()
 
         self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue')
@@ -217,7 +222,7 @@ class EVariableLengthValue(MutableMapping):
         """
         Returns a generator of the keys.
         """
-        overlap = set([utils.metadata_key_str])
+        overlap = {utils.metadata_key_str}
         for key in self._local_file.keys():
             if key in self._remote_index:
                 overlap.add(key)
@@ -414,9 +419,9 @@ class EVariableLengthValue(MutableMapping):
 
 
     def __getitem__(self, key: str):
-        value = self.get(key)
+        value = self.get(key, default=_MISSING)
 
-        if value is None:
+        if value is _MISSING:
             raise KeyError(f'{key}')
         else:
             return value
