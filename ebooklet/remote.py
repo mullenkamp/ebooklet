@@ -188,11 +188,13 @@ class S3SessionReader:
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
             self.type = meta['type']
+            self.num_groups = int(meta['num_groups']) if 'num_groups' in meta else None
         elif resp_obj.status == 404:
             self._init_bytes = None
             self.uuid = None
             self.timestamp = None
             self.type = None
+            self.num_groups = None
         else:
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
@@ -236,7 +238,8 @@ class S3SessionReader:
         """
         Get the user metadata.
         """
-        resp_obj = self.get_object(f'{booklet.utils.metadata_key_bytes.decode()}')
+        s3_key = '_metadata' if self.num_groups is not None else f'{booklet.utils.metadata_key_bytes.decode()}'
+        resp_obj = self.get_object(s3_key)
         if resp_obj.status == 200:
             meta = orjson.loads(resp_obj.data)
         elif resp_obj.status == 404:
@@ -338,6 +341,21 @@ class S3SessionWriter(S3SessionReader):
         else:
             raise ValueError('Session is not writable.')
 
+
+    def delete_object(self, key: str):
+        """
+        Delete a single object.
+        """
+        if self.writable:
+            key1 = self.write_db_key + '/' + key
+            resp = self._write_session.list_object_versions(prefix=key1)
+            del_list = []
+            for obj in resp.iter_objects():
+                del_list.append({'key': obj['key'], 'version_id': obj['version_id']})
+            if del_list:
+                return self._write_session.delete_objects(del_list)
+        else:
+            raise ValueError('Session is not writable.')
 
     def delete_objects(self, keys):
         """

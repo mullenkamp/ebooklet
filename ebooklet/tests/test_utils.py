@@ -4,6 +4,47 @@ import booklet
 from ebooklet import utils, remote
 import uuid6 as uuid
 
+
+def test_key_to_group_id():
+    # Deterministic
+    assert utils.key_to_group_id('test', 10) == utils.key_to_group_id('test', 10)
+    # Different keys can map to different groups
+    results = set(utils.key_to_group_id(str(i), 10) for i in range(100))
+    assert len(results) > 1
+    # Always within range
+    for i in range(100):
+        gid = utils.key_to_group_id(str(i), 10)
+        assert 0 <= gid < 10
+
+
+def test_pack_unpack_roundtrip():
+    entries = [
+        ('key1', 1000000, b'value1'),
+        ('key2', 2000000, b'value2'),
+        ('key3', 3000000, b'a longer value here'),
+    ]
+    packed = utils.pack_group(entries)
+    unpacked = utils.unpack_group(packed)
+    assert len(unpacked) == len(entries)
+    for (ok, ot, ov), (uk, ut, uv) in zip(entries, unpacked):
+        assert ok == uk
+        assert ot == ut
+        assert ov == uv
+
+
+def test_pack_unpack_empty():
+    packed = utils.pack_group([])
+    unpacked = utils.unpack_group(packed)
+    assert unpacked == []
+
+
+def test_pack_unpack_single():
+    entries = [('only', 999999, b'\x00\x01\x02')]
+    packed = utils.pack_group(entries)
+    unpacked = utils.unpack_group(packed)
+    assert len(unpacked) == 1
+    assert unpacked[0] == entries[0]
+
 def test_check_local_vs_remote(tmp_path):
     local_path = tmp_path / "local.blt"
     # Create a local booklet file
