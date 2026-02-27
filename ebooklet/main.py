@@ -524,6 +524,57 @@ class EVariableLengthValue(MutableMapping):
         else:
             raise ValueError('File is open for read only.')
 
+    def map(self, func, keys=None, write_db=None, n_workers=None):
+        """
+        Apply func to items in parallel using multiprocessing, writing results
+        to this ebooklet or a separate output ebooklet/booklet.
+
+        Parameters
+        ----------
+        func : callable
+            A picklable function: func(key, value) -> (new_key, new_value) or None.
+            Must be a top-level function (not a lambda or closure).
+        keys : iterable, optional
+            Specific keys to process. If None, processes all keys.
+        write_db : EVariableLengthValue or booklet, optional
+            A separate writable database to write results to. If None, writes
+            back to this ebooklet (which must be open for writing).
+        n_workers : int, optional
+            Number of worker processes. Defaults to os.cpu_count().
+
+        Returns
+        -------
+        dict
+            Statistics: {'processed': int, 'written': int, 'errors': int}
+        """
+        same_file = write_db is None
+
+        # Access control at ebooklet level (local_file is always writable internally)
+        if same_file and not self.writable:
+            raise ValueError('File is open for read only. Pass a writable write_db or open in write mode.')
+        if write_db is not None and isinstance(write_db, EVariableLengthValue) and not write_db.writable:
+            raise ValueError('write_db is open for read only.')
+
+        # Materialize keys (needed twice: load_items + booklet map)
+        if keys is not None and not isinstance(keys, (list, tuple)):
+            keys = list(keys)
+
+        # Load data from S3 before processing
+        failure_dict = self.load_items(keys)
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
+
+        # Unwrap ebooklet write_db to its underlying booklet
+        booklet_write_db = None
+        if write_db is not None:
+            if isinstance(write_db, EVariableLengthValue):
+                booklet_write_db = write_db._local_file
+            else:
+                booklet_write_db = write_db
+
+        # Delegate to booklet
+        return self._local_file.map(func, keys=keys, write_db=booklet_write_db, n_workers=n_workers)
+
 
 class RemoteConnGroup(EVariableLengthValue):
     """
