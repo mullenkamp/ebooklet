@@ -112,7 +112,7 @@ class Change:
 
         self.update()
 
-        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type)
+        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type, self._ebooklet._num_groups)
 
         if isinstance(result, dict):
             # Partial failure — don't clean up changelog so push can be retried
@@ -141,6 +141,7 @@ class EVariableLengthValue(MutableMapping):
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
+            num_groups: int = None,
             ):
         """
 
@@ -149,9 +150,9 @@ class EVariableLengthValue(MutableMapping):
         if flag == 'n' and remote_session.uuid is not None:
             remote_session.delete_remote()
 
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue')
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups)
 
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
@@ -178,6 +179,12 @@ class EVariableLengthValue(MutableMapping):
         else:
             remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
 
+        ## Resolve num_groups: remote metadata > user param
+        if remote_session.num_groups is not None:
+            resolved_num_groups = remote_session.num_groups
+        else:
+            resolved_num_groups = num_groups
+
         ## Finalizer
         self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
 
@@ -192,6 +199,7 @@ class EVariableLengthValue(MutableMapping):
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
         self.type = ebooklet_type
+        self._num_groups = resolved_num_groups
 
 
     def set_metadata(self, data, timestamp=None):
@@ -377,19 +385,30 @@ class EVariableLengthValue(MutableMapping):
         Loads items into the local file from the remote. If keys is None, then it loads all of the values from the remote in to the local file. Returns a dict of failed transfers.
         """
         futures = {}
-
         failure_dict = {}
 
         with ThreadPoolExecutor(max_workers=self._remote_session.threads) as executor:
             if keys is None:
-                for key, remote_time_bytes in self._remote_index.items():
+                items_iter = self._remote_index.items()
+            else:
+                items_iter = ((k, self._remote_index.get(k)) for k in keys)
+
+            if self._num_groups is not None:
+                groups_to_download = set()
+                for key, remote_time_bytes in items_iter:
                     check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                     if check:
-                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                        futures[f] = key
+                        if key == utils.metadata_key_str:
+                            f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                            futures[f] = key
+                        else:
+                            group_id = utils.key_to_group_id(key, self._num_groups)
+                            if group_id not in groups_to_download:
+                                groups_to_download.add(group_id)
+                                f = executor.submit(utils.get_remote_group, group_id, self._local_file, self._remote_session)
+                                futures[f] = f'_group_{group_id}'
             else:
-                for key in keys:
-                    remote_time_bytes = self._remote_index.get(key)
+                for key, remote_time_bytes in items_iter:
                     check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                     if check:
                         f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
@@ -412,7 +431,11 @@ class EVariableLengthValue(MutableMapping):
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
-            failure = utils.get_remote_value(self._local_file, key, self._remote_session)
+            if self._num_groups is not None and key != utils.metadata_key_str:
+                group_id = utils.key_to_group_id(key, self._num_groups)
+                failure = utils.get_remote_group(group_id, self._local_file, self._remote_session)
+            else:
+                failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure
         else:
             return None
@@ -501,6 +524,57 @@ class EVariableLengthValue(MutableMapping):
         else:
             raise ValueError('File is open for read only.')
 
+    def map(self, func, keys=None, write_db=None, n_workers=None):
+        """
+        Apply func to items in parallel using multiprocessing, writing results
+        to this ebooklet or a separate output ebooklet/booklet.
+
+        Parameters
+        ----------
+        func : callable
+            A picklable function: func(key, value) -> (new_key, new_value) or None.
+            Must be a top-level function (not a lambda or closure).
+        keys : iterable, optional
+            Specific keys to process. If None, processes all keys.
+        write_db : EVariableLengthValue or booklet, optional
+            A separate writable database to write results to. If None, writes
+            back to this ebooklet (which must be open for writing).
+        n_workers : int, optional
+            Number of worker processes. Defaults to os.cpu_count().
+
+        Returns
+        -------
+        dict
+            Statistics: {'processed': int, 'written': int, 'errors': int}
+        """
+        same_file = write_db is None
+
+        # Access control at ebooklet level (local_file is always writable internally)
+        if same_file and not self.writable:
+            raise ValueError('File is open for read only. Pass a writable write_db or open in write mode.')
+        if write_db is not None and isinstance(write_db, EVariableLengthValue) and not write_db.writable:
+            raise ValueError('write_db is open for read only.')
+
+        # Materialize keys (needed twice: load_items + booklet map)
+        if keys is not None and not isinstance(keys, (list, tuple)):
+            keys = list(keys)
+
+        # Load data from S3 before processing
+        failure_dict = self.load_items(keys)
+        if failure_dict:
+            raise urllib3.exceptions.HTTPError(failure_dict)
+
+        # Unwrap ebooklet write_db to its underlying booklet
+        booklet_write_db = None
+        if write_db is not None:
+            if isinstance(write_db, EVariableLengthValue):
+                booklet_write_db = write_db._local_file
+            else:
+                booklet_write_db = write_db
+
+        # Delegate to booklet
+        return self._local_file.map(func, keys=keys, write_db=booklet_write_db, n_workers=n_workers)
+
 
 class RemoteConnGroup(EVariableLengthValue):
     """
@@ -513,11 +587,12 @@ class RemoteConnGroup(EVariableLengthValue):
             flag: str = "r",
             n_buckets: int=12007,
             buffer_size: int = 2**22,
+            num_groups: int = None,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup')
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups)
 
 
     def add(self, remote_conn: remote.S3Connection):
@@ -569,6 +644,7 @@ def open(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     remote_conn_group: bool=False,
+    num_groups: int = None,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -598,6 +674,9 @@ def open(
     remote_conn_group : bool
         Should the file be opened as a remote connection group? If not, then it will be opened as a normal ebooklet (EVariableLengthValue). This parameter only applies when creating a new file.
 
+    num_groups : int or None
+        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+
     Returns
     -------
     Ebooklet
@@ -620,6 +699,9 @@ def open(
     |         | for reading and writing                   |
     +---------+-------------------------------------------+
     """
+    if num_groups is not None and num_groups < 1:
+        raise ValueError('num_groups must be a positive integer.')
+
     local_file_path = pathlib.Path(file_path)
 
     local_file_exists = local_file_path.exists()
@@ -630,13 +712,13 @@ def open(
 
     if ebooklet_type is None:
         if remote_conn_group:
-            return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
+            return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
         else:
-            return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+            return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
     elif ebooklet_type == 'EVariableLengthValue':
-        return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+        return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
     elif ebooklet_type == 'RemoteConnGroup':
-        return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size)
+        return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
     else:
         raise TypeError('Somehow the ebooklet got saved with an erroneous ebooklet type...')
 

@@ -39,6 +39,7 @@ flag = "n"
 buffer_size = 524288
 read_timeout = 60
 threads = 10
+num_groups = 10
 
 db_key = uuid.uuid8().hex[-13:]
 db_key2 = uuid.uuid8().hex[-13:]
@@ -106,32 +107,12 @@ def cleanup(request):
     request.addfinalizer(remove_test_data)
 
 
-# @pytest.fixture
-# def get_logs(request):
-#     yield
-
-#     if request.node.rep_call.failed:
-#         # Add code here to cleanup failure scenario
-#         print("executing test failed")
-
-#         with remote_conn.open('w') as s3open:
-#             s3open.delete_remote()
-
-#         file_path.unlink()
-#         remote_index_path = file_path.parent.joinpath(file_path.name + '.remote_index')
-#         remote_index_path.unlink()
-
-
-    # elif request.node.rep_call.passed:
-    #     # Add code here to cleanup success scenario
-    #     print("executing test success")
-
 ################################################
 ### Normal local operations
 
 
 def test_set_items():
-    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -142,7 +123,7 @@ def test_set_items():
 
 
 def test_update():
-    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         f.update(data_dict)
 
     with ebooklet.open(remote_conn, file_path) as f:
@@ -265,17 +246,6 @@ def test_prune():
 
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
-    # Reindex
-    # with ebooklet.open(remote_conn, file_path, 'w') as f:
-    #     old_len = len(f)
-    #     old_n_buckets = f._n_buckets
-    #     removed_items = f.prune(reindex=True)
-    #     new_n_buckets = f._n_buckets
-    #     new_len = len(f)
-    #     test_value = f['2']
-
-    # assert (removed_items == 0) and (new_n_buckets > old_n_buckets) and (new_len == old_len) and isinstance(test_value, int)
-
     # Remove the rest via timestamp filter
     timestamp = booklet.utils.make_timestamp_int()
 
@@ -301,7 +271,7 @@ def test_clear():
 
 
 def test_push():
-    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle') as f:
+    with ebooklet.open(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -411,7 +381,7 @@ def test_remove_remote_local():
     with remote_conn.open('w') as s3open:
         s3open.delete_remote()
 
-    with ebooklet.open(remote_conn2, file_path, 'n', value_serializer='pickle') as db:
+    with ebooklet.open(remote_conn2, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as db:
        uuid1 = db._remote_session.get_uuid()
        assert uuid1 is None
     # with remote_conn2.open('w') as s3open:
@@ -419,81 +389,3 @@ def test_remove_remote_local():
 
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
