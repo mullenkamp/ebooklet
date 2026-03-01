@@ -288,12 +288,51 @@ def test_push():
     file_path.unlink()
 
 
+def test_load_items():
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
+        # Load specific keys
+        subset = ['2', '5', '10']
+        failures = f.load_items(subset)
+        assert failures == {}
+
+        for key in subset:
+            assert f[key] == data_dict[key]
+
+        # Load all
+        failures = f.load_items()
+        assert failures == {}
+
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path.unlink()
+
+
+def test_discard():
+    with ebooklet.open(remote_conn, file_path, 'w') as f:
+        f['discard_me'] = 'should be removed'
+        f.sync()
+
+        changes = f.changes()
+        change_keys = [c['key'] for c in changes.iter_changes()]
+        assert 'discard_me' in change_keys
+
+        changes.discard(['discard_me'])
+
+        assert f.get('discard_me') is None
+
+        ri_path = f._remote_index_path
+
+    ri_path.unlink()
+    file_path.unlink()
+
+
 def test_read_remote():
     http_remote = remote.S3Connection(db_url=db_url)
 
     with ebooklet.open(http_remote, file_path) as f:
-        # value1 = f['10']
-        # assert value1 == data_dict['10']
+        value1 = f['10']
+        assert value1 == data_dict['10']
 
         counter = 0
         for key, value in f.get_items(f.keys()):
@@ -384,8 +423,9 @@ def test_remove_remote_local():
     with ebooklet.open(remote_conn2, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as db:
        uuid1 = db._remote_session.get_uuid()
        assert uuid1 is None
-    # with remote_conn2.open('w') as s3open:
-    #     s3open.delete_remote()
+
+    with remote_conn2.open('w') as s3open:
+        s3open.delete_remote()
 
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()
