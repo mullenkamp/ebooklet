@@ -250,14 +250,15 @@ class S3SessionReader:
         return meta
 
 
-    def get_object(self, key: str=None):
+    def get_object(self, key: str=None, range_start: int=None, range_end: int=None):
         """
         Get a remote object/file. The input should be a key as a str. It should return an object with a .status attribute as an int, a .data attribute in bytes, and a .error attribute as a dict.
+        Optionally specify range_start and range_end for byte-range requests.
         """
         if key is None:
-            resp = self._read_session.get_object(self.read_db_key)
+            resp = self._read_session.get_object(self.read_db_key, range_start=range_start, range_end=range_end)
         else:
-            resp = self._read_session.get_object(self.read_db_key + '/' + key)
+            resp = self._read_session.get_object(self.read_db_key + '/' + key, range_start=range_start, range_end=range_end)
 
         return resp
 

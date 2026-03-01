@@ -23,7 +23,7 @@ def test_pack_unpack_roundtrip():
         ('key2', 2000000, b'value2'),
         ('key3', 3000000, b'a longer value here'),
     ]
-    packed = utils.pack_group(entries)
+    packed, offsets = utils.pack_group(entries)
     unpacked = utils.unpack_group(packed)
     assert len(unpacked) == len(entries)
     for (ok, ot, ov), (uk, ut, uv) in zip(entries, unpacked):
@@ -33,17 +33,63 @@ def test_pack_unpack_roundtrip():
 
 
 def test_pack_unpack_empty():
-    packed = utils.pack_group([])
+    packed, offsets = utils.pack_group([])
     unpacked = utils.unpack_group(packed)
     assert unpacked == []
+    assert offsets == {}
 
 
 def test_pack_unpack_single():
     entries = [('only', 999999, b'\x00\x01\x02')]
-    packed = utils.pack_group(entries)
+    packed, offsets = utils.pack_group(entries)
     unpacked = utils.unpack_group(packed)
     assert len(unpacked) == 1
     assert unpacked[0] == entries[0]
+
+
+def test_pack_group_offsets_allow_byte_range_read():
+    """Offsets from pack_group can slice the packed bytes to recover each value."""
+    entries = [
+        ('key1', 1000000, b'value1'),
+        ('key2', 2000000, b'value2'),
+        ('key3', 3000000, b'a longer value here'),
+    ]
+    packed, offsets = utils.pack_group(entries)
+
+    assert set(offsets.keys()) == {'key1', 'key2', 'key3'}
+    for key, _ts, value in entries:
+        offset, length = offsets[key]
+        assert length == len(value)
+        assert packed[offset:offset + length] == value
+
+
+def test_pack_group_offsets_merged_range():
+    """A single slice spanning multiple keys contains all their values at the right relative offsets."""
+    entries = [
+        ('a', 100, b'alpha'),
+        ('b', 200, b'bravo'),
+        ('c', 300, b'charlie'),
+    ]
+    packed, offsets = utils.pack_group(entries)
+
+    # Simulate a merged byte-range GET (min offset to max offset+length)
+    all_offsets = [(k, *offsets[k]) for k in offsets]
+    all_offsets.sort(key=lambda x: x[1])
+    range_start = all_offsets[0][1]
+    last = all_offsets[-1]
+    range_end = last[1] + last[2]
+    chunk = packed[range_start:range_end]
+
+    for key, _ts, value in entries:
+        offset, length = offsets[key]
+        rel_offset = offset - range_start
+        assert chunk[rel_offset:rel_offset + length] == value
+
+
+def test_key_to_group_id_single_group():
+    """With num_groups=1 every key maps to group 0."""
+    for i in range(50):
+        assert utils.key_to_group_id(str(i), 1) == 0
 
 def test_check_local_vs_remote(tmp_path):
     local_path = tmp_path / "local.blt"
