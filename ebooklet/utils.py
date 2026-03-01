@@ -34,16 +34,24 @@ def key_to_group_id(key: str, num_groups: int) -> int:
     return int.from_bytes(digest, 'big') % num_groups
 
 
-def pack_group(entries: list[tuple[str, int, bytes]]) -> bytes:
+def pack_group(entries: list[tuple[str, int, bytes]]) -> tuple[bytes, dict[str, tuple[int, int]]]:
     buf = struct.pack('>I', len(entries))
+    offsets = {}
+    pos = 4
     for key, timestamp, value in entries:
         key_bytes = key.encode()
         buf += struct.pack('>H', len(key_bytes))
+        pos += 2
         buf += key_bytes
+        pos += len(key_bytes)
         buf += int_to_bytes(timestamp, 7)
+        pos += 7
         buf += struct.pack('>I', len(value))
+        pos += 4
+        offsets[key] = (pos, len(value))
         buf += value
-    return buf
+        pos += len(value)
+    return buf, offsets
 
 
 def unpack_group(data: bytes) -> list[tuple[str, int, bytes]]:
@@ -206,14 +214,14 @@ def upload_group(group_id, local_file, remote_session, keys_in_group):
         entries.append((key, time_int_us, valb))
 
     if entries:
-        packed = pack_group(entries)
+        packed, offsets = pack_group(entries)
         resp = remote_session.put_object(str(group_id), packed)
         if resp.status // 100 != 2:
-            return resp.error
+            return resp.error, None
+        return None, offsets
     else:
         resp = remote_session.delete_object(str(group_id))
-
-    return None
+        return None, {}
 
 
 def get_remote_group(group_id, local_file, remote_session):
@@ -227,6 +235,37 @@ def get_remote_group(group_id, local_file, remote_session):
     else:
         return resp.error
 
+    return None
+
+
+def get_remote_group_value(group_id, key, offset, length, timestamp_int, local_file, remote_session):
+    resp = remote_session.get_object(str(group_id), range_start=offset, range_end=offset + length - 1)
+    if resp.status in (200, 206):
+        local_file.set(key, resp.data, timestamp_int, encode_value=False)
+    elif resp.status == 404:
+        pass
+    else:
+        return resp.error
+    return None
+
+
+def get_remote_group_values(group_id, key_infos, local_file, remote_session):
+    """key_infos: list of (key, offset, length, timestamp_int)"""
+    sorted_infos = sorted(key_infos, key=lambda x: x[1])
+    range_start = sorted_infos[0][1]
+    last = sorted_infos[-1]
+    range_end = last[1] + last[2] - 1
+
+    resp = remote_session.get_object(str(group_id), range_start=range_start, range_end=range_end)
+    if resp.status in (200, 206):
+        for key, offset, length, timestamp_int in sorted_infos:
+            rel_offset = offset - range_start
+            value = resp.data[rel_offset:rel_offset + length]
+            local_file.set(key, value, timestamp_int, encode_value=False)
+    elif resp.status == 404:
+        pass
+    else:
+        return resp.error
     return None
 
 
@@ -264,12 +303,13 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session):
     with booklet.FixedLengthValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
         if remote_session.uuid and remote_index is not None:
             for key, local_int_us in local_file.timestamps():
-                remote_bytes_us = remote_index.get(key)
-                if remote_bytes_us:
-                    remote_int_us = bytes_to_int(remote_bytes_us)
+                remote_val = remote_index.get(key)
+                if remote_val:
+                    remote_ts_bytes = remote_val[:7]
+                    remote_int_us = bytes_to_int(remote_ts_bytes)
                     if local_int_us > remote_int_us:
                         local_bytes_us = int_to_bytes(local_int_us, 7)
-                        f[key] = local_bytes_us + remote_bytes_us
+                        f[key] = local_bytes_us + remote_ts_bytes
                 else:
                     local_bytes_us = int_to_bytes(local_int_us, 7)
                     f[key] = local_bytes_us + int_to_bytes(0, 7)
@@ -278,13 +318,14 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session):
             key = booklet.utils.metadata_key_bytes.decode()
             local_int_us = local_file.get_timestamp(key)
             if local_int_us:
-                remote_bytes_us = remote_index.get(key)
-                if remote_bytes_us:
-                    remote_int_us = bytes_to_int(remote_bytes_us)
+                remote_val = remote_index.get(key)
+                if remote_val:
+                    remote_ts_bytes = remote_val[:7]
+                    remote_int_us = bytes_to_int(remote_ts_bytes)
                     local_int_us = local_file.get_timestamp(key)
                     if local_int_us > remote_int_us:
                         local_bytes_us = int_to_bytes(local_int_us, 7)
-                        f[key] = local_bytes_us + remote_bytes_us
+                        f[key] = local_bytes_us + remote_ts_bytes
                 else:
                     local_bytes_us = int_to_bytes(local_int_us, 7)
                     f[key] = local_bytes_us + int_to_bytes(0, 7)
@@ -395,23 +436,25 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                 for future in as_completed(futures):
                     tag, identifier = futures[future]
                     run_result = future.result()
-                    if run_result is None:
-                        if tag == 'metadata':
-                            remote_index[metadata_key_str] = cl[metadata_key_str][:7]
+                    if tag == 'metadata':
+                        if run_result is None:
+                            remote_index[metadata_key_str] = cl[metadata_key_str][:7] + b'\x00' * 8
+                            updated = True
                         else:
-                            ## Update remote_index for all keys in this group
+                            failures[identifier] = run_result
+                    else:
+                        error, offsets = run_result
+                        if error is None:
                             gid = identifier
                             for key in group_keys[gid]:
-                                cl_val = cl.get(key)
-                                if cl_val:
-                                    remote_index[key] = cl_val[:7]
-                                else:
+                                if key in offsets:
                                     ts = local_file.get_timestamp(key)
                                     if ts:
-                                        remote_index[key] = int_to_bytes(ts, 7)
-                        updated = True
-                    else:
-                        failures[identifier] = run_result
+                                        offset, length = offsets[key]
+                                        remote_index[key] = int_to_bytes(ts, 7) + int_to_bytes(offset, 4) + int_to_bytes(length, 4)
+                            updated = True
+                        else:
+                            failures[identifier] = error
 
             ## Deletions are handled by group re-packing (deleted keys excluded)
             ## Remove deleted keys from remote_index
@@ -432,7 +475,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                     key = futures[future]
                     run_result = future.result()
                     if run_result is None:
-                        remote_index[key] = cl[key][:7]
+                        remote_index[key] = cl[key][:7] + b'\x00' * 8
                         updated = True
                     else:
                         failures[key] = run_result

@@ -177,7 +177,7 @@ class EVariableLengthValue(MutableMapping):
             else:
                 remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
         else:
-            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=7, n_buckets=n_buckets, buffer_size=buffer_size)
+            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Resolve num_groups: remote metadata > user param
         if remote_session.num_groups is not None:
@@ -394,8 +394,9 @@ class EVariableLengthValue(MutableMapping):
                 items_iter = ((k, self._remote_index.get(k)) for k in keys)
 
             if self._num_groups is not None:
-                groups_to_download = set()
-                for key, remote_time_bytes in items_iter:
+                groups_to_download = {}
+                for key, remote_val in items_iter:
+                    remote_time_bytes = remote_val[:7] if remote_val else None
                     check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                     if check:
                         if key == utils.metadata_key_str:
@@ -403,12 +404,17 @@ class EVariableLengthValue(MutableMapping):
                             futures[f] = key
                         else:
                             group_id = utils.key_to_group_id(key, self._num_groups)
-                            if group_id not in groups_to_download:
-                                groups_to_download.add(group_id)
-                                f = executor.submit(utils.get_remote_group, group_id, self._local_file, self._remote_session)
-                                futures[f] = f'_group_{group_id}'
+                            offset = utils.bytes_to_int(remote_val[7:11])
+                            length = utils.bytes_to_int(remote_val[11:15])
+                            timestamp_int = utils.bytes_to_int(remote_val[:7])
+                            groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
+
+                for group_id, key_infos in groups_to_download.items():
+                    f = executor.submit(utils.get_remote_group_values, group_id, key_infos, self._local_file, self._remote_session)
+                    futures[f] = f'_group_{group_id}'
             else:
-                for key, remote_time_bytes in items_iter:
+                for key, remote_val in items_iter:
+                    remote_time_bytes = remote_val[:7] if remote_val else None
                     check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                     if check:
                         f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
@@ -427,13 +433,17 @@ class EVariableLengthValue(MutableMapping):
         """
 
         """
-        remote_time_bytes = self._remote_index.get(key)
+        remote_val = self._remote_index.get(key)
+        remote_time_bytes = remote_val[:7] if remote_val else None
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
             if self._num_groups is not None and key != utils.metadata_key_str:
                 group_id = utils.key_to_group_id(key, self._num_groups)
-                failure = utils.get_remote_group(group_id, self._local_file, self._remote_session)
+                offset = utils.bytes_to_int(remote_val[7:11])
+                length = utils.bytes_to_int(remote_val[11:15])
+                timestamp_int = utils.bytes_to_int(remote_val[:7])
+                failure = utils.get_remote_group_value(group_id, key, offset, length, timestamp_int, self._local_file, self._remote_session)
             else:
                 failure = utils.get_remote_value(self._local_file, key, self._remote_session)
             return failure

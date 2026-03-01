@@ -42,7 +42,7 @@ uv build
 
 1. **`remote.py` — S3 Connection Layer**
    - `S3Connection` — configuration/credential holder; call `.open(flag)` to get a session
-   - `S3SessionReader` — read-only S3 access (supports both `s3func.S3Session` and `s3func.HttpSession` for public URLs)
+   - `S3SessionReader` — read-only S3 access (supports both `s3func.S3Session` and `s3func.HttpSession` for public URLs); `get_object()` supports `range_start`/`range_end` for byte-range requests
    - `S3SessionWriter(S3SessionReader)` — adds write operations, S3 locking, `copy_remote`, `delete_remote`
 
 2. **`main.py` — Database Layer**
@@ -53,20 +53,34 @@ uv build
 
 3. **`utils.py` — Sync Engine**
    - Handles local file initialization, remote index download, changelog creation, and multi-threaded upload/download via `ThreadPoolExecutor`
-   - Key helper: `check_local_vs_remote()` compares timestamps to decide if data needs downloading
+   - `pack_group()` / `unpack_group()` — serialize/deserialize grouped key/value entries; `pack_group()` also returns byte-offset mapping
+   - `upload_group()` — packs and uploads a group, returns `(error, offsets_dict)`
+   - `get_remote_group_value()` — single-key byte-range S3 GET
+   - `get_remote_group_values()` — merged byte-range S3 GET for multiple keys in the same group
+   - `check_local_vs_remote()` — compares timestamps to decide if data needs downloading
+
+### Grouped S3 Storage
+
+When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_groups`). Each group is a single S3 object containing all key/value pairs for that bucket, packed via `pack_group()` / `unpack_group()` in `utils.py`.
+
+- **Byte-range reads:** The `remote_index` stores byte offset and length for each key within its group. Single-key reads use S3 byte-range GET requests to fetch only the needed bytes. Multi-key reads from the same group use a single merged byte-range GET (min offset → max offset+length).
+- **Grouped writes:** `push()` re-packs entire affected groups and uploads them. `upload_group()` returns offset info that gets stored in `remote_index`.
+- Per-key storage (no grouping) is used when `num_groups` is `None`.
 
 ### Data Flow
 
-- **Read path:** `db[key]` → check local file → if missing/stale, download from S3 → cache locally → return
+- **Read path (per-key):** `db[key]` → check local file → if missing/stale, download from S3 → cache locally → return
+- **Read path (grouped):** `db[key]` → check local file → if missing/stale, byte-range GET from group S3 object using stored offset/length → cache locally → return
+- **Bulk read (grouped):** `load_items()` → collect stale keys → group by group_id → one merged byte-range GET per group → cache locally
 - **Write path:** `db[key] = val` → write to local booklet file only
 - **Sync path:** `db.changes().push()` → create changelog (local vs remote timestamps) → upload changed items via thread pool → update remote index object on S3
 
 ### Key Files per Database
 
 - `{file_path}` — local booklet database
-- `{file_path}.remote_index` — tracks what's stored remotely (FixedLengthValue, 7-byte timestamp per key)
-- `{file_path}.changelog` — temporary diff file created during sync
-- S3: `{db_key}` (main index object) and `{db_key}/{key}` (individual values)
+- `{file_path}.remote_index` — tracks what's stored remotely (FixedLengthValue, 15 bytes per key: 7-byte timestamp + 4-byte offset + 4-byte length). For per-key mode, offset/length are zero-filled.
+- `{file_path}.changelog` — temporary diff file created during sync (14 bytes per key: 7-byte local timestamp + 7-byte remote timestamp)
+- S3: `{db_key}` (main index object) and `{db_key}/{key}` (individual values or group blobs)
 
 ### Concurrency Model
 
@@ -83,7 +97,7 @@ from ebooklet import open, EVariableLengthValue, RemoteConnGroup, S3Connection
 
 ### Dependencies
 
-Core: `booklet>=0.9.2`, `s3func>=0.7.2`, `urllib3>=2` (plus `uuid6`, `orjson`, `portalocker`, `base64`)
+Core: `booklet>=0.12.1`, `s3func>=0.7.2`, `urllib3>=2` (plus `uuid6`, `orjson`, `portalocker`, `base64`)
 
 ### Open Flags
 
