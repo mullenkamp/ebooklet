@@ -70,10 +70,9 @@ uv build
 
 ### Concurrency Model
 
-- Writes are thread-safe (thread locks)
+- Reads and writes are thread-safe (thread locks in booklet)
 - Multiprocessing-safe (portalocker file locks)
 - Remote write locking via S3 object locks (`s3func.s3lock`)
-- Reads are NOT thread-safe
 - Resource cleanup via `weakref.finalize`
 
 ### Public API (`__init__.py`)

@@ -89,7 +89,9 @@ def test_map_all_keys():
         for key, value in data_dict.items():
             f[key] = value
 
-        stats = f.map(double_value, n_workers=2)
+        results = list(f.map(double_value, n_workers=2))
+        for key, value in results:
+            f[key] = value
 
     with ebooklet.open(remote_conn_map, file_path_map) as f:
         for key, value in data_dict.items():
@@ -102,7 +104,9 @@ def test_map_specific_keys():
             f[key] = value
 
         subset = ['2', '5', '10']
-        stats = f.map(double_value, keys=subset, n_workers=2)
+        results = list(f.map(double_value, keys=subset, n_workers=2))
+        for key, value in results:
+            f[key] = value
 
     with ebooklet.open(remote_conn_map, file_path_map) as f:
         for key in subset:
@@ -125,7 +129,9 @@ def test_map_with_remote_data():
 
     # Reopen (data is on S3), map should load from remote first
     with ebooklet.open(remote_conn_map, file_path_map, 'w', value_serializer='pickle') as f:
-        stats = f.map(double_value, n_workers=2)
+        results = list(f.map(double_value, n_workers=2))
+        for key, value in results:
+            f[key] = value
 
         for key, value in data_dict.items():
             assert f[key] == value * 2
@@ -137,35 +143,13 @@ def test_map_separate_write_db():
             source[key] = value
 
         with ebooklet.open(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', num_groups=num_groups) as dest:
-            stats = source.map(remap_key, write_db=dest, n_workers=2)
+            results = list(source.map(remap_key, n_workers=2))
+            for key, value in results:
+                dest[key] = value
 
         with ebooklet.open(remote_conn_map2, file_path_map2) as dest:
             for key, value in data_dict.items():
                 assert dest[f"new_{key}"] == value
-
-
-def test_map_read_only_raises():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
-        for key, value in data_dict.items():
-            f[key] = value
-
-    with ebooklet.open(remote_conn_map, file_path_map) as f:
-        with pytest.raises(ValueError, match='read only'):
-            f.map(double_value, n_workers=2)
-
-
-def test_map_read_only_with_write_db():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
-        for key, value in data_dict.items():
-            f[key] = value
-
-    with ebooklet.open(remote_conn_map, file_path_map) as source:
-        with ebooklet.open(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', num_groups=num_groups) as dest:
-            stats = source.map(double_value, write_db=dest, n_workers=2)
-
-    with ebooklet.open(remote_conn_map2, file_path_map2) as dest:
-        for key, value in data_dict.items():
-            assert dest[key] == value * 2
 
 
 def test_map_skip_none():
@@ -173,21 +157,6 @@ def test_map_skip_none():
         for key, value in data_dict.items():
             f[key] = value
 
-        stats = f.map(skip_even, n_workers=2)
+        results = list(f.map(skip_even, n_workers=2))
 
-    assert stats['written'] < stats['processed']
-
-
-def test_map_stats():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
-        for key, value in data_dict.items():
-            f[key] = value
-
-        stats = f.map(double_value, n_workers=2)
-
-    assert 'processed' in stats
-    assert 'written' in stats
-    assert 'errors' in stats
-    assert stats['processed'] == len(data_dict)
-    assert stats['written'] == len(data_dict)
-    assert stats['errors'] == 0
+    assert len(results) < len(data_dict)
