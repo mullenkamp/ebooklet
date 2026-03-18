@@ -85,7 +85,7 @@ def cleanup(request):
 
 
 def test_map_all_keys():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -93,13 +93,13 @@ def test_map_all_keys():
         for key, value in results:
             f[key] = value
 
-    with ebooklet.open(remote_conn_map, file_path_map) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map) as f:
         for key, value in data_dict.items():
             assert f[key] == value * 2
 
 
 def test_map_specific_keys():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -108,7 +108,7 @@ def test_map_specific_keys():
         for key, value in results:
             f[key] = value
 
-    with ebooklet.open(remote_conn_map, file_path_map) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map) as f:
         for key in subset:
             assert f[key] == data_dict[key] * 2
 
@@ -118,7 +118,7 @@ def test_map_specific_keys():
 
 def test_map_with_remote_data():
     # Write and push to S3
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
         f.changes().push()
@@ -128,7 +128,7 @@ def test_map_with_remote_data():
     file_path_map.unlink()
 
     # Reopen (data is on S3), map should load from remote first
-    with ebooklet.open(remote_conn_map, file_path_map, 'w', value_serializer='pickle') as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'w', value_serializer='pickle') as f:
         results = list(f.map(double_value, n_workers=2))
         for key, value in results:
             f[key] = value
@@ -138,22 +138,22 @@ def test_map_with_remote_data():
 
 
 def test_map_separate_write_db():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as source:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as source:
         for key, value in data_dict.items():
             source[key] = value
 
-        with ebooklet.open(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', num_groups=num_groups) as dest:
+        with ebooklet.open_ebooklet(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', num_groups=num_groups) as dest:
             results = list(source.map(remap_key, n_workers=2))
             for key, value in results:
                 dest[key] = value
 
-        with ebooklet.open(remote_conn_map2, file_path_map2) as dest:
+        with ebooklet.open_ebooklet(remote_conn_map2, file_path_map2) as dest:
             for key, value in data_dict.items():
                 assert dest[f"new_{key}"] == value
 
 
 def test_map_skip_none():
-    with ebooklet.open(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
         for key, value in data_dict.items():
             f[key] = value
 

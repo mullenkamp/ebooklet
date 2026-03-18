@@ -625,14 +625,13 @@ class RemoteConnGroup(EVariableLengthValue):
         raise NotImplementedError('Use the add method to add remote connections to the group.')
 
 
-def open(
+def open_ebooklet(
     remote_conn: Union[remote.S3Connection, str, dict],
     file_path: Union[str, pathlib.Path],
     flag: str = "r",
     value_serializer: str = None,
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    remote_conn_group: bool=False,
     num_groups: int = None,
     ):
     """
@@ -651,7 +650,6 @@ def open(
 
     value_serializer : str, class, or None
         The serializer to use to convert the input value to bytes. Run the booklet.available_serializers to determine the internal serializers that are available. None will require bytes as input.
-        Does not apply for the remote connection group.
 
     n_buckets : int
         The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.
@@ -660,15 +658,12 @@ def open(
         The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
         This is only used when the file is open for writing.
 
-    remote_conn_group : bool
-        Should the file be opened as a remote connection group? If not, then it will be opened as a normal ebooklet (EVariableLengthValue). This parameter only applies when creating a new file.
-
     num_groups : int or None
         The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
 
     Returns
     -------
-    Ebooklet
+    EVariableLengthValue
 
     The optional *flag* argument can be:
 
@@ -699,16 +694,80 @@ def open(
     remote_conn = remote.check_remote_conn(remote_conn, flag)
     remote_session, ebooklet_type = utils.open_remote_conn(remote_conn, flag, local_file_exists)
 
-    if ebooklet_type is None:
-        if remote_conn_group:
-            return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
-        else:
-            return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
-    elif ebooklet_type == 'EVariableLengthValue':
-        return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
-    elif ebooklet_type == 'RemoteConnGroup':
-        return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
-    else:
-        raise TypeError('Somehow the ebooklet got saved with an erroneous ebooklet type...')
+    if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
+        raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
+
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+
+
+def open_rcg(
+    remote_conn: Union[remote.S3Connection, str, dict],
+    file_path: Union[str, pathlib.Path],
+    flag: str = "r",
+    n_buckets: int=12007,
+    buffer_size: int = 2**22,
+    num_groups: int = None,
+    ):
+    """
+    Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
+
+    Parameters
+    -----------
+    remote_conn : S3Connection, str, or dict
+        The object to connect to a remote. It can be an S3Connection object, an http url string, or a dict with the parameters for initializing an S3Connection object.
+
+    file_path : str or pathlib.Path
+        It must be a path to a local file location. If you want to use a tempfile, then use the name from the NamedTemporaryFile initialized class.
+
+    flag : str
+        Flag associated with how the file is opened according to the dbm style. See below for details.
+
+    n_buckets : int
+        The number of hash buckets to using in the indexing. Generally use the same number of buckets as you expect for the total number of keys.
+
+    buffer_size : int
+        The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
+        This is only used when the file is open for writing.
+
+    num_groups : int or None
+        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+
+    Returns
+    -------
+    RemoteConnGroup
+
+    The optional *flag* argument can be:
+
+    +---------+-------------------------------------------+
+    | Value   | Meaning                                   |
+    +=========+===========================================+
+    | ``'r'`` | Open existing database for reading only   |
+    |         | (default)                                 |
+    +---------+-------------------------------------------+
+    | ``'w'`` | Open existing database for reading and    |
+    |         | writing                                   |
+    +---------+-------------------------------------------+
+    | ``'c'`` | Open database for reading and writing,    |
+    |         | creating it if it doesn't exist           |
+    +---------+-------------------------------------------+
+    | ``'n'`` | Always create a new, empty database, open |
+    |         | for reading and writing                   |
+    +---------+-------------------------------------------+
+    """
+    if num_groups is not None and num_groups < 1:
+        raise ValueError('num_groups must be a positive integer.')
+
+    local_file_path = pathlib.Path(file_path)
+
+    local_file_exists = local_file_path.exists()
+
+    ## Check and open the remote session
+    remote_conn = remote.check_remote_conn(remote_conn, flag)
+    remote_session, ebooklet_type = utils.open_remote_conn(remote_conn, flag, local_file_exists)
+
+    if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
+        raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
+
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
 
 

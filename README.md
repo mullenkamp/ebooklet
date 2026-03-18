@@ -47,13 +47,13 @@ remote_conn = ebooklet.S3Connection(
 If you only need to read and have a public URL, pass it directly — no `S3Connection` needed:
 
 ```python
-db = ebooklet.open('https://my-bucket.org/big_data.blt', '/tmp/big_data.blt', flag='r')
+db = ebooklet.open_ebooklet('https://my-bucket.org/big_data.blt', '/tmp/big_data.blt', flag='r')
 ```
 
 ### Open, read, write
 
 ```python
-with ebooklet.open(remote_conn, '/tmp/big_data.blt', flag='c', value_serializer='pickle') as db:
+with ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='c', value_serializer='pickle') as db:
     db['key1'] = ['one', 2, 'three', 4]
     value = db['key1']
 ```
@@ -65,8 +65,8 @@ Be careful with flags — using `'n'` will delete the remote database in additio
 By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket.
 
 ```python
-db = ebooklet.open(remote_conn, '/tmp/big_data.blt', flag='n',
-                   value_serializer='pickle', num_groups=64)
+db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
+                            value_serializer='pickle', num_groups=64)
 ```
 
 - Keys are assigned to groups via `blake2b` hash mod `num_groups`
@@ -82,7 +82,7 @@ Use grouped storage when you have many small values — it reduces the number of
 The `changes()` method returns a `Change` object for inspecting and pushing differences between local and remote:
 
 ```python
-with ebooklet.open(remote_conn, '/tmp/big_data.blt', 'w') as db:
+with ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', 'w') as db:
     db['key1'] = 'new value'
 
     changes = db.changes()
@@ -124,7 +124,7 @@ remote_conn_rcg = ebooklet.S3Connection(
     endpoint_url=endpoint_url_rcg,
 )
 
-with ebooklet.open(remote_conn_rcg, '/tmp/rcg.blt', 'n', remote_conn_group=True) as rcg:
+with ebooklet.open_rcg(remote_conn_rcg, '/tmp/rcg.blt', 'n') as rcg:
     rcg.add(remote_conn)
 
     changes = rcg.changes()
