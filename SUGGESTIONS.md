@@ -91,4 +91,4 @@ Ensure the synchronization process is atomic or idempotent.
 `s3func` is instantiated directly within `ebooklet`.
 
 **Suggestion:**
-Allow users to pass an existing `s3func` session or client into `ebooklet.open()`. This simplifies testing (mocking the connection) and allows users to share sessions between multiple `ebooklet` instances or other parts of their application.
+Allow users to pass an existing `s3func` session or client into `ebooklet.open_ebooklet()`. This simplifies testing (mocking the connection) and allows users to share sessions between multiple `ebooklet` instances or other parts of their application.

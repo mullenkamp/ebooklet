@@ -66,7 +66,7 @@ remote_conn = ebooklet.S3Connection(
     endpoint_url='https://...'
 )
 
-with ebooklet.open(remote_conn, 'local_data.blt', flag='c') as db:
+with ebooklet.open_ebooklet(remote_conn, 'local_data.blt', flag='c') as db:
     db['key'] = 'value'
     changes = db.changes()
     changes.push()

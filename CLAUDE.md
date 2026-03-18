@@ -49,7 +49,8 @@ uv build
    - `EVariableLengthValue(MutableMapping)` — the main database class. Maintains a local booklet file + a `.remote_index` file tracking what's on S3
    - `RemoteConnGroup(EVariableLengthValue)` — specialized variant that stores `S3Connection` references (always uses `orjson` serializer)
    - `Change` — manages sync workflow: `pull()` updates remote index, `update()` creates changelog, `push()` uploads changes
-   - `open()` — top-level factory function; determines type from remote metadata or `remote_conn_group` flag
+   - `open_ebooklet()` — factory function for `EVariableLengthValue` databases
+   - `open_rcg()` — factory function for `RemoteConnGroup` databases
 
 3. **`utils.py` — Sync Engine**
    - Handles local file initialization, remote index download, changelog creation, and multi-threaded upload/download via `ThreadPoolExecutor`
@@ -92,7 +93,7 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 ### Public API (`__init__.py`)
 
 ```python
-from ebooklet import open, EVariableLengthValue, RemoteConnGroup, S3Connection
+from ebooklet import open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup, S3Connection
 ```
 
 ### Dependencies
