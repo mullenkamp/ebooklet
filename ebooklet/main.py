@@ -142,24 +142,47 @@ class EVariableLengthValue(MutableMapping):
             n_buckets: int=12007,
             buffer_size: int = 2**22,
             num_groups: int = None,
+            lock_timeout: int = 300,
+            force_lock: bool = False,
             ):
         """
 
         """
-        ## Remove the remote database if flag == 'n'
-        if flag == 'n' and remote_session.uuid is not None:
-            remote_session.delete_remote()
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups, lock_timeout, force_lock)
 
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups)
-
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None, lock_timeout=300, force_lock=False):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
         ## Lock the remote if file is opened for write
         if flag != 'r':
             lock = remote_session.create_lock()
-            lock.acquire()
+            if force_lock:
+                lock.break_other_locks()
+            acquired = lock.acquire(timeout=lock_timeout)
+            if not acquired:
+                others = lock.other_locks()
+                if others:
+                    import datetime
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    ages = []
+                    for lock_id, info in others.items():
+                        ts = info.get('upload_timestamp')
+                        if ts:
+                            age = now - ts
+                            ages.append(str(age).split('.')[0])
+                    age_str = ', '.join(ages) if ages else 'unknown'
+                    msg = (
+                        f'Could not acquire write lock within {lock_timeout}s. '
+                        f'Blocked by existing lock(s) held for: {age_str}. '
+                        'If you are sure no other writer is active, re-open with force_lock=True to break stale locks.'
+                    )
+                else:
+                    msg = (
+                        f'Could not acquire write lock within {lock_timeout}s. '
+                        'Re-open with force_lock=True to break stale locks.'
+                    )
+                raise TimeoutError(msg)
             self.writable = True
         else:
             lock = None
@@ -577,11 +600,13 @@ class RemoteConnGroup(EVariableLengthValue):
             n_buckets: int=12007,
             buffer_size: int = 2**22,
             num_groups: int = None,
+            lock_timeout: int = 300,
+            force_lock: bool = False,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups, lock_timeout, force_lock)
 
 
     def add(self, remote_conn: remote.S3Connection):
@@ -633,6 +658,8 @@ def open_ebooklet(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     num_groups: int = None,
+    lock_timeout: int = 300,
+    force_lock: bool = False,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -660,6 +687,13 @@ def open_ebooklet(
 
     num_groups : int or None
         The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+
+    lock_timeout : int
+        Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
+
+    force_lock : bool
+        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
     Returns
     -------
@@ -697,7 +731,7 @@ def open_ebooklet(
     if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
 
-    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
 
 
 def open_rcg(
@@ -707,6 +741,8 @@ def open_rcg(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     num_groups: int = None,
+    lock_timeout: int = 300,
+    force_lock: bool = False,
     ):
     """
     Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
@@ -731,6 +767,13 @@ def open_rcg(
 
     num_groups : int or None
         The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+
+    lock_timeout : int
+        Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
+
+    force_lock : bool
+        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
     Returns
     -------
@@ -768,6 +811,6 @@ def open_rcg(
     if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
 
-    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
 
 

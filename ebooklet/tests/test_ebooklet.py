@@ -414,18 +414,57 @@ def test_remote_conn_grp_read_remote():
 
 
 ##################################
+### New API behavior tests
+
+
+def test_flag_n_does_not_delete_remote():
+    """flag='n' should reset local file but preserve remote, pulling UUID and index from it."""
+    # Ensure remote has data
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+        f['persist_test'] = 'should_survive'
+        f.sync()
+        changes = f.changes()
+        changes.push()
+
+    # Re-open with flag='n' — local file is reset but inherits remote UUID and index
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+        # Remote data is accessible via transparent pull
+        assert f.get('persist_test') == 'should_survive'
+
+    # Verify remote still exists
+    with remote_conn.open() as session:
+        assert session.uuid is not None
+
+
+def test_lock_timeout():
+    """A second writer should get TimeoutError when the lock is held."""
+    f1 = ebooklet.open_ebooklet(remote_conn, file_path, 'w')
+    try:
+        with pytest.raises(TimeoutError, match='Could not acquire write lock'):
+            ebooklet.open_ebooklet(remote_conn, file_path, 'w', lock_timeout=5)
+    finally:
+        f1.close()
+
+
+def test_lock_timeout_default_acquires():
+    """Opening for write with default timeout should succeed when no lock is held."""
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'w') as f:
+        assert f.writable
+
+
+##################################
 ### Remove files
 
 def test_remove_remote_local():
     with remote_conn.open('w') as s3open:
         s3open.delete_remote()
 
-    with ebooklet.open_ebooklet(remote_conn2, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as db:
-       uuid1 = db._remote_session.get_uuid()
-       assert uuid1 is None
-
     with remote_conn2.open('w') as s3open:
         s3open.delete_remote()
+
+    # Verify remote_conn2 is actually gone
+    with remote_conn2.open() as session:
+        assert session.uuid is None
 
     with remote_conn_rcg.open('w') as s3open:
         s3open.delete_remote()

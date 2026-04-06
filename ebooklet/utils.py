@@ -139,7 +139,11 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
     if local_file_path.exists():
 
         if flag == 'n':
-            local_file = booklet.open(local_file_path, flag='n', key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
+            if remote_uuid:
+                local_file = booklet.open(local_file_path, flag='n', init_bytes=remote_session._init_bytes)
+                local_file._n_keys = 0
+            else:
+                local_file = booklet.open(local_file_path, flag='n', key_serializer='str', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size)
 
             overwrite_remote_index = True
         else:
@@ -170,7 +174,7 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
     """
     remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
 
-    if (not remote_index_path.exists() or overwrite_remote_index) and (flag != 'n'):
+    if not remote_index_path.exists() or overwrite_remote_index:
         if remote_session.uuid:
             index0 = remote_session.get_object()
             if index0.status == 200:
