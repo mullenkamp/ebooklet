@@ -686,7 +686,7 @@ def open_ebooklet(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
         Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
 
     lock_timeout : int
@@ -719,6 +719,8 @@ def open_ebooklet(
     """
     if num_groups is not None and num_groups < 1:
         raise ValueError('num_groups must be a positive integer.')
+    if num_groups is not None:
+        num_groups = utils.next_prime(num_groups)
 
     local_file_path = pathlib.Path(file_path)
 
@@ -766,7 +768,7 @@ def open_rcg(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
         Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
 
     lock_timeout : int
@@ -799,6 +801,8 @@ def open_rcg(
     """
     if num_groups is not None and num_groups < 1:
         raise ValueError('num_groups must be a positive integer.')
+    if num_groups is not None:
+        num_groups = utils.next_prime(num_groups)
 
     local_file_path = pathlib.Path(file_path)
 

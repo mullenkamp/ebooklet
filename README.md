@@ -62,11 +62,12 @@ Be careful with flags — using `'n'` will delete the remote database in additio
 
 ## Grouped Storage
 
-By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket.
+By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket. If the provided `num_groups` is not prime, it is automatically rounded up to the nearest prime for optimal hash distribution.
 
 ```python
 db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
                             value_serializer='pickle', num_groups=64)
+# num_groups is adjusted to 67 (nearest prime >= 64)
 ```
 
 - Keys are assigned to groups via `blake2b` hash mod `num_groups`

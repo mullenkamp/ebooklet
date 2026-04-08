@@ -29,6 +29,32 @@ metadata_key_str = booklet.utils.metadata_key_bytes.decode()
 ### Group functions
 
 
+def is_prime_small(n: int) -> bool:
+    """Trial-division primality test suitable for small n."""
+    if n < 2:
+        return False
+    if n < 4:
+        return True
+    if n % 2 == 0 or n % 3 == 0:
+        return False
+    i = 5
+    while i * i <= n:
+        if n % i == 0 or n % (i + 2) == 0:
+            return False
+        i += 6
+    return True
+
+
+def next_prime(n: int) -> int:
+    """Return the smallest prime >= n."""
+    if n <= 2:
+        return 2
+    candidate = n if n % 2 != 0 else n + 1
+    while not is_prime_small(candidate):
+        candidate += 2
+    return candidate
+
+
 def key_to_group_id(key: str, num_groups: int) -> int:
     digest = hashlib.blake2b(key.encode(), digest_size=4).digest()
     return int.from_bytes(digest, 'big') % num_groups

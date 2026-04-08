@@ -505,7 +505,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "booklet", specifier = ">=0.12.1" },
-    { name = "s3func", specifier = ">=0.8" },
+    { name = "s3func", specifier = ">=0.8.5" },
     { name = "urllib3", specifier = ">=2" },
 ]
 
@@ -1314,15 +1314,15 @@ wheels = [
 
 [[package]]
 name = "s3func"
-version = "0.8.1"
+version = "0.8.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "orjson" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a3/a1/2c9040b379047644a7b5f6f885949ac975ac760bad95196bd9097f429213/s3func-0.8.1.tar.gz", hash = "sha256:683bcf80db3345f5594b53fa03eeb698f0b3a3fe832dd1421097bb695cb872aa", size = 27328, upload-time = "2026-02-09T00:44:54.692Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/2b/5402465327815220ffef305fd3f800d36ad974e2fb1fcae1959dcb8d7a99/s3func-0.8.5.tar.gz", hash = "sha256:275b44cea302e02d3510c20063a39d8c63f47eb9464785bf1bee7cb1075e7838", size = 28243, upload-time = "2026-04-07T07:31:39.561Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/38/0e1ebbad388b665a721e39a5e2f6555c01aa4926829fa5e870967fb34aea/s3func-0.8.1-py3-none-any.whl", hash = "sha256:f73c53734bd0225cb35e87433752de86afe8daffead3e1a50fd21f85ec26a761", size = 32118, upload-time = "2026-02-09T00:44:52.817Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/c0/d5780c2e45a26141de14bf934356e0ac859115a7f8fd3fa9beb2df1c42b2/s3func-0.8.5-py3-none-any.whl", hash = "sha256:5bec8f74bd76e1ea16991cf87bd70577249862b0be9dd6a84281e7367f646148", size = 34230, upload-time = "2026-04-07T07:31:38.262Z" },
 ]
 
 [[package]]

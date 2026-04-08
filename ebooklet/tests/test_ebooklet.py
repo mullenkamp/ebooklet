@@ -39,7 +39,7 @@ flag = "n"
 buffer_size = 524288
 read_timeout = 60
 threads = 10
-num_groups = 10
+num_groups = 11
 
 db_key = uuid.uuid8().hex[-13:]
 db_key2 = uuid.uuid8().hex[-13:]

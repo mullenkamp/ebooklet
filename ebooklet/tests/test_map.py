@@ -26,7 +26,7 @@ except:
     access_key = os.environ['access_key']
 
 bucket = 'achelous'
-num_groups = 10
+num_groups = 11
 
 db_key_map = uuid.uuid8().hex[-13:]
 file_path_map = script_path.joinpath(db_key_map)
