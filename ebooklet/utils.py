@@ -201,15 +201,43 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
     remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
 
     if not remote_index_path.exists() or overwrite_remote_index:
-        if remote_session.uuid:
-            index0 = remote_session.get_object()
-            if index0.status == 200:
-                with portalocker.Lock(remote_index_path, 'wb', timeout=120) as f:
-                    f.write(index0.data)
-            elif index0.status != 404:
-                raise urllib3.exceptions.HTTPError(index0.error)
+        fetch_remote_index(remote_index_path, remote_session)
 
     return remote_index_path
+
+
+def fetch_remote_index(dest_path, remote_session):
+    """
+    Download the remote db object (the remote index) to dest_path. Returns True on
+    success, False when there is nothing to fetch (no remote uuid, or a 404);
+    raises on other HTTP errors.
+    """
+    if not remote_session.uuid:
+        return False
+
+    index0 = remote_session.get_object()
+    if index0.status == 200:
+        with portalocker.Lock(dest_path, 'wb', timeout=120) as f:
+            f.write(index0.data)
+        return True
+    elif index0.status == 404:
+        return False
+    else:
+        raise urllib3.exceptions.HTTPError(index0.error)
+
+
+def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
+    """
+    Open the local remote-index booklet with the standard flag mapping (read-only
+    for 'r' sessions, writable otherwise, fresh file when none exists).
+    """
+    if remote_index_path.exists():
+        if flag == 'r':
+            return booklet.FixedLengthValue(remote_index_path, 'r')
+        else:
+            return booklet.FixedLengthValue(remote_index_path, 'w')
+    else:
+        return booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
 
 
 def get_remote_value(local_file, key, remote_session):

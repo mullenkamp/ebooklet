@@ -13,9 +13,11 @@ Regression tests for the two push-integrity fixes (v0.8.4):
 
 These tests run against the live test bucket, following test_ebooklet.py conventions.
 """
+import datetime
 import io
 import os
 import pathlib
+import shutil
 
 import pytest
 import uuid6 as uuid
@@ -302,3 +304,150 @@ def test_deletes_retained_when_group_pull_fails():
     values, stored_keys = read_all(conn, [k1, k2])
     assert values == {k1: None, k2: b'v2'}
     assert stored_keys == [k2]
+
+
+#################################################
+### 0.9.0 items: 'n' guard + writes-only, pull() repair, prune contract
+
+
+def test_flag_n_num_groups_guard_and_lock_release():
+    conn = make_conn('nguard')
+    seed_remote(conn, {'k': b'v'})  # grouped remote, num_groups=5
+
+    with pytest.raises(ValueError, match='conflicts with the existing'):
+        open_ebooklet(conn, local_path('nguard-a'), flag='n', num_groups=7)
+
+    ## The rejected open must have released the lock: an immediate open succeeds.
+    with open_ebooklet(conn, local_path('nguard-b'), flag='n', num_groups=num_groups, lock_timeout=15) as eb:
+        assert eb._num_groups == num_groups
+
+
+def test_lock_released_on_uuid_mismatch():
+    ## Review finding 4 regression: pre-existing early-raise paths in _init_common
+    ## (here: local/remote UUID mismatch) must release the lock immediately, not at GC.
+    conn_a = make_conn('mismatch-a')
+    conn_b = make_conn('mismatch-b')
+    seed_remote(conn_a, {'k': b'v'})
+    seed_remote(conn_b, {'k': b'v'})
+
+    pa = local_path('mismatch-local')
+    with open_ebooklet(conn_a, pa, flag='w'):
+        pass
+
+    with pytest.raises(ValueError, match='different UUID'):
+        open_ebooklet(conn_b, pa, flag='w')
+
+    with open_ebooklet(conn_b, local_path('mismatch-ok'), flag='w', lock_timeout=15) as eb:
+        assert eb.writable
+
+
+def test_flag_n_writes_only_push():
+    ## 'n' contract (Mike's decision): old remote stays readable pre-push, but the
+    ## pushed new database contains ONLY this session's writes - reads never
+    ## resurrect old keys, and the pushed index has no dangling entries.
+    conn = make_conn('nwrites')
+    seed_remote(conn, {'old1': b'old-1', 'old2': b'old-2'})
+
+    with open_ebooklet(conn, local_path('nwrites-w'), flag='n', num_groups=num_groups) as eb:
+        assert eb.get('old1') == b'old-1'  # transparent read still works pre-push
+        eb['new1'] = b'new-1'
+        assert eb.changes().push() is True
+
+    with open_ebooklet(conn, local_path('nwrites-r'), flag='r') as eb:
+        assert sorted(eb.keys()) == ['new1']
+        assert eb.get('new1') == b'new-1'
+        assert eb.get('old1') is None
+
+
+def test_pull_stranded_reader():
+    ## A reader session opened (on a copied local file) BEFORE the remote exists
+    ## caches uuid=None; pull() must reload full metadata and refresh the index.
+    conn = make_conn('stranded')
+    producer_path = local_path('stranded-producer')
+    with open_ebooklet(conn, producer_path, flag='n', num_groups=num_groups) as eb:
+        eb['k1'] = b'v1'
+
+    reader_path = local_path('stranded-reader')
+    shutil.copy(producer_path, reader_path)
+
+    reader = open_ebooklet(conn, reader_path, flag='r')
+    assert reader._remote_session.uuid is None
+
+    with open_ebooklet(conn, producer_path, flag='w', num_groups=num_groups) as eb:
+        eb['k2'] = b'v2'
+        assert eb.changes().push() is True
+
+    reader.changes().pull()
+    assert sorted(reader.keys()) == ['k1', 'k2']
+    assert reader.get('k2') == b'v2'
+    reader.close()
+
+
+def test_pull_sees_remote_advance():
+    conn = make_conn('pull-adv')
+    seed_remote(conn, {'k1': b'v1'})
+
+    reader = open_ebooklet(conn, local_path('pull-adv-r'), flag='r')
+    assert reader.get('k1') == b'v1'
+
+    with open_ebooklet(conn, local_path('pull-adv-w'), flag='w') as eb:
+        eb['k2'] = b'v2'
+        assert eb.changes().push() is True
+
+    reader.changes().pull()
+    assert reader.get('k2') == b'v2'
+    reader.close()
+
+
+def test_pull_fetch_failure_leaves_session_usable():
+    ## Review finding 3 regression: a failed index download during pull() must
+    ## leave the live session fully usable (fetch-first ordering).
+    conn = make_conn('pull-fail')
+    seed_remote(conn, {'k1': b'v1'})
+
+    reader = open_ebooklet(conn, local_path('pull-fail-r'), flag='r')
+    assert reader.get('k1') == b'v1'
+
+    with open_ebooklet(conn, local_path('pull-fail-w'), flag='w') as eb:
+        eb['k2'] = b'v2'
+        assert eb.changes().push() is True
+
+    original_get = reader._remote_session.get_object
+
+    def failing_get(*args, **kwargs):
+        class MockResp:
+            status = 500
+            error = 'injected fetch failure'
+        return MockResp()
+
+    reader._remote_session.get_object = failing_get
+    with pytest.raises(Exception):
+        reader.changes().pull()
+    reader._remote_session.get_object = original_get
+
+    assert reader.get('k1') == b'v1'   # session untouched by the failed pull
+    reader.changes().pull()
+    assert reader.get('k2') == b'v2'
+    reader.close()
+
+
+def test_prune_local_eviction_contract():
+    ## Decided contract: prune reclaims local space only; the remote is untouched;
+    ## evicted values re-pull on demand; pushes repack from the remote's membership.
+    conn = make_conn('prune')
+    keys = {f'pk{i}': f'val-{i}'.encode() for i in range(4)}
+    seed_remote(conn, keys)
+
+    with open_ebooklet(conn, local_path('prune-w'), flag='w') as eb:
+        for k, v in keys.items():  # materialize everything locally
+            assert eb.get(k) == v
+        removed = eb.prune(timestamp=datetime.datetime.now(datetime.timezone.utc))
+        assert removed >= len(keys)          # local eviction happened
+        assert eb.get('pk0') == keys['pk0']  # transparently re-pulls
+        eb['pk_new'] = b'new'
+        assert eb.changes().push() is True
+
+    with open_ebooklet(conn, local_path('prune-r'), flag='r') as eb:
+        for k, v in keys.items():
+            assert eb.get(k) == v            # remote untouched by prune
+        assert eb.get('pk_new') == b'new'
