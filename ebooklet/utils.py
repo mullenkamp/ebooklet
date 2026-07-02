@@ -254,24 +254,27 @@ def upload_group(group_id, local_file, remote_session, keys_in_group):
         return None, {}
 
 
-def get_remote_group(group_id, local_file, remote_session):
+## Per-entry header layout inside a packed group object (see pack_group):
+## [key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]
+group_entry_fixed_overhead = 2 + 7 + 4
+
+
+def recover_group_members(group_id, key_infos, local_file, remote_session):
+    """
+    Fallback for when ranged reads into a group object cannot be verified against the
+    remote_index offsets (a corrupted or shifted group object). Downloads the whole
+    self-describing group object and recovers whichever requested members it actually
+    contains, trusting the object's own embedded keys/timestamps rather than the index.
+    Members not present in the object are simply not materialized.
+    """
     resp = remote_session.get_object(str(group_id))
     if resp.status == 200:
-        entries = unpack_group(resp.data)
-        for key, timestamp, value in entries:
-            local_file.set(key, value, timestamp, encode_value=False)
-    elif resp.status == 404:
-        pass
-    else:
-        return resp.error
-
-    return None
-
-
-def get_remote_group_value(group_id, key, offset, length, timestamp_int, local_file, remote_session):
-    resp = remote_session.get_object(str(group_id), range_start=offset, range_end=offset + length - 1)
-    if resp.status in (200, 206):
-        local_file.set(key, resp.data, timestamp_int, encode_value=False)
+        entries = {key: (timestamp, value) for key, timestamp, value in unpack_group(resp.data)}
+        for key, offset, length, timestamp_int in key_infos:
+            entry = entries.get(key)
+            if entry is not None:
+                timestamp, value = entry
+                local_file.set(key, value, timestamp, encode_value=False)
     elif resp.status == 404:
         pass
     else:
@@ -280,23 +283,68 @@ def get_remote_group_value(group_id, key, offset, length, timestamp_int, local_f
 
 
 def get_remote_group_values(group_id, key_infos, local_file, remote_session):
-    """key_infos: list of (key, offset, length, timestamp_int)"""
+    """
+    key_infos: list of (key, offset, length, timestamp_int)
+
+    Each member read is verified against the group object's embedded entry header
+    (the key itself and the value length precede every value in the packed layout)
+    before being trusted - a stale index offset would otherwise silently deliver
+    another entry's bytes. On any verification failure the whole (self-describing)
+    group object is downloaded and parsed instead (recover_group_members).
+    """
     sorted_infos = sorted(key_infos, key=lambda x: x[1])
-    range_start = sorted_infos[0][1]
+
+    ## Start the ranged read at the first member's entry header so every requested
+    ## member's header is inside the fetched range.
+    first_key, first_offset, _, _ = sorted_infos[0]
+    range_start = first_offset - group_entry_fixed_overhead - len(first_key.encode())
     last = sorted_infos[-1]
     range_end = last[1] + last[2] - 1
 
+    if range_start < 0:
+        logger.warning(f"Group {group_id}: stored index offsets are malformed; recovering members from the full group object.")
+        return recover_group_members(group_id, key_infos, local_file, remote_session)
+
     resp = remote_session.get_object(str(group_id), range_start=range_start, range_end=range_end)
     if resp.status in (200, 206):
+        data = resp.data
+        verified = []
         for key, offset, length, timestamp_int in sorted_infos:
+            key_bytes = key.encode()
+            header_start = offset - group_entry_fixed_overhead - len(key_bytes) - range_start
             rel_offset = offset - range_start
-            value = resp.data[rel_offset:rel_offset + length]
+
+            ok = header_start >= 0 and rel_offset + length <= len(data)
+            if ok:
+                key_len = struct.unpack_from('>H', data, header_start)[0]
+                ok = (key_len == len(key_bytes)
+                      and data[header_start + 2:header_start + 2 + key_len] == key_bytes
+                      and struct.unpack_from('>I', data, header_start + 2 + key_len + 7)[0] == length)
+            if not ok:
+                verified = None
+                break
+            verified.append((key, data[rel_offset:rel_offset + length], timestamp_int))
+
+        if verified is None:
+            logger.warning(f"Group {group_id}: stored index offsets do not match the group object layout (corrupted or shifted object); recovering members from the full group object.")
+            return recover_group_members(group_id, key_infos, local_file, remote_session)
+
+        for key, value, timestamp_int in verified:
             local_file.set(key, value, timestamp_int, encode_value=False)
     elif resp.status == 404:
         pass
+    elif resp.status == 416:
+        ## Requested range extends past the object's end - the object shrank
+        ## relative to the index. Recover whatever actually exists.
+        logger.warning(f"Group {group_id}: stored index offsets extend past the group object; recovering members from the full group object.")
+        return recover_group_members(group_id, key_infos, local_file, remote_session)
     else:
         return resp.error
     return None
+
+
+def get_remote_group_value(group_id, key, offset, length, timestamp_int, local_file, remote_session):
+    return get_remote_group_values(group_id, [(key, offset, length, timestamp_int)], local_file, remote_session)
 
 
 def check_local_vs_remote(local_file, remote_time_bytes, key):
@@ -443,12 +491,76 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
             for key in deletes:
                 affected_group_ids.add(key_to_group_id(key, num_groups))
 
-            ## Build full key lists per affected group from local_file
-            group_keys = {gid: [] for gid in affected_group_ids}
+            ## Build FULL key lists per affected group: the union of locally-present
+            ## keys and remote-index keys. A group object is completely replaced on
+            ## upload, so every current member must be packed - not just the keys
+            ## that happen to be materialized in the local file.
+            group_key_sets = {gid: set() for gid in affected_group_ids}
             for key in local_file.keys():
+                if key == metadata_key_str:
+                    continue
                 gid = key_to_group_id(key, num_groups)
-                if gid in group_keys:
-                    group_keys[gid].append(key)
+                if gid in group_key_sets:
+                    group_key_sets[gid].add(key)
+
+            ## Members whose local value is missing or older than the remote must be
+            ## pulled down before their group can be repacked (one ranged read per group).
+            groups_to_download = {}
+            pull_count = 0
+            pull_bytes = 0
+            ## NOTE: iterate items() in a single pass - booklet iterators hold the
+            ## booklet's thread lock for their whole lifetime, so calling get() on
+            ## remote_index while iterating remote_index.keys() would self-deadlock.
+            for key, remote_val in remote_index.items():
+                if key == metadata_key_str or key in deletes:
+                    continue
+                gid = key_to_group_id(key, num_groups)
+                if gid not in group_key_sets:
+                    continue
+                group_key_sets[gid].add(key)
+                if remote_val and check_local_vs_remote(local_file, remote_val[:7], key):
+                    if local_file.get_timestamp(key) is not None:
+                        logger.warning(f"Push is replacing the locally-stored value of '{key}' with the newer remote value before repacking its group - any unpushed local modification to it is discarded (its local timestamp is older than the remote's).")
+                    offset = bytes_to_int(remote_val[7:11])
+                    length = bytes_to_int(remote_val[11:15])
+                    timestamp_int = bytes_to_int(remote_val[:7])
+                    if length > 0:
+                        groups_to_download.setdefault(gid, []).append((key, offset, length, timestamp_int))
+                        pull_count += 1
+                        pull_bytes += length
+
+            if groups_to_download:
+                logger.info(f"Pulling {pull_count} group member value(s) (~{pull_bytes} bytes) from {len(groups_to_download)} group(s) so the groups can be repacked in full.")
+                with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
+                    pull_futures = {executor.submit(get_remote_group_values, gid, key_infos, local_file, remote_session): gid for gid, key_infos in groups_to_download.items()}
+                    for future in as_completed(pull_futures):
+                        gid = pull_futures[future]
+                        error = future.result()
+                        if error is not None:
+                            ## Never upload a partially-materialized group - leave the
+                            ## old remote group object intact and report the failure.
+                            failures[gid] = error
+                            group_key_sets.pop(gid, None)
+
+            ## Any member that still has no local value lost its remote bytes at some
+            ## earlier point (e.g. a partial push from a version < 0.8.4). Repack the
+            ## group without it and remove the dangling index entry.
+            group_keys = {}
+            for gid, keys_set in group_key_sets.items():
+                keys_in_group = []
+                lost_keys = []
+                for key in keys_set:
+                    if local_file.get_timestamp(key) is None:
+                        lost_keys.append(key)
+                    else:
+                        keys_in_group.append(key)
+                if lost_keys:
+                    logger.warning(f"Group {gid}: dropping {len(lost_keys)} key(s) whose remote bytes no longer exist (likely a partial push from a version < 0.8.4): {sorted(lost_keys)}")
+                    for key in lost_keys:
+                        if key in remote_index:
+                            del remote_index[key]
+                    updated = True
+                group_keys[gid] = keys_in_group
 
             with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
                 futures = {}
@@ -486,12 +598,21 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                         else:
                             failures[identifier] = error
 
-            ## Deletions are handled by group re-packing (deleted keys excluded)
-            ## Remove deleted keys from remote_index
+            ## Deletions are handled by group re-packing (deleted keys excluded).
+            ## Only clear deletes whose group was successfully repacked and uploaded:
+            ## keeping a failed group's deletes in the set marks that group as
+            ## affected again on the next push, so its object is eventually repacked
+            ## (otherwise the deleted keys' bytes would stay orphaned in S3 forever).
+            failed_gids = {gid for gid in failures if isinstance(gid, int)}
+            retained_deletes = set()
             for key in deletes:
+                if key_to_group_id(key, num_groups) in failed_gids:
+                    retained_deletes.add(key)
+                    continue
                 if key in remote_index:
                     del remote_index[key]
             deletes.clear()
+            deletes.update(retained_deletes)
 
         else:
             ## Per-key upload path (legacy)
@@ -516,7 +637,10 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
     ## Upload the remote_index file
     remote_index.sync()
 
-    if updated or force_push or (deletes and num_groups is None):
+    ## Also write the db object when the remote does not exist yet (uuid is None) or
+    ## the remote was wiped (flag 'n'), so that creating/replacing an EMPTY database
+    ## still materializes the remote instead of being a silent no-op.
+    if updated or force_push or (deletes and num_groups is None) or flag == 'n' or remote_session.uuid is None:
         time_int_us = booklet.utils.make_timestamp_int()
 
         ## Get main file init bytes

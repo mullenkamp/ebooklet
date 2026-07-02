@@ -46,6 +46,13 @@ class Change:
         self._ebooklet.sync()
 
         ## update the remote timestamp
+        ## NOTE (known defect, tracked in envlib OPEN_WORK): this refreshes only the
+        ## timestamp, so a session created before the remote existed keeps uuid=None
+        ## and never pulls the index (stranded). A full _load_db_metadata() here is
+        ## not enough either: rewriting the index file of a LIVE session self-conflicts
+        ## with the session's own file lock, and the open handle would not see the new
+        ## content. A proper pull() repair needs index-handle cycling. Workaround:
+        ## reopen the session to pick up remote changes.
         self._ebooklet._remote_session.get_timestamp()
 
         ## Determine if a change has occurred
@@ -184,6 +191,14 @@ class EVariableLengthValue(MutableMapping):
                     )
                 raise TimeoutError(msg)
             self.writable = True
+
+            ## Re-read the remote db metadata now that the lock is held: another
+            ## writer may have created or updated the remote while this writer was
+            ## waiting on the lock, and the uuid/timestamp/init_bytes/num_groups
+            ## cached at session creation would otherwise be stale (a writer with a
+            ## stale uuid=None would skip the remote index pull and clobber the
+            ## other writer's push).
+            remote_session._load_db_metadata()
         else:
             lock = None
             self.writable = False
@@ -203,6 +218,11 @@ class EVariableLengthValue(MutableMapping):
             remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
 
         ## Resolve num_groups: remote metadata > user param
+        ## NOTE: for flag 'n' this silently ignores the user's num_groups when the
+        ## old remote still exists - but the 'n' contract keeps the old remote
+        ## readable until push, and those reads need the OLD grouping. Changing the
+        ## grouping on replace needs a dual-regime design (tracked in envlib
+        ## OPEN_WORK).
         if remote_session.num_groups is not None:
             resolved_num_groups = remote_session.num_groups
         else:
