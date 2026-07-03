@@ -23,9 +23,9 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  "s3func>=0.8.5",
+  "s3func>=0.9.0",
   'urllib3>=2',
-  "booklet>=0.12.3",
+  "booklet>=0.12.4",
 ]
 
 [dependency-groups]
