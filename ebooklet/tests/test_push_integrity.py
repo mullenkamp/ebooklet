@@ -18,6 +18,7 @@ import io
 import os
 import pathlib
 import shutil
+import warnings
 
 import pytest
 import uuid6 as uuid
@@ -107,12 +108,26 @@ def read_all(conn, keys):
 @pytest.fixture(scope="session", autouse=True)
 def cleanup(request):
     def remove_test_data():
+        ## Loud, with one retry AND verify-by-listing. Deleting can fail without
+        ## raising (s3func delete_objects discards the multi-delete POST response),
+        ## and a killed run (e.g. 2026-07-03: a suite SIGTERM'd by a harness timeout
+        ## leaked 17 remotes) never reaches teardown at all - so only an
+        ## after-the-fact listing actually proves the remote is gone.
         for conn in _conns:
-            try:
-                with conn.open('w') as s3open:
-                    s3open.delete_remote()
-            except Exception:
-                pass
+            for attempt in (1, 2):
+                try:
+                    with conn.open('w') as s3open:
+                        s3open.delete_remote()
+                        ## list covers db_key/* children; get_uuid covers the bare index object
+                        remaining = list(s3open.list_objects().iter_objects())
+                        gone = not remaining and s3open.get_uuid() is None
+                    if gone:
+                        break
+                    if attempt == 2:
+                        print(f'cleanup: {conn.db_key} not fully deleted ({len(remaining)} child objects remain)')
+                except Exception as e:
+                    if attempt == 2:
+                        print(f'cleanup: delete_remote failed for {conn.db_key}: {type(e).__name__}: {e}')
         for p in _paths:
             for f in p.parent.glob(p.name + '*'):
                 f.unlink(missing_ok=True)
@@ -451,3 +466,81 @@ def test_prune_local_eviction_contract():
         for k, v in keys.items():
             assert eb.get(k) == v            # remote untouched by prune
         assert eb.get('pk_new') == b'new'
+
+
+#################################################
+### num_groups on unpushed reopens (0.9.1)
+# Nothing local records the creation-time num_groups choice (deliberate: no extra
+# sidecar files). Reopening a created-but-not-yet-pushed database without
+# re-passing num_groups warns loudly - the first push would go per-key.
+
+WARN_MATCH = 'has not been pushed to the remote yet and num_groups was not provided'
+
+
+def _remote_basenames(conn):
+    with conn.open('w') as s3open:
+        return sorted(obj['key'].split('/')[-1] for obj in s3open.list_objects().iter_objects())
+
+
+def test_num_groups_unpushed_reopen_warns():
+    """A bare 'w' reopen before the first push can't know the creation grouping -
+    it must warn (pre-0.9.1 it silently resolved to per-key), and the fresh
+    create itself must NOT warn."""
+    conn = make_conn('ngwarn')
+    p = local_path('ng-warn-writer')
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')  # fresh create: no warning expected
+        with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+            eb['key000'] = b'v0'
+            # close WITHOUT pushing
+
+    with pytest.warns(UserWarning, match=WARN_MATCH):
+        with open_ebooklet(conn, p, flag='w') as eb:
+            assert eb._num_groups is None  # documented fallback: per-key
+
+    # re-passing num_groups is the supported path - no warning
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
+            assert eb._num_groups == num_groups
+
+
+def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
+    """Re-passing num_groups on the first-push reopen keeps the grouped layout;
+    once pushed, bare reopens read num_groups from remote metadata (no warning)."""
+    conn = make_conn('ngrepass')
+    p = local_path('ng-repass-writer')
+
+    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+        eb['key000'] = b'v0'
+        eb['key001'] = b'v1'
+
+    with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
+        assert eb._num_groups == num_groups
+        assert eb.changes().push() is True
+
+    names = _remote_basenames(conn)
+    assert 'key000' not in names                  # no raw per-key objects
+    assert any(name.isdigit() for name in names)  # group objects present
+
+    vals, _ = read_all(conn, ['key000', 'key001'])
+    assert vals == {'key000': b'v0', 'key001': b'v1'}
+
+    # remote initialized -> tier 1 wins, bare reopen is silent and grouped
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with open_ebooklet(conn, p, flag='w') as eb:
+            assert eb._num_groups == num_groups
+
+
+def test_num_groups_unpushed_reopen_warns_rcg():
+    """RemoteConnGroup flows through the same _init_common - same warning."""
+    conn = make_conn('ngwarnrcg')
+    p = local_path('ng-warn-rcg')
+    with open_rcg(conn, p, flag='n', num_groups=num_groups) as rcg:
+        pass
+
+    with pytest.warns(UserWarning, match=WARN_MATCH):
+        with open_rcg(conn, p, flag='w') as rcg:
+            pass

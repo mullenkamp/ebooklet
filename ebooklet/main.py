@@ -8,6 +8,7 @@ from typing import Union
 import os
 import pathlib
 import re
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
 import orjson
@@ -269,6 +270,7 @@ class EVariableLengthValue(MutableMapping):
                 )
 
             ## Init the local file
+            local_file_existed = local_file_path.exists()
             local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
             remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
@@ -281,6 +283,20 @@ class EVariableLengthValue(MutableMapping):
                 resolved_num_groups = remote_session.num_groups
             else:
                 resolved_num_groups = num_groups
+
+            ## Nothing local records the creation-time num_groups choice (a deliberate
+            ## trade-off to avoid another sidecar file), so reopening a
+            ## created-but-not-yet-pushed database without re-passing num_groups would
+            ## silently make the first push per-key. Warn loudly instead of guessing.
+            if (flag in ('w', 'c') and local_file_existed and remote_session.uuid is None
+                    and num_groups is None):
+                warnings.warn(
+                    'This database has not been pushed to the remote yet and num_groups was not '
+                    'provided - the first push will use per-key storage. If the database was '
+                    'created with grouped storage, re-open it passing the same num_groups.',
+                    UserWarning,
+                    stacklevel=4,  # _init_common -> subclass __init__ -> open_ebooklet/open_rcg -> user code
+                )
         except BaseException:
             if remote_index is not None:
                 try:
@@ -843,7 +859,8 @@ def open_ebooklet(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
+        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
         Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
 
     lock_timeout : int
@@ -925,7 +942,8 @@ def open_rcg(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
+        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
         Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
 
     lock_timeout : int

@@ -74,7 +74,8 @@ db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
 - Single-key reads use S3 byte-range GET requests to fetch only the needed bytes
 - Multi-key reads from the same group use a single merged byte-range GET
 - On push, entire affected groups are re-packed and uploaded
-- For existing databases, `num_groups` is read from S3 metadata (user-provided value is ignored)
+- For databases already pushed to the remote, `num_groups` is read from S3 metadata (user-provided value is ignored)
+- For a database created locally but not yet pushed, the creation-time choice is not recorded anywhere — re-pass the same `num_groups` when reopening before the first push (reopening without it emits a `UserWarning`, and the first push would fall back to per-key storage)
 
 Use grouped storage when you have many small values — it reduces the number of S3 objects and can improve read performance through byte-range requests.
 
