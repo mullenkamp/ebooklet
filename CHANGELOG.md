@@ -4,7 +4,51 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.9.3 (2026-07-09)
+
+### Fixed
+- **A 404 for an object the remote index claims is no longer silently treated as
+  absence.** Every value fetch is driven by the index, so a missing backing object
+  means either a legitimately-deleted key seen through a stale reader index, or a
+  real store inconsistency. Previously both were swallowed (`pass` on 404) and
+  surfaced later as a confusing KeyError or silently-skipped `map()` keys far from
+  the cause (observed in CI during a B2 service incident). Now ebooklet
+  **re-checks, then gets loud**: the index is re-pulled once per operation; keys the
+  fresh index no longer claims are treated as cleanly absent (with stale local
+  values purged, including metadata, so nothing resurrects); keys it still claims
+  raise the new **`RemoteIntegrityError`**.
+
+### Added
+- `RemoteIntegrityError` (exported): raised for confirmed remote-integrity faults
+  (index claims a key, backing object missing after a fresh re-pull). It subclasses
+  `urllib3.exceptions.HTTPError`, so existing handlers keep working — but callers
+  with offline fallbacks should catch it FIRST and treat it as an error, not as
+  connectivity trouble.
+- An internal index lock: the index-handle swap performed by `changes().pull()` (and
+  now by the automatic re-check) is serialized against point reads and `load_items`,
+  so a re-check in one thread can no longer close the index under a concurrent
+  reader. Iteration (`keys()`) concurrent with a pull on the same instance remains
+  unsynchronized (pre-existing, documented).
+
+### Changed — push over a missing group object now fails instead of self-healing
+Previously, if a group object 404'd during a push's pull-phase, the push silently
+dropped the affected members (the "lost keys" recovery for pre-0.8.4 partial-push
+remnants) and **succeeded**. Now such a push returns a **partial-failure dict**
+naming the affected keys and leaves the changelog intact for retry.
+
+**Recovery:** if the reported keys are genuinely gone (e.g. old partial-push
+remnants), `del` each reported key and push again; if the object should exist,
+restore it (or re-set the keys' values) and push again.
+
+### Changed (other)
+- Requires s3func >= 0.9.2 (transient 5xx/429 responses are now retried with
+  backoff at the HTTP layer, so brief provider incidents are absorbed before any of
+  the above machinery is reached).
+- `requirements.txt` pins refreshed to match `pyproject.toml`.
+
 ## 0.9.2 (2026-07-09)
+
+Requires s3func >= 0.9.1 and booklet >= 0.12.6.
 
 ### Changed
 - Requires booklet >= 0.12.6, which fixes the iterator deadlock (`get()` inside a

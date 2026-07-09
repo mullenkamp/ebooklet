@@ -5,9 +5,11 @@
 """
 from collections.abc import Mapping, MutableMapping
 from typing import Union
+import logging
 import os
 import pathlib
 import re
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
@@ -20,12 +22,37 @@ import urllib3
 from . import utils
 from . import remote
 
+logger = logging.getLogger(__name__)
+
 
 #######################################################
 ### Classes
 
 
 _MISSING = object()
+
+
+class RemoteIntegrityError(urllib3.exceptions.HTTPError):
+    """
+    The remote store contradicts its own index: the index claims key(s) whose
+    backing object is missing (404), and a fresh index re-pull confirmed the
+    claim. Distinct from connectivity errors so callers can tell "the remote
+    is inconsistent" apart from "the remote is unreachable"; subclasses
+    urllib3's HTTPError so existing handlers keep working.
+    """
+
+
+def _failure_exception(failure):
+    """
+    Choose the exception class for a surfaced fetch failure: confirmed
+    integrity failures (missing-object markers) get RemoteIntegrityError so
+    callers can discriminate; everything else stays a plain HTTPError.
+    """
+    if isinstance(failure, utils.MissingRemoteObject):
+        return RemoteIntegrityError(failure)
+    if isinstance(failure, dict) and any(isinstance(v, utils.MissingRemoteObject) for v in failure.values()):
+        return RemoteIntegrityError(failure)
+    return urllib3.exceptions.HTTPError(failure)
 
 ## RCG entry keys become S3 object-key suffixes in per-key mode; characters outside
 ## this set are known to break request signing (e.g. '!' fails B2 signature validation).
@@ -51,50 +78,11 @@ class Change:
         """
         Refresh this session's view of the remote index. Values refresh lazily per
         key on the next access (the read path compares local vs index timestamps).
-        Not safe to call concurrently with other operations on the same instance.
+        The index handle swap is serialized against point reads and load_items via
+        an internal lock, but iteration (keys()) concurrent with a pull on the same
+        instance may still observe a closed index.
         """
-        eb = self._ebooklet
-        eb.sync()
-
-        ## Reload the full remote db metadata - not just the timestamp. A session
-        ## created before the remote existed has uuid=None cached; refreshing only
-        ## the timestamp would leave check_local_remote_sync permanently skipping
-        ## the index pull (a stranded reader).
-        eb._remote_session._load_db_metadata()
-
-        ## The session's group-mode view may predate the remote's creation (e.g. a
-        ## reader opened before the first push) - adopt the remote's num_groups so
-        ## subsequent reads use the right storage layout.
-        if eb._remote_session.num_groups is not None:
-            eb._num_groups = eb._remote_session.num_groups
-
-        ## Determine if a change has occurred
-        overwrite_remote_index = utils.check_local_remote_sync(eb._local_file, eb._remote_session, eb._flag)
-        if not overwrite_remote_index:
-            return
-
-        ## Fetch FIRST, to a temp path: a failed download must leave the live
-        ## session untouched (a close-then-fetch order would strand the session
-        ## with a closed index handle).
-        tmp_path = eb._remote_index_path.parent.joinpath(eb._remote_index_path.name + '.tmp')
-        fetched = utils.fetch_remote_index(tmp_path, eb._remote_session)
-        if not fetched:
-            return
-
-        ## Swap the handle: close -> atomic replace -> reopen -> re-register the
-        ## finalizer with the new index object (the old one is closed).
-        eb._remote_index.close()
-        try:
-            os.replace(tmp_path, eb._remote_index_path)
-        finally:
-            new_index = utils.open_remote_index(eb._remote_index_path, eb._flag, eb._n_buckets, eb._buffer_size)
-            eb._remote_index = new_index
-
-        eb._finalizer.detach()
-        eb._finalizer = weakref.finalize(eb, utils.ebooklet_finalizer, eb._local_file, new_index, eb._remote_session, eb.lock)
-
-        ## Record the freshness of this view so an immediate second pull() is a no-op.
-        eb._local_file._set_file_timestamp(eb._remote_session.timestamp)
+        self._ebooklet._pull_remote_index()
 
 
     def update(self):
@@ -322,6 +310,12 @@ class EVariableLengthValue(MutableMapping):
         self._local_file = local_file
         self._remote_index_path = remote_index_path
         self._remote_index = remote_index
+        ## Serializes the remote-index handle swap (_pull_remote_index closes and
+        ## reopens the index booklet) against point reads and load_items - without
+        ## it, a re-check triggered inside one thread's get() would close the index
+        ## under a concurrent reader. RLock: _resolve_missing holds it while
+        ## calling _pull_remote_index.
+        self._index_lock = threading.RLock()
         self._deletes = set()
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
@@ -352,7 +346,7 @@ class EVariableLengthValue(MutableMapping):
         """
         failure = self._load_item(booklet.utils.metadata_key_bytes.decode())
         if failure:
-            raise urllib3.exceptions.HTTPError(failure)
+            raise _failure_exception(failure)
 
         self._local_file.sync()
 
@@ -381,7 +375,7 @@ class EVariableLengthValue(MutableMapping):
         failure_dict = self.load_items()
 
         if failure_dict:
-            raise urllib3.exceptions.HTTPError(failure_dict)
+            raise _failure_exception(failure_dict)
 
         return self._local_file.items()
 
@@ -393,7 +387,7 @@ class EVariableLengthValue(MutableMapping):
         failure_dict = self.load_items()
 
         if failure_dict:
-            raise urllib3.exceptions.HTTPError(failure_dict)
+            raise _failure_exception(failure_dict)
 
         return self._local_file.values()
 
@@ -404,7 +398,7 @@ class EVariableLengthValue(MutableMapping):
         failure_dict = self.load_items()
 
         if failure_dict:
-            raise urllib3.exceptions.HTTPError(failure_dict)
+            raise _failure_exception(failure_dict)
 
         return self._local_file.timestamps(include_value=include_value)
 
@@ -415,7 +409,7 @@ class EVariableLengthValue(MutableMapping):
         """
         failure = self._load_item(key)
         if failure:
-            raise urllib3.exceptions.HTTPError(failure)
+            raise _failure_exception(failure)
 
         return self._local_file.get_timestamp(key, include_value=include_value, decode_value=decode_value, default=default)
 
@@ -467,7 +461,7 @@ class EVariableLengthValue(MutableMapping):
         """
         failure = self._load_item(key)
         if failure:
-            raise urllib3.exceptions.HTTPError(failure)
+            raise _failure_exception(failure)
 
         return self._local_file.get(key, default=default)
 
@@ -520,7 +514,7 @@ class EVariableLengthValue(MutableMapping):
         failure_dict = self.load_items(keys)
 
         if failure_dict:
-            raise urllib3.exceptions.HTTPError(failure_dict)
+            raise _failure_exception(failure_dict)
 
         for key in keys:
             output = self._local_file.get(key, default=default)
@@ -535,37 +529,41 @@ class EVariableLengthValue(MutableMapping):
         failure_dict = {}
 
         with ThreadPoolExecutor(max_workers=self._remote_session.threads) as executor:
-            if keys is None:
-                items_iter = self._remote_index.items()
-            else:
-                items_iter = ((k, self._remote_index.get(k)) for k in keys)
+            ## The index-iteration phase holds _index_lock so a re-check in a
+            ## concurrent thread cannot swap the index handle mid-scan. The
+            ## fetch workers never touch the index (only local_file + session).
+            with self._index_lock:
+                if keys is None:
+                    items_iter = self._remote_index.items()
+                else:
+                    items_iter = ((k, self._remote_index.get(k)) for k in keys)
 
-            if self._num_groups is not None:
-                groups_to_download = {}
-                for key, remote_val in items_iter:
-                    remote_time_bytes = remote_val[:7] if remote_val else None
-                    check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                    if check:
-                        if key == utils.metadata_key_str:
+                if self._num_groups is not None:
+                    groups_to_download = {}
+                    for key, remote_val in items_iter:
+                        remote_time_bytes = remote_val[:7] if remote_val else None
+                        check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
+                        if check:
+                            if key == utils.metadata_key_str:
+                                f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                                futures[f] = key
+                            else:
+                                group_id = utils.key_to_group_id(key, self._num_groups)
+                                offset = utils.bytes_to_int(remote_val[7:11])
+                                length = utils.bytes_to_int(remote_val[11:15])
+                                timestamp_int = utils.bytes_to_int(remote_val[:7])
+                                groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
+
+                    for group_id, key_infos in groups_to_download.items():
+                        f = executor.submit(utils.get_remote_group_values, group_id, key_infos, self._local_file, self._remote_session)
+                        futures[f] = f'_group_{group_id}'
+                else:
+                    for key, remote_val in items_iter:
+                        remote_time_bytes = remote_val[:7] if remote_val else None
+                        check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
+                        if check:
                             f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                             futures[f] = key
-                        else:
-                            group_id = utils.key_to_group_id(key, self._num_groups)
-                            offset = utils.bytes_to_int(remote_val[7:11])
-                            length = utils.bytes_to_int(remote_val[11:15])
-                            timestamp_int = utils.bytes_to_int(remote_val[:7])
-                            groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
-
-                for group_id, key_infos in groups_to_download.items():
-                    f = executor.submit(utils.get_remote_group_values, group_id, key_infos, self._local_file, self._remote_session)
-                    futures[f] = f'_group_{group_id}'
-            else:
-                for key, remote_val in items_iter:
-                    remote_time_bytes = remote_val[:7] if remote_val else None
-                    check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                    if check:
-                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                        futures[f] = key
 
             for f in as_completed(futures):
                 key = futures[f]
@@ -573,14 +571,137 @@ class EVariableLengthValue(MutableMapping):
                 if error is not None:
                     failure_dict[key] = error
 
+        ## Resolve missing-object markers ONCE per operation, after the pool has
+        ## fully drained (the re-check protocol swaps the index handle - it must
+        ## never run per-future).
+        missing = {fk: e for fk, e in failure_dict.items() if isinstance(e, utils.MissingRemoteObject)}
+        if missing:
+            for fk, resolved in self._resolve_missing(missing).items():
+                if resolved is None:
+                    del failure_dict[fk]
+                else:
+                    failure_dict[fk] = resolved
+
         return failure_dict
+
+
+    def _pull_remote_index(self):
+        """
+        Refresh this session's view of the remote index (the body extracted from
+        Change.pull; Change.pull delegates here). Holds _index_lock across the
+        handle swap so point reads and load_items never observe a closed index.
+        """
+        with self._index_lock:
+            self.sync()
+
+            ## Reload the full remote db metadata - not just the timestamp. A session
+            ## created before the remote existed has uuid=None cached; refreshing only
+            ## the timestamp would leave check_local_remote_sync permanently skipping
+            ## the index pull (a stranded reader).
+            self._remote_session._load_db_metadata()
+
+            ## The session's group-mode view may predate the remote's creation (e.g. a
+            ## reader opened before the first push) - adopt the remote's num_groups so
+            ## subsequent reads use the right storage layout.
+            if self._remote_session.num_groups is not None:
+                self._num_groups = self._remote_session.num_groups
+
+            ## Determine if a change has occurred
+            overwrite_remote_index = utils.check_local_remote_sync(self._local_file, self._remote_session, self._flag)
+            if not overwrite_remote_index:
+                return
+
+            ## Fetch FIRST, to a temp path: a failed download must leave the live
+            ## session untouched (a close-then-fetch order would strand the session
+            ## with a closed index handle).
+            tmp_path = self._remote_index_path.parent.joinpath(self._remote_index_path.name + '.tmp')
+            fetched = utils.fetch_remote_index(tmp_path, self._remote_session)
+            if not fetched:
+                return
+
+            ## Swap the handle: close -> atomic replace -> reopen -> re-register the
+            ## finalizer with the new index object (the old one is closed).
+            self._remote_index.close()
+            try:
+                os.replace(tmp_path, self._remote_index_path)
+            finally:
+                new_index = utils.open_remote_index(self._remote_index_path, self._flag, self._n_buckets, self._buffer_size)
+                self._remote_index = new_index
+
+            self._finalizer.detach()
+            self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, new_index, self._remote_session, self.lock)
+
+            ## Record the freshness of this view so an immediate second pull() is a
+            ## no-op. NOTE: this stamp must stay AFTER the fetch gate above - hoisting
+            ## it would let a no-op re-check mask a later real index change.
+            self._local_file._set_file_timestamp(self._remote_session.timestamp)
+
+
+    def _resolve_missing(self, missing):
+        """
+        Re-check-then-loud protocol for MissingRemoteObject markers, ONE index
+        re-pull for the whole batch. missing is {failure_key: marker}; returns
+        {failure_key: narrowed_marker_or_None}.
+
+        A marker means the index claimed key(s) whose backing object 404'd -
+        either a legitimately-deleted key seen through a stale index, or a real
+        integrity fault. Re-pulling the index disambiguates: keys the FRESH
+        index no longer claims were legitimately deleted (treated as absent,
+        with local cleanup so stale materialized values cannot resurrect);
+        keys it still claims are confirmed integrity failures (kept, loud).
+
+        Writers hold the S3 lock for their whole session, so no concurrent
+        deleter can exist for them: their re-pull is a no-op (remote timestamp
+        unchanged) -> still-claims -> loud, which is the intended behavior.
+
+        Accepted residual: a reader re-checking during a writer's mid-push
+        window (an emptied group object already deleted, the new db object not
+        yet uploaded) re-pulls the OLD index and reports a loud failure for
+        what is really a transient race.
+        """
+        with self._index_lock:
+            try:
+                self._pull_remote_index()
+            except BaseException:
+                all_keys = sorted({k for m in missing.values() for k in m.keys})
+                logger.warning(
+                    f'The index re-pull while investigating missing remote object(s) claimed by '
+                    f'the index for key(s) {all_keys} itself failed; re-raising the pull error.'
+                )
+                raise
+
+            out = {}
+            for fkey, marker in missing.items():
+                still_claimed = [k for k in marker.keys if self._remote_index.get(k) is not None]
+                if still_claimed:
+                    marker.keys = still_claimed
+                    logger.warning(repr(marker))
+                    out[fkey] = marker
+                else:
+                    ## Legitimate deletion: clean up any stale materialized local
+                    ## values so the key does not resurrect from the local file.
+                    for k in marker.keys:
+                        if k == utils.metadata_key_str:
+                            ## booklet has no metadata unset; overwrite with null so
+                            ## get_metadata() returns None (a raw skip would serve
+                            ## stale metadata after a legitimate remote deletion).
+                            self._local_file.set_metadata(None)
+                        elif k in self._local_file:
+                            del self._local_file[k]
+                    logger.info(
+                        f"remote object '{marker.s3_key}' was deleted remotely; treating key(s) "
+                        f'{marker.keys} as absent after refreshing the index'
+                    )
+                    out[fkey] = None
+            return out
 
 
     def _load_item(self, key):
         """
 
         """
-        remote_val = self._remote_index.get(key)
+        with self._index_lock:
+            remote_val = self._remote_index.get(key)
         remote_time_bytes = remote_val[:7] if remote_val else None
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
@@ -593,6 +714,9 @@ class EVariableLengthValue(MutableMapping):
                 failure = utils.get_remote_group_value(group_id, key, offset, length, timestamp_int, self._local_file, self._remote_session)
             else:
                 failure = utils.get_remote_value(self._local_file, key, self._remote_session)
+
+            if isinstance(failure, utils.MissingRemoteObject):
+                failure = self._resolve_missing({key: failure})[key]
             return failure
         else:
             return None
@@ -709,7 +833,7 @@ class EVariableLengthValue(MutableMapping):
 
         failure_dict = self.load_items(keys)
         if failure_dict:
-            raise urllib3.exceptions.HTTPError(failure_dict)
+            raise _failure_exception(failure_dict)
 
         yield from self._local_file.map(func, keys=keys, n_workers=n_workers)
 

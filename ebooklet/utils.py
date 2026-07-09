@@ -240,6 +240,30 @@ def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
         return booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
 
 
+class MissingRemoteObject:
+    """
+    Truthy failure marker: the remote index claims key(s) whose backing S3
+    object returned 404. Every value fetch is gated on the index claiming the
+    key (check_local_vs_remote), so a 404 here always means the store
+    contradicts its own index - either a legitimately-deleted key seen through
+    a stale reader index, or a real integrity fault. main.py's re-check
+    protocol (_resolve_missing) disambiguates the two by re-pulling the index.
+
+    Deliberately truthy (no __bool__/__len__) and non-None so it passes both
+    failure gates: the point-read `if failure:` and load_items' `is not None`.
+    """
+    __slots__ = ('s3_key', 'keys')
+
+    def __init__(self, s3_key: str, keys: list):
+        self.s3_key = s3_key   # the S3 object key that 404'd (group id str, per-key key, or '_metadata')
+        self.keys = keys       # the ebooklet keys the index claims live in that object
+
+    def __repr__(self):
+        return (f"remote object '{self.s3_key}' is missing but the remote index still claims "
+                f"key(s) {self.keys} (integrity failure); delete these keys and re-push, "
+                f"or restore the object")
+
+
 def get_remote_value(local_file, key, remote_session):
     """
 
@@ -255,7 +279,9 @@ def get_remote_value(local_file, key, remote_session):
         else:
             local_file.set(key, resp.data, timestamp, encode_value=False)
     elif resp.status == 404:
-        pass
+        ## This fetch only runs when the remote index claims the key, so a 404
+        ## is never legitimate absence - surface it for the re-check protocol.
+        return MissingRemoteObject(s3_key, [key])
     else:
         return resp.error
 
@@ -304,7 +330,9 @@ def recover_group_members(group_id, key_infos, local_file, remote_session):
                 timestamp, value = entry
                 local_file.set(key, value, timestamp, encode_value=False)
     elif resp.status == 404:
-        pass
+        ## key_infos comes from remote-index entries, so the index claims these
+        ## members - a missing group object is never legitimate absence here.
+        return MissingRemoteObject(str(group_id), [k for k, _o, _l, _t in key_infos])
     else:
         return resp.error
     return None
@@ -360,7 +388,9 @@ def get_remote_group_values(group_id, key_infos, local_file, remote_session):
         for key, value, timestamp_int in verified:
             local_file.set(key, value, timestamp_int, encode_value=False)
     elif resp.status == 404:
-        pass
+        ## sorted_infos comes from remote-index entries, so the index claims
+        ## these members - a missing group object is never legitimate absence.
+        return MissingRemoteObject(str(group_id), [k for k, _o, _l, _t in key_infos])
     elif resp.status == 416:
         ## Requested range extends past the object's end - the object shrank
         ## relative to the index. Recover whatever actually exists.
