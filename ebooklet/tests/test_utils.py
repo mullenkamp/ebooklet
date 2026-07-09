@@ -91,6 +91,29 @@ def test_key_to_group_id_single_group():
     for i in range(50):
         assert utils.key_to_group_id(str(i), 1) == 0
 
+def test_is_prime_small():
+    assert not utils.is_prime_small(0)
+    assert not utils.is_prime_small(1)
+    assert utils.is_prime_small(2)
+    assert utils.is_prime_small(3)
+    assert not utils.is_prime_small(4)
+    assert utils.is_prime_small(5)
+    assert not utils.is_prime_small(9)
+    assert utils.is_prime_small(11)
+    assert utils.is_prime_small(97)
+    assert not utils.is_prime_small(100)
+
+
+def test_next_prime():
+    assert utils.next_prime(1) == 2
+    assert utils.next_prime(2) == 2
+    assert utils.next_prime(3) == 3
+    assert utils.next_prime(4) == 5
+    assert utils.next_prime(10) == 11
+    assert utils.next_prime(11) == 11
+    assert utils.next_prime(100) == 101
+
+
 def test_check_local_vs_remote(tmp_path):
     local_path = tmp_path / "local.blt"
     # Create a local booklet file

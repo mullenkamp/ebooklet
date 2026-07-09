@@ -5,9 +5,13 @@
 """
 from collections.abc import Mapping, MutableMapping
 from typing import Union
+import os
 import pathlib
+import re
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
+import orjson
 import weakref
 from itertools import count
 from collections import deque
@@ -22,6 +26,10 @@ from . import remote
 
 
 _MISSING = object()
+
+## RCG entry keys become S3 object-key suffixes in per-key mode; characters outside
+## this set are known to break request signing (e.g. '!' fails B2 signature validation).
+rcg_key_pattern = re.compile(r'^[A-Za-z0-9._-]+$')
 
 
 class Change:
@@ -41,19 +49,52 @@ class Change:
 
     def pull(self):
         """
-        Update the remote index file to determine if any changes have occurred.
+        Refresh this session's view of the remote index. Values refresh lazily per
+        key on the next access (the read path compares local vs index timestamps).
+        Not safe to call concurrently with other operations on the same instance.
         """
-        self._ebooklet.sync()
+        eb = self._ebooklet
+        eb.sync()
 
-        ## update the remote timestamp
-        self._ebooklet._remote_session.get_timestamp()
+        ## Reload the full remote db metadata - not just the timestamp. A session
+        ## created before the remote existed has uuid=None cached; refreshing only
+        ## the timestamp would leave check_local_remote_sync permanently skipping
+        ## the index pull (a stranded reader).
+        eb._remote_session._load_db_metadata()
+
+        ## The session's group-mode view may predate the remote's creation (e.g. a
+        ## reader opened before the first push) - adopt the remote's num_groups so
+        ## subsequent reads use the right storage layout.
+        if eb._remote_session.num_groups is not None:
+            eb._num_groups = eb._remote_session.num_groups
 
         ## Determine if a change has occurred
-        overwrite_remote_index = utils.check_local_remote_sync(self._ebooklet._local_file, self._ebooklet._remote_session, self._ebooklet._flag)
+        overwrite_remote_index = utils.check_local_remote_sync(eb._local_file, eb._remote_session, eb._flag)
+        if not overwrite_remote_index:
+            return
 
-        ## Pull down the remote index
-        if overwrite_remote_index:
-            utils.get_remote_index_file(self._ebooklet._local_file_path, overwrite_remote_index, self._ebooklet._remote_session, self._ebooklet._flag)
+        ## Fetch FIRST, to a temp path: a failed download must leave the live
+        ## session untouched (a close-then-fetch order would strand the session
+        ## with a closed index handle).
+        tmp_path = eb._remote_index_path.parent.joinpath(eb._remote_index_path.name + '.tmp')
+        fetched = utils.fetch_remote_index(tmp_path, eb._remote_session)
+        if not fetched:
+            return
+
+        ## Swap the handle: close -> atomic replace -> reopen -> re-register the
+        ## finalizer with the new index object (the old one is closed).
+        eb._remote_index.close()
+        try:
+            os.replace(tmp_path, eb._remote_index_path)
+        finally:
+            new_index = utils.open_remote_index(eb._remote_index_path, eb._flag, eb._n_buckets, eb._buffer_size)
+            eb._remote_index = new_index
+
+        eb._finalizer.detach()
+        eb._finalizer = weakref.finalize(eb, utils.ebooklet_finalizer, eb._local_file, new_index, eb._remote_session, eb.lock)
+
+        ## Record the freshness of this view so an immediate second pull() is a no-op.
+        eb._local_file._set_file_timestamp(eb._remote_session.timestamp)
 
 
     def update(self):
@@ -110,6 +151,21 @@ class Change:
         if not self._ebooklet.writable:
             raise ValueError('File is open for read-only.')
 
+        ## flag 'n' replaces the database with THIS session's writes only: purge
+        ## everything else (transparently-read/materialized old keys and old index
+        ## entries) so reads can't resurrect old data into the new database and the
+        ## pushed index carries no dangling references to wiped objects.
+        if self._ebooklet._flag == 'n':
+            written = self._ebooklet._written_keys
+            stale_local = [k for k in self._ebooklet._local_file.keys()
+                           if k != utils.metadata_key_str and k not in written]
+            for k in stale_local:
+                del self._ebooklet._local_file[k]
+            stale_index = [k for k in self._ebooklet._remote_index.keys()
+                           if k != utils.metadata_key_str and k not in written]
+            for k in stale_index:
+                del self._ebooklet._remote_index[k]
+
         self.update()
 
         result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type, self._ebooklet._num_groups)
@@ -142,48 +198,119 @@ class EVariableLengthValue(MutableMapping):
             n_buckets: int=12007,
             buffer_size: int = 2**22,
             num_groups: int = None,
+            lock_timeout: int = 300,
+            force_lock: bool = False,
             ):
         """
 
         """
-        ## Remove the remote database if flag == 'n'
-        if flag == 'n' and remote_session.uuid is not None:
-            remote_session.delete_remote()
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups, lock_timeout, force_lock)
 
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups)
-
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None, lock_timeout=300, force_lock=False):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
         ## Lock the remote if file is opened for write
         if flag != 'r':
             lock = remote_session.create_lock()
-            lock.acquire()
+            if force_lock:
+                lock.break_other_locks()
+            acquired = lock.acquire(timeout=lock_timeout)
+            if not acquired:
+                others = lock.other_locks()
+                if others:
+                    import datetime
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    ages = []
+                    for lock_id, info in others.items():
+                        ts = info.get('upload_timestamp')
+                        if ts:
+                            age = now - ts
+                            ages.append(str(age).split('.')[0])
+                    age_str = ', '.join(ages) if ages else 'unknown'
+                    msg = (
+                        f'Could not acquire write lock within {lock_timeout}s. '
+                        f'Blocked by existing lock(s) held for: {age_str}. '
+                        'If you are sure no other writer is active, re-open with force_lock=True to break stale locks.'
+                    )
+                else:
+                    msg = (
+                        f'Could not acquire write lock within {lock_timeout}s. '
+                        'Re-open with force_lock=True to break stale locks.'
+                    )
+                raise TimeoutError(msg)
             self.writable = True
+
+            ## Re-read the remote db metadata now that the lock is held: another
+            ## writer may have created or updated the remote while this writer was
+            ## waiting on the lock, and the uuid/timestamp/init_bytes/num_groups
+            ## cached at session creation would otherwise be stale (a writer with a
+            ## stale uuid=None would skip the remote index pull and clobber the
+            ## other writer's push).
+            remote_session._load_db_metadata()
         else:
             lock = None
             self.writable = False
 
-        ## Init the local file
-        local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
+        ## Everything between lock acquisition and finalizer registration must
+        ## release the lock on failure - an early raise (e.g. local/remote UUID
+        ## mismatch or a failed index fetch) would otherwise leave the exclusive
+        ## remote lock held until garbage collection finally releases it.
+        local_file = None
+        remote_index = None
+        try:
+            ## flag 'n' guard: the 'n' contract keeps the old remote readable until
+            ## push, and those reads need the OLD grouping - a conflicting
+            ## num_groups cannot be honored.
+            if flag == 'n' and num_groups is not None and remote_session.num_groups is not None and num_groups != remote_session.num_groups:
+                raise ValueError(
+                    f"num_groups={num_groups} conflicts with the existing remote's num_groups={remote_session.num_groups}. "
+                    "flag 'n' keeps the old remote readable until push, which requires the existing grouping. "
+                    "Either omit num_groups to inherit it, or call delete_remote() first to change the grouping."
+                )
 
-        remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
+            ## Init the local file
+            local_file_existed = local_file_path.exists()
+            local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
-        ## Open remote index file
-        if remote_index_path.exists():
-            if flag == 'r':
-                remote_index = booklet.FixedLengthValue(remote_index_path, 'r')
+            remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
+
+            ## Open remote index file
+            remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size)
+
+            ## Resolve num_groups: remote metadata > user param
+            if remote_session.num_groups is not None:
+                resolved_num_groups = remote_session.num_groups
             else:
-                remote_index = booklet.FixedLengthValue(remote_index_path, 'w')
-        else:
-            remote_index = booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
+                resolved_num_groups = num_groups
 
-        ## Resolve num_groups: remote metadata > user param
-        if remote_session.num_groups is not None:
-            resolved_num_groups = remote_session.num_groups
-        else:
-            resolved_num_groups = num_groups
+            ## Nothing local records the creation-time num_groups choice (a deliberate
+            ## trade-off to avoid another sidecar file), so reopening a
+            ## created-but-not-yet-pushed database without re-passing num_groups would
+            ## silently make the first push per-key. Warn loudly instead of guessing.
+            if (flag in ('w', 'c') and local_file_existed and remote_session.uuid is None
+                    and num_groups is None):
+                warnings.warn(
+                    'This database has not been pushed to the remote yet and num_groups was not '
+                    'provided - the first push will use per-key storage. If the database was '
+                    'created with grouped storage, re-open it passing the same num_groups.',
+                    UserWarning,
+                    stacklevel=4,  # _init_common -> subclass __init__ -> open_ebooklet/open_rcg -> user code
+                )
+        except BaseException:
+            if remote_index is not None:
+                try:
+                    remote_index.close()
+                except Exception:
+                    pass
+            if local_file is not None:
+                try:
+                    local_file.close()
+                except Exception:
+                    pass
+            if lock is not None:
+                lock.release()
+            raise
 
         ## Finalizer
         self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
@@ -198,8 +325,14 @@ class EVariableLengthValue(MutableMapping):
         self._deletes = set()
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
+        self._buffer_size = buffer_size
         self.type = ebooklet_type
         self._num_groups = resolved_num_groups
+        ## Keys explicitly written during THIS session (set/__setitem__/update/
+        ## set_timestamp). Used by the flag 'n' push to build the replacement
+        ## database from true writes only - transparently-read (materialized) old
+        ## keys never leak into the new database.
+        self._written_keys = set()
 
 
     def set_metadata(self, data, timestamp=None):
@@ -292,6 +425,7 @@ class EVariableLengthValue(MutableMapping):
         """
         if self.writable:
             self._local_file.set_timestamp(key, timestamp)
+            self._written_keys.add(key)
         else:
             raise ValueError('File is open for read only.')
 
@@ -302,6 +436,7 @@ class EVariableLengthValue(MutableMapping):
         """
         if self.writable:
             self._local_file.set(key, value, timestamp=timestamp, encode_value=encode_value)
+            self._written_keys.add(key)
 
         else:
             raise ValueError('File is open for read only.')
@@ -350,9 +485,21 @@ class EVariableLengthValue(MutableMapping):
 
     def prune(self, timestamp=None):
         """
-        Prunes the old keys and associated values. Returns the number of removed items. The method can also prune remove keys/values older than the timestamp. The user can also reindex the booklet file. False does no reindexing, True increases the n_buckets to a preassigned value, or an int of the n_buckets. True can only be used if the default n_buckets were used at original initialisation.
+        Reclaim LOCAL disk space. Removes overwritten/deleted local entries and,
+        when a timestamp is given, evicts local keys older than it. Returns the
+        number of removed items.
+
+        Contract: prune never touches the remote. Remote index entries survive, so
+        evicted values transparently re-pull on the next access, and pushes repack
+        groups from the remote's full membership. Remote deletion is exclusively
+        the job of `del`/`__delitem__` (+ push).
         """
         if self.writable:
+            ## Normalize to int microseconds here: booklet's prune documents
+            ## int/str/datetime but its prune_file compares raw against int
+            ## timestamps (upstream bug, tracked in envlib OPEN_WORK).
+            if timestamp is not None:
+                timestamp = booklet.utils.make_timestamp_int(timestamp)
             removed = self._local_file.prune(timestamp=timestamp)
             self._n_buckets = self._local_file._n_buckets
 
@@ -474,6 +621,8 @@ class EVariableLengthValue(MutableMapping):
 
             if key in self._local_file:
                 del self._local_file[key]
+
+            self._written_keys.discard(key)
         else:
             raise ValueError('File is open for read only.')
 
@@ -577,52 +726,101 @@ class RemoteConnGroup(EVariableLengthValue):
             n_buckets: int=12007,
             buffer_size: int = 2**22,
             num_groups: int = None,
+            lock_timeout: int = 300,
+            force_lock: bool = False,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups, lock_timeout, force_lock)
 
 
-    def add(self, remote_conn: remote.S3Connection):
+    def add(self, remote_conn: remote.S3Connection, key: str = None, user_meta=None):
         """
-        Add a remote connection to the group.
+        Add or update (upsert) a remote connection entry in the group.
+
+        Parameters
+        ----------
+        remote_conn : S3Connection
+            Connection to the member remote. It must already exist (have been pushed).
+        key : str or None
+            The entry key. Defaults to the member remote's uuid hex. Must match
+            [A-Za-z0-9._-]+ (entry keys become S3 object-key suffixes; other
+            characters are known to break request signing).
+        user_meta : JSON-serializable or None
+            Caller-supplied metadata stored verbatim in the entry (e.g. a
+            catalogue's queryable metadata dict).
+
+        Entry schema (version 1) - treat as a stable contract:
+        {'entry_version': 1,
+         'type': <member ebooklet type>,
+         'timestamp': <member remote's timestamp>,
+         'remote_meta': <snapshot of the member remote's metadata slot>,
+         'user_meta': <the user_meta argument>,
+         'remote_conn': <S3Connection.to_dict() - never contains credentials>}
+        Pre-0.9.0 entries lack 'entry_version' and stored the metadata snapshot
+        under 'user_meta'.
         """
-        if self.writable:
-
-
-            if not isinstance(remote_conn, remote.S3Connection):
-                raise TypeError('remote_conn/value must be a remote.S3Connection')
-
-            ## Get remote_conn metadata
-            with remote_conn.open() as rc:
-                uuid0 = rc.get_uuid()
-                if uuid0 is None:
-                    raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
-
-                uuid_hex = uuid0.hex
-
-                user_meta = rc.get_user_metadata()
-                ebooklet_type = rc.get_type()
-                ts = rc.get_timestamp()
-
-            conn_dict = {'type': ebooklet_type,
-                         'timestamp': ts,
-                         'user_meta': user_meta,
-                         'remote_conn': remote_conn.to_dict(),
-                         }
-
-            self._local_file.set(uuid_hex, conn_dict, ts)
-
-        else:
+        if not self.writable:
             raise ValueError('File is open for read only.')
+
+        if not isinstance(remote_conn, remote.S3Connection):
+            raise TypeError('remote_conn/value must be a remote.S3Connection')
+
+        if key is not None:
+            if not isinstance(key, str):
+                raise TypeError('key must be a str.')
+            if key == utils.metadata_key_str:
+                raise ValueError('key clashes with the internal metadata key.')
+            if not rcg_key_pattern.match(key):
+                raise ValueError('key must match [A-Za-z0-9._-]+ (entry keys become S3 object-key suffixes; other characters are known to break request signing).')
+
+        if user_meta is not None:
+            try:
+                orjson.dumps(user_meta)
+            except TypeError as e:
+                raise TypeError(f'user_meta must be JSON-serializable: {e}')
+
+        ## Get remote_conn metadata
+        with remote_conn.open() as rc:
+            uuid0 = rc.get_uuid()
+            if uuid0 is None:
+                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+
+            uuid_hex = uuid0.hex
+
+            remote_meta = rc.get_user_metadata()
+            ebooklet_type = rc.get_type()
+            ts = rc.get_timestamp()
+
+        if key is None:
+            key = uuid_hex
+
+        conn_dict = {'entry_version': 1,
+                     'type': ebooklet_type,
+                     'timestamp': ts,
+                     'remote_meta': remote_meta,
+                     'user_meta': user_meta,
+                     'remote_conn': remote_conn.to_dict(),
+                     }
+
+        ## The entry is stamped with the WRITE time (timestamp=None -> now), not the
+        ## member's timestamp - otherwise an upsert that changes only user_meta
+        ## would never enter the changelog and would silently never push.
+        self._local_file.set(key, conn_dict, None)
+        self._written_keys.add(key)
+
+        ## Clean up a stale default-keyed entry for the same member (left by a
+        ## pre-0.9.0-style add) when migrating to explicit keys.
+        if key != uuid_hex and uuid_hex in self:
+            del self[uuid_hex]
 
 
     def set(self, key, remote_conn: remote.S3Connection):
         """
-        Use the add method to add remote connections to the group.
+        Upsert an entry via add(). `rcg[key] = conn` is equivalent.
         """
-        raise NotImplementedError('Use the add method to add remote connections to the group.')
+        self.add(remote_conn, key=key)
 
 
 def open_ebooklet(
@@ -633,6 +831,8 @@ def open_ebooklet(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     num_groups: int = None,
+    lock_timeout: int = 300,
+    force_lock: bool = False,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -659,7 +859,15 @@ def open_ebooklet(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
+        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
+        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+
+    lock_timeout : int
+        Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
+
+    force_lock : bool
+        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
     Returns
     -------
@@ -685,6 +893,8 @@ def open_ebooklet(
     """
     if num_groups is not None and num_groups < 1:
         raise ValueError('num_groups must be a positive integer.')
+    if num_groups is not None:
+        num_groups = utils.next_prime(num_groups)
 
     local_file_path = pathlib.Path(file_path)
 
@@ -697,7 +907,7 @@ def open_ebooklet(
     if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
 
-    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
 
 
 def open_rcg(
@@ -707,6 +917,8 @@ def open_rcg(
     n_buckets: int=12007,
     buffer_size: int = 2**22,
     num_groups: int = None,
+    lock_timeout: int = 300,
+    force_lock: bool = False,
     ):
     """
     Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
@@ -730,7 +942,15 @@ def open_rcg(
         This is only used when the file is open for writing.
 
     num_groups : int or None
-        The number of groups for grouped S3 object storage. Required when creating a new database (flag='n'). For existing databases, this value is read from S3 metadata and the user-provided value is ignored. If None for a new database, per-key storage is used.
+        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
+        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
+        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+
+    lock_timeout : int
+        Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
+
+    force_lock : bool
+        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
     Returns
     -------
@@ -756,6 +976,8 @@ def open_rcg(
     """
     if num_groups is not None and num_groups < 1:
         raise ValueError('num_groups must be a positive integer.')
+    if num_groups is not None:
+        num_groups = utils.next_prime(num_groups)
 
     local_file_path = pathlib.Path(file_path)
 
@@ -768,6 +990,6 @@ def open_rcg(
     if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
 
-    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
 
 

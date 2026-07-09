@@ -9,6 +9,8 @@ EBooklet is a Python key-value database that syncs with S3 (AWS or any S3-compat
 
 Keys must be strings (S3 object name requirement). Values can use any serializer supported by Booklet.
 
+Changes between releases are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## Installation
 
 ```
@@ -62,18 +64,20 @@ Be careful with flags — using `'n'` will delete the remote database in additio
 
 ## Grouped Storage
 
-By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket.
+By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket. If the provided `num_groups` is not prime, it is automatically rounded up to the nearest prime for optimal hash distribution.
 
 ```python
 db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
                             value_serializer='pickle', num_groups=64)
+# num_groups is adjusted to 67 (nearest prime >= 64)
 ```
 
 - Keys are assigned to groups via `blake2b` hash mod `num_groups`
 - Single-key reads use S3 byte-range GET requests to fetch only the needed bytes
 - Multi-key reads from the same group use a single merged byte-range GET
 - On push, entire affected groups are re-packed and uploaded
-- For existing databases, `num_groups` is read from S3 metadata (user-provided value is ignored)
+- For databases already pushed to the remote, `num_groups` is read from S3 metadata (user-provided value is ignored)
+- For a database created locally but not yet pushed, the creation-time choice is not recorded anywhere — re-pass the same `num_groups` when reopening before the first push (reopening without it emits a `UserWarning`, and the first push would fall back to per-key storage)
 
 Use grouped storage when you have many small values — it reduces the number of S3 objects and can improve read performance through byte-range requests.
 

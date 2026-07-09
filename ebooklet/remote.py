@@ -349,12 +349,7 @@ class S3SessionWriter(S3SessionReader):
         """
         if self.writable:
             key1 = self.write_db_key + '/' + key
-            resp = self._write_session.list_object_versions(prefix=key1)
-            del_list = []
-            for obj in resp.iter_objects():
-                del_list.append({'key': obj['key'], 'version_id': obj['version_id']})
-            if del_list:
-                return self._write_session.delete_objects(del_list)
+            self._write_session.delete_objects(prefix=key1)
         else:
             raise ValueError('Session is not writable.')
 
@@ -363,18 +358,8 @@ class S3SessionWriter(S3SessionReader):
         Delete specific objects.
         """
         if self.writable:
-            del_list = []
-            resp = self._write_session.list_object_versions(prefix=self.write_db_key + '/')
-            for obj in resp.iter_objects():
-                key0 = obj['key']
-                key = key0.split('/')[-1]
-                if key in keys:
-                    del_list.append({'key': key0, 'version_id': obj['version_id']})
-
-            if del_list:
-                del_resp = self._write_session.delete_objects(del_list)
-                if del_resp.status // 100 != 2:
-                    raise urllib3.exceptions.HTTPError(del_resp.error)
+            full_keys = [self.write_db_key + '/' + key for key in keys]
+            self._write_session.delete_objects(full_keys)
         else:
             raise ValueError('Session is not writable.')
 
@@ -384,13 +369,7 @@ class S3SessionWriter(S3SessionReader):
         Delete the entire remote.
         """
         if self.writable:
-            del_list = []
-            resp = self._write_session.list_object_versions(prefix=self.write_db_key)
-            for obj in resp.iter_objects():
-                key0 = obj['key']
-                del_list.append({'key': key0, 'version_id': obj['version_id']})
-
-            self._write_session.delete_objects(del_list)
+            self._write_session.delete_objects(prefix=self.write_db_key)
             self._init_bytes = None
             self.uuid = None
         else:
@@ -571,7 +550,7 @@ class S3Connection(JsonSerializer):
                 bucket: str=None,
                 endpoint_url: str=None,
                 db_url: str=None,
-                threads: int=20,
+                threads: int=10,
                 read_timeout: int=60,
                 retries: int=3,
                 ):
