@@ -536,9 +536,11 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
             groups_to_download = {}
             pull_count = 0
             pull_bytes = 0
-            ## NOTE: iterate items() in a single pass - booklet iterators hold the
-            ## booklet's thread lock for their whole lifetime, so calling get() on
-            ## remote_index while iterating remote_index.keys() would self-deadlock.
+            ## NOTE: iterate items() in a single pass - one scan instead of a
+            ## per-key chain lookup for every get(). (Before booklet 0.12.6 this
+            ## was also mandatory: iterators held the thread lock across yields,
+            ## so get() during iteration self-deadlocked. That constraint is
+            ## gone, but the single pass remains the right access pattern.)
             for key, remote_val in remote_index.items():
                 if key == metadata_key_str or key in deletes:
                     continue
@@ -671,17 +673,22 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
     if updated or force_push or (deletes and num_groups is None) or flag == 'n' or remote_session.uuid is None:
         time_int_us = booklet.utils.make_timestamp_int()
 
-        ## Get main file init bytes
+        ## Get main file init bytes. Direct _file access moves the shared file
+        ## position, so hold the owning booklet's thread lock (booklet's own
+        ## contract since 0.12.6: every position-mover locks).
         local_file._set_file_timestamp(time_int_us)
-        local_file._file.seek(0)
-        local_init_bytes = bytearray(local_file._file.read(200))
+        with local_file._thread_lock:
+            local_file._file.seek(0)
+            local_init_bytes = bytearray(local_file._file.read(200))
         if local_init_bytes[:16] != booklet.utils.uuid_variable_blt:
             raise ValueError(local_init_bytes)
 
         n_keys_pos = booklet.utils.n_keys_pos
         local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
 
-        remote_index._file.seek(0)
+        with remote_index._thread_lock:
+            remote_index._file.seek(0)
+            remote_index_bytes = remote_index._file.read()
 
         metadata = {
             'timestamp': str(time_int_us),
@@ -692,7 +699,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         if num_groups is not None:
             metadata['num_groups'] = str(num_groups)
 
-        resp = remote_session.put_db_object(remote_index._file.read(), metadata=metadata)
+        resp = remote_session.put_db_object(remote_index_bytes, metadata=metadata)
 
         if resp.status // 100 != 2:
             raise urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")

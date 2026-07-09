@@ -9,6 +9,8 @@ EBooklet is a Python key-value database that syncs with S3 (AWS or any S3-compat
 
 Keys must be strings (S3 object name requirement). Values can use any serializer supported by Booklet.
 
+Changes between releases are tracked in [CHANGELOG.md](CHANGELOG.md).
+
 ## Installation
 
 ```
