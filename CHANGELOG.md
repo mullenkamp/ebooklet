@@ -4,7 +4,7 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.9.2 (202-07-09)
+## 0.9.2 (2026-07-09)
 
 ### Changed
 - Requires booklet >= 0.12.6, which fixes the iterator deadlock (`get()` inside a
