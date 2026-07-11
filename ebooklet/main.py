@@ -159,8 +159,20 @@ class Change:
         result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type, self._ebooklet._num_groups)
 
         if isinstance(result, dict):
-            # Partial failure — don't clean up changelog so push can be retried
+            # Partial failure — don't clean up changelog so push can be retried.
+            # The 'n' flag is also kept so a retry redoes the full wipe-and-replace
+            # (the remote must never end up half old, half new).
             return result
+
+        ## A flag='n' session is a REPLACEMENT session only until the replacement
+        ## push completes - after that the remote IS this session's database, and
+        ## the session must behave like 'w'. Without this downgrade, every
+        ## subsequent push re-ran update_remote's wipe and re-uploaded only the
+        ## new changelog, silently destroying everything pushed earlier in the
+        ## session (data loss; found 2026-07-09 via cfdb's mid-session push test
+        ## once ebooklet 0.9.3 made missing objects loud).
+        if self._ebooklet._flag == 'n':
+            self._ebooklet._flag = 'w'
 
         if result:
             self._changelog_path.unlink()

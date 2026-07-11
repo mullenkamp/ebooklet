@@ -4,6 +4,22 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.9.4 (2026-07-12)
+
+### Fixed — data loss: a second push in a `flag='n'` session wiped the remote again
+Every push in a `flag='n'` session began with a full remote wipe, then re-uploaded
+only the groups touched by the CURRENT changelog. The first push was correct (wipe
++ full upload), but a second push in the same session — e.g. cfdb's documented
+"push mid-session, keep working, push at close" pattern — destroyed everything the
+first push uploaded except the groups touched since, while reporting success. The
+loss was silent until 0.9.3's missing-object detection made it loud (readers now
+raised `RemoteIntegrityError`; before 0.9.3 the missing keys just quietly vanished).
+
+A `flag='n'` session now downgrades to `'w'` once the replacement push completes:
+the wipe happens exactly once. A partial-failure push does NOT downgrade, so a
+retry redoes the full wipe-and-replace (the remote can never end up half old,
+half new). Present since the `flag='n'` contract was introduced (0.9.0).
+
 ## 0.9.3 (2026-07-09)
 
 ### Fixed
