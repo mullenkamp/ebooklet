@@ -544,3 +544,36 @@ def test_num_groups_unpushed_reopen_warns_rcg():
     with pytest.warns(UserWarning, match=WARN_MATCH):
         with open_rcg(conn, p, flag='w') as rcg:
             pass
+
+
+#################################################
+### 0.9.4: flag='n' sessions must wipe exactly once
+
+
+def test_flag_n_second_push_preserves_remote():
+    ## Data-loss regression: every push in a flag='n' session used to re-run the
+    ## remote wipe and re-upload only the current changelog's groups - a second
+    ## push destroyed everything the first push uploaded (silently pre-0.9.3,
+    ## loudly after). The session must downgrade to 'w' after the replacement
+    ## push so the wipe happens exactly once.
+    (k1, k2, k3), c1 = colliding_keys()   # k* share one group; c1 in another
+    conn = make_conn('nwipe')
+
+    p = local_path('nwipe-writer')
+    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+        eb[k1] = b'v1'
+        eb[c1] = b'vc'
+        eb.set_metadata({'m': 1})
+        assert eb.changes().push() is True     # replacement push (wipes, uploads all)
+        assert eb._flag == 'w'                 # downgraded: no further wipes
+
+        eb[k2] = b'v2'                         # touches only k1's group
+        assert eb.changes().push() is True     # second push must NOT wipe c1's group
+
+    values, stored_keys = read_all(conn, [k1, k2, c1])
+    assert values == {k1: b'v1', k2: b'v2', c1: b'vc'}   # c1 survived (was destroyed pre-fix)
+    assert stored_keys == sorted([k1, k2, c1])
+
+    p2 = local_path('nwipe-reader')
+    with open_ebooklet(conn, p2, flag='r') as eb:
+        assert eb.get_metadata() == {'m': 1}
