@@ -44,6 +44,8 @@ remote_conn = ebooklet.S3Connection(
 )
 ```
 
+Use an `https` `db_url` for anything public — readers fetch the database over that URL, and a plain-`http` one is served unencrypted (a `UserWarning` is emitted). `http` is fine for local testing (e.g. MinIO); silence the warning with `warnings.filterwarnings`. The same consideration applies to a plain-`http` `endpoint_url`, which additionally carries signed requests.
+
 ### Read-only shortcut
 
 If you only need to read and have a public URL, pass it directly — no `S3Connection` needed:
@@ -120,6 +122,8 @@ Remote connection groups organize and store collections of `S3Connection` object
 
 They work like a normal EBooklet except they use `add` instead of `set`, keys are database UUIDs, and values are dicts of `S3Connection` parameters plus metadata.
 
+The entry schema (version 1, documented on `RemoteConnGroup.add`) is **frozen**: consumers can rely on its fields indefinitely, and any future change will come as a new `entry_version` alongside it. Entries never contain credentials.
+
 The remote connection must already exist to be added to a group.
 
 ```python
@@ -134,6 +138,21 @@ with ebooklet.open_rcg(remote_conn_rcg, '/tmp/rcg.blt', 'n') as rcg:
     changes = rcg.changes()
     changes.push()
 ```
+
+## Data Formats and Stability
+
+What EBooklet stores in a remote, and how stable each piece is. For a database at S3 key `D`:
+
+| Object | Key | Contents |
+|--------|-----|----------|
+| db object | `D` | Body: the serialized remote-index booklet. S3 metadata: `timestamp`, `uuid`, `type`, `init_bytes`, `format_version`, and `num_groups` (grouped mode) |
+| children | `D/<name>` | Group objects (named by decimal group id), per-key values, and the user-metadata object `_metadata` |
+| lock tickets | `D.lock.<id>-<seq>` | Transient S3 lock objects for the active writer |
+
+- **`format_version`** (new in 0.9.5) stamps the remote storage format; the current version is 1, and remotes pushed by older versions (no stamp) are read as 1. An ebooklet refuses to open a remote whose `format_version` is newer than it supports (`UnsupportedFormatError`) — upgrade ebooklet instead.
+- **Remote-index entry** (15 bytes per key): `timestamp` (7 bytes) + `offset` (4) + `length` (4). In per-key mode, `offset` and `length` are always 0. In grouped mode they locate the member's value inside its group object — `length` is the value's byte length and **may be 0 for an empty value**. Future layouts will change the index's fixed entry size (`value_len`, 15 today), which is the layout discriminator — not the `length` field.
+- **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index.
+- **RCG entry schema v1**: frozen (see Remote Connection Groups above).
 
 ## Open Flags
 

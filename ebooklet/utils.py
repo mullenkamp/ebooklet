@@ -25,6 +25,20 @@ int_to_bytes = booklet.utils.int_to_bytes
 bytes_to_int = booklet.utils.bytes_to_int
 metadata_key_str = booklet.utils.metadata_key_bytes.decode()
 
+## The remote storage format version this ebooklet reads and writes. Stamped
+## into the db object's S3 metadata on every push; remotes whose stamp exceeds
+## it are refused with UnsupportedFormatError (absence of the stamp = 1).
+SUPPORTED_FORMAT_VERSION = 1
+
+
+class UnsupportedFormatError(ValueError):
+    """
+    The remote database's storage format_version is newer than this ebooklet
+    version supports - a compatibility fault, deliberately distinct from
+    RemoteIntegrityError (which means the store contradicts its own index).
+    Fix: upgrade ebooklet.
+    """
+
 ############################################
 ### Group functions
 
@@ -230,6 +244,13 @@ def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
     """
     Open the local remote-index booklet with the standard flag mapping (read-only
     for 'r' sessions, writable otherwise, fresh file when none exists).
+
+    Index entry layout (fixed value_len=15): timestamp(7) + offset(4) + length(4).
+    Per-key mode: offset and length are always 0. Grouped mode: offset/length
+    locate the member value inside its group object; length is the value's byte
+    length and MAY be 0 (an empty value) - it is NOT a mode discriminator. Future
+    layouts change the fixed value_len (the layout discriminator), gated by the
+    db object's format_version metadata.
     """
     if remote_index_path.exists():
         if flag == 'r':
@@ -243,22 +264,29 @@ def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
 class MissingRemoteObject:
     """
     Truthy failure marker: the remote index claims key(s) whose backing S3
-    object returned 404. Every value fetch is gated on the index claiming the
-    key (check_local_vs_remote), so a 404 here always means the store
-    contradicts its own index - either a legitimately-deleted key seen through
-    a stale reader index, or a real integrity fault. main.py's re-check
-    protocol (_resolve_missing) disambiguates the two by re-pulling the index.
+    object returned 404 - or, for grouped members, whose group object exists
+    (200) but no longer contains them (object_exists=True). Every value fetch
+    is gated on the index claiming the key (check_local_vs_remote), so either
+    state means the store contradicts its own index - a legitimately-deleted
+    key seen through a stale reader index, or a real integrity fault. main.py's
+    re-check protocol (_resolve_missing) disambiguates the two by re-pulling
+    the index.
 
     Deliberately truthy (no __bool__/__len__) and non-None so it passes both
     failure gates: the point-read `if failure:` and load_items' `is not None`.
     """
-    __slots__ = ('s3_key', 'keys')
+    __slots__ = ('s3_key', 'keys', 'object_exists')
 
-    def __init__(self, s3_key: str, keys: list):
-        self.s3_key = s3_key   # the S3 object key that 404'd (group id str, per-key key, or '_metadata')
+    def __init__(self, s3_key: str, keys: list, object_exists: bool = False):
+        self.s3_key = s3_key   # the S3 object key (group id str, per-key key, or '_metadata')
         self.keys = keys       # the ebooklet keys the index claims live in that object
+        self.object_exists = object_exists  # True: object present but lacks these members
 
     def __repr__(self):
+        if self.object_exists:
+            return (f"remote group object '{self.s3_key}' no longer contains member key(s) "
+                    f"{self.keys} but the remote index still claims them (integrity failure); "
+                    f"delete these keys and re-push, or restore the members")
         return (f"remote object '{self.s3_key}' is missing but the remote index still claims "
                 f"key(s) {self.keys} (integrity failure); delete these keys and re-push, "
                 f"or restore the object")
@@ -304,7 +332,12 @@ def upload_group(group_id, local_file, remote_session, keys_in_group):
             return resp.error, None
         return None, offsets
     else:
-        resp = remote_session.delete_object(str(group_id))
+        ## A failed delete leaves the index still referencing the still-existing
+        ## group object - a consistent, retryable state. Reporting it as a
+        ## failure keeps the group's deletes retained so the next push retries.
+        error = remote_session.delete_object(str(group_id))
+        if error is not None:
+            return error, None
         return None, {}
 
 
@@ -313,22 +346,37 @@ def upload_group(group_id, local_file, remote_session, keys_in_group):
 group_entry_fixed_overhead = 2 + 7 + 4
 
 
-def recover_group_members(group_id, key_infos, local_file, remote_session):
+def recover_group_members(group_id, key_infos, local_file, remote_session, report_missing_members=True):
     """
     Fallback for when ranged reads into a group object cannot be verified against the
     remote_index offsets (a corrupted or shifted group object). Downloads the whole
     self-describing group object and recovers whichever requested members it actually
     contains, trusting the object's own embedded keys/timestamps rather than the index.
-    Members not present in the object are simply not materialized.
+
+    Members the index claims but the (200) object does not contain are reported as a
+    MissingRemoteObject marker so read paths route them through the re-check protocol
+    (_resolve_missing) - previously `key in db` said True while `db[key]` silently
+    raised KeyError. The push path passes report_missing_members=False: there the
+    absent-member state is deliberately self-healed (the lost-keys drop in
+    update_remote), which is also the recovery mechanism for the read-side error.
     """
     resp = remote_session.get_object(str(group_id))
     if resp.status == 200:
         entries = {key: (timestamp, value) for key, timestamp, value in unpack_group(resp.data)}
+        missing = []
         for key, offset, length, timestamp_int in key_infos:
             entry = entries.get(key)
             if entry is not None:
                 timestamp, value = entry
                 local_file.set(key, value, timestamp, encode_value=False)
+            else:
+                missing.append(key)
+        if report_missing_members and missing:
+            ## Recovered members above stay materialized - they are valid remote
+            ## data. The marker carries only the still-missing subset. An empty
+            ## missing list must return None (plain success), never a truthy
+            ## empty marker that would trigger a needless index re-pull.
+            return MissingRemoteObject(str(group_id), missing, object_exists=True)
     elif resp.status == 404:
         ## key_infos comes from remote-index entries, so the index claims these
         ## members - a missing group object is never legitimate absence here.
@@ -338,7 +386,7 @@ def recover_group_members(group_id, key_infos, local_file, remote_session):
     return None
 
 
-def get_remote_group_values(group_id, key_infos, local_file, remote_session):
+def get_remote_group_values(group_id, key_infos, local_file, remote_session, report_missing_members=True):
     """
     key_infos: list of (key, offset, length, timestamp_int)
 
@@ -346,7 +394,8 @@ def get_remote_group_values(group_id, key_infos, local_file, remote_session):
     (the key itself and the value length precede every value in the packed layout)
     before being trusted - a stale index offset would otherwise silently deliver
     another entry's bytes. On any verification failure the whole (self-describing)
-    group object is downloaded and parsed instead (recover_group_members).
+    group object is downloaded and parsed instead (recover_group_members;
+    report_missing_members is passed through - see its docstring).
     """
     sorted_infos = sorted(key_infos, key=lambda x: x[1])
 
@@ -359,7 +408,7 @@ def get_remote_group_values(group_id, key_infos, local_file, remote_session):
 
     if range_start < 0:
         logger.warning(f"Group {group_id}: stored index offsets are malformed; recovering members from the full group object.")
-        return recover_group_members(group_id, key_infos, local_file, remote_session)
+        return recover_group_members(group_id, key_infos, local_file, remote_session, report_missing_members)
 
     resp = remote_session.get_object(str(group_id), range_start=range_start, range_end=range_end)
     if resp.status in (200, 206):
@@ -383,7 +432,7 @@ def get_remote_group_values(group_id, key_infos, local_file, remote_session):
 
         if verified is None:
             logger.warning(f"Group {group_id}: stored index offsets do not match the group object layout (corrupted or shifted object); recovering members from the full group object.")
-            return recover_group_members(group_id, key_infos, local_file, remote_session)
+            return recover_group_members(group_id, key_infos, local_file, remote_session, report_missing_members)
 
         for key, value, timestamp_int in verified:
             local_file.set(key, value, timestamp_int, encode_value=False)
@@ -395,7 +444,7 @@ def get_remote_group_values(group_id, key_infos, local_file, remote_session):
         ## Requested range extends past the object's end - the object shrank
         ## relative to the index. Recover whatever actually exists.
         logger.warning(f"Group {group_id}: stored index offsets extend past the group object; recovering members from the full group object.")
-        return recover_group_members(group_id, key_infos, local_file, remote_session)
+        return recover_group_members(group_id, key_infos, local_file, remote_session, report_missing_members)
     else:
         return resp.error
     return None
@@ -588,11 +637,23 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                         groups_to_download.setdefault(gid, []).append((key, offset, length, timestamp_int))
                         pull_count += 1
                         pull_bytes += length
+                    else:
+                        ## A grouped member with length 0 is an EMPTY value, not
+                        ## a per-key entry (those never reach this loop). There
+                        ## is nothing to download - the value IS b''. Materialize
+                        ## it directly, otherwise a locally-absent empty member
+                        ## would fall into the lost-keys drop below and be
+                        ## silently deleted by the repack.
+                        local_file.set(key, b'', timestamp_int, encode_value=False)
 
             if groups_to_download:
                 logger.info(f"Pulling {pull_count} group member value(s) (~{pull_bytes} bytes) from {len(groups_to_download)} group(s) so the groups can be repacked in full.")
                 with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
-                    pull_futures = {executor.submit(get_remote_group_values, gid, key_infos, local_file, remote_session): gid for gid, key_infos in groups_to_download.items()}
+                    ## report_missing_members=False: on the push path an absent
+                    ## member is deliberately self-healed by the lost-keys drop
+                    ## below - a loud marker here would make the push fail
+                    ## permanently instead of repairing the group.
+                    pull_futures = {executor.submit(get_remote_group_values, gid, key_infos, local_file, remote_session, False): gid for gid, key_infos in groups_to_download.items()}
                     for future in as_completed(pull_futures):
                         gid = pull_futures[future]
                         error = future.result()
@@ -725,6 +786,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
             'uuid': local_file.uuid.hex,
             'type': ebooklet_type,
             'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode(),
+            'format_version': str(SUPPORTED_FORMAT_VERSION),
         }
         if num_groups is not None:
             metadata['num_groups'] = str(num_groups)

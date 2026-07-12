@@ -11,6 +11,7 @@ import urllib3
 import booklet
 from typing import Union
 import s3func
+import warnings
 import weakref
 import orjson
 import base64
@@ -184,6 +185,16 @@ class S3SessionReader:
         resp_obj = self.head_object()
         if resp_obj.status == 200:
             meta = resp_obj.metadata
+            ## Refuse too-new remotes BEFORE parsing anything else - this is the
+            ## single choke point for reader init, writer init, and every index
+            ## re-pull. Remotes without the stamp predate it and are v1.
+            self.format_version = int(meta.get('format_version', 1))
+            if self.format_version > utils.SUPPORTED_FORMAT_VERSION:
+                raise utils.UnsupportedFormatError(
+                    f'This remote database uses storage format_version '
+                    f'{self.format_version}, but this ebooklet version only supports '
+                    f'up to {utils.SUPPORTED_FORMAT_VERSION}. Upgrade ebooklet to open it.'
+                )
             self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
@@ -195,6 +206,7 @@ class S3SessionReader:
             self.timestamp = None
             self.type = None
             self.num_groups = None
+            self.format_version = None
         else:
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
@@ -308,7 +320,13 @@ class S3SessionWriter(S3SessionReader):
         Should I include this? Or should I simply let the other methods fail if it's not writable? I do like having an explicit test...
         """
         if not self._writable_check:
-            test_key = self.write_db_key + uuid.uuid6().hex[-13:]
+            ## The probe key lives INSIDE the db_key + '/' namespace so a
+            ## crashed probe's orphan is prefix-distinguishable from sibling
+            ## databases and sweepable by delete_remote (the old sibling-level
+            ## key db_key + <hex> was neither). The delete below is exact key +
+            ## version_id, so even a pathological collision with a user key is
+            ## non-destructive on versioned stores.
+            test_key = self.write_db_key + '/_writable_probe_' + uuid.uuid6().hex[-13:]
             put_resp = self._write_session.put_object(test_key, b'0')
             if put_resp.status // 100 == 2:
                 del_resp = self._write_session.delete_object(test_key, put_resp.metadata['version_id'])
@@ -345,31 +363,56 @@ class S3SessionWriter(S3SessionReader):
 
     def delete_object(self, key: str):
         """
-        Delete a single object.
+        Delete a single object by exact key (all versions).
+
+        Returns None on success or the error on failure. The error must be
+        RETURNED, never raised: the caller (upload_group) runs in a push worker
+        thread, and a raise would propagate through future.result() and crash
+        the whole push instead of degrading to the partial-failure retry path.
         """
         if self.writable:
             key1 = self.write_db_key + '/' + key
-            self._write_session.delete_objects(prefix=key1)
+            try:
+                ## Exact keys, not a prefix: group ids are non-zero-padded
+                ## decimals, so a prefix delete of group '1' would also destroy
+                ## groups '10', '11', ... purge=True (the s3func default, made
+                ## explicit) removes all versions of exactly this key.
+                self._write_session.delete_objects(keys=[key1], purge=True)
+            except urllib3.exceptions.HTTPError as err:
+                return err
+            return None
         else:
             raise ValueError('Session is not writable.')
 
     def delete_objects(self, keys):
         """
-        Delete specific objects.
+        Delete specific objects (exact keys, all versions).
         """
         if self.writable:
             full_keys = [self.write_db_key + '/' + key for key in keys]
-            self._write_session.delete_objects(full_keys)
+            self._write_session.delete_objects(keys=full_keys, purge=True)
         else:
             raise ValueError('Session is not writable.')
 
 
     def delete_remote(self):
         """
-        Delete the entire remote.
+        Delete the entire remote database: the db object itself, then every
+        child object under db_key + '/'. Deliberately bounded - a bare db_key
+        prefix would also match sibling databases (deleting 'mydb' would wipe
+        'mydb2') and the lock namespace db_key + '.lock.', which must survive:
+        the flag='n' push calls this while HOLDING its own session lock, and
+        other writers' live tickets are theirs to release. Crashed writers'
+        stale tickets are left for force_lock (age-gated breaking is planned).
         """
         if self.writable:
-            self._write_session.delete_objects(prefix=self.write_db_key)
+            ## The db object is the existence marker - delete it first so a
+            ## torn teardown leaves only invisible orphans (swept by a rerun)
+            ## rather than an index claiming missing children. purge=True
+            ## resolves this one key's versions via an over-broad namespace
+            ## listing - acceptable for a rare teardown operation.
+            self._write_session.delete_objects(keys=[self.write_db_key], purge=True)
+            self._write_session.delete_objects(prefix=self.write_db_key + '/', purge=True)
             self._init_bytes = None
             self.uuid = None
         else:
@@ -598,6 +641,16 @@ class S3Connection(JsonSerializer):
         self.access_key = access_key
         self.endpoint_url = endpoint_url
         self.db_url = db_url
+        ## Single choke point: every public entry point that carries a db_url
+        ## (incl. bare url strings via check_remote_conn) constructs this class.
+        if isinstance(db_url, str) and db_url.lower().startswith('http://'):
+            warnings.warn(
+                'db_url uses plain http - readers fetch this database unencrypted. '
+                'Use an https url for anything public; http is acceptable for local '
+                'testing (silence with warnings.filterwarnings).',
+                UserWarning,
+                stacklevel=2,
+            )
         self.threads = threads
         self.read_timeout = read_timeout
         self.retries = retries
