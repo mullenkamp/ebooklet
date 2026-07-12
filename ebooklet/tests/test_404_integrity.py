@@ -301,7 +301,7 @@ def test_push_pull_404_is_loud_and_retryable():
 
         assert isinstance(result, dict) and result
         assert any(isinstance(v, MissingRemoteObject) for v in result.values())
-        assert k1 in eb._deletes                 # retry signal retained
+        assert k1 in eb._journal.deletes         # retry signal retained
 
         assert eb.changes().push() is True       # retry completes
 

@@ -13,7 +13,8 @@ from typing import Union
 import s3func
 import warnings
 import weakref
-import orjson
+import msgspec
+import orjson   # remaining use: the user-metadata object decode (dies with the format-2 metadata embedding)
 import base64
 import datetime
 import concurrent.futures
@@ -142,7 +143,7 @@ class JsonSerializer:
         return d1
 
     def dumps(self):
-        return orjson.dumps(self.to_dict())
+        return msgspec.json.encode(self.to_dict())
 
 
 class S3SessionReader:
@@ -164,6 +165,16 @@ class S3SessionReader:
         Test to see if remote read access is possible. Same as .read_access.
         """
         return self.read_access
+
+    @property
+    def initialized(self):
+        """
+        Whether the remote database exists (its db object has been pushed at
+        least once). Maintained by _load_db_metadata: the 404 branch leaves
+        uuid None. This names the session-lifecycle fact directly instead of
+        scattering `uuid is None` checks (Seam-1 decomposition).
+        """
+        return self.uuid is not None
 
     def __enter__(self):
         return self
@@ -403,7 +414,8 @@ class S3SessionWriter(S3SessionReader):
         'mydb2') and the lock namespace db_key + '.lock.', which must survive:
         the flag='n' push calls this while HOLDING its own session lock, and
         other writers' live tickets are theirs to release. Crashed writers'
-        stale tickets are left for force_lock (age-gated breaking is planned).
+        stale tickets are left for force_lock (age-gated since s3func 0.9.3:
+        only tickets older than 2 hours are broken, so live writers survive).
         """
         if self.writable:
             ## The db object is the existence marker - delete it first so a
@@ -541,7 +553,11 @@ class S3SessionWriter(S3SessionReader):
         Parameters
         ----------
         timestamp : str or datetime.datetime
-            All locks older than the timestamp will be removed. The default is now.
+            Lock tickets uploaded at or before the timestamp are removed. The
+            default is 2 hours ago (s3func's age gate): younger tickets are
+            presumed to belong to a LIVE writer, whose next push would then
+            abort at its lock re-verification. Pass an explicit now to break
+            everything regardless of age.
 
         Returns
         -------

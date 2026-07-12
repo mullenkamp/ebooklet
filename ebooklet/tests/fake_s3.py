@@ -42,9 +42,12 @@ class FakeListResp:
 
 
 class FakeLock:
-    """Single-process stand-in for the s3func bakery lock."""
+    """Single-process stand-in for the s3func bakery lock. verify() mirrors
+    s3func 0.9.3's contract minimally: True only while acquired. Tests that
+    need a broken-ticket scenario flip `broken` to make verify() fail."""
     def __init__(self):
         self._held = False
+        self.broken = False
 
     def acquire(self, blocking=True, timeout=-1, exclusive=True):
         self._held = True
@@ -52,6 +55,9 @@ class FakeLock:
 
     def release(self):
         self._held = False
+
+    def verify(self):
+        return self._held and not self.broken
 
     def other_locks(self):
         return {}

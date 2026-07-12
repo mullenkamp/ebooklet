@@ -312,7 +312,7 @@ def test_deletes_retained_when_group_pull_fails():
         eb._remote_session.get_object = original_get
 
         assert isinstance(result, dict) and result   # push reported the failure
-        assert k1 in eb._deletes                     # retry signal retained
+        assert k1 in eb._journal.deletes             # retry signal retained
 
         assert eb.changes().push() is True           # retry completes the delete
 
@@ -482,10 +482,11 @@ def _remote_basenames(conn):
         return sorted(obj['key'].split('/')[-1] for obj in s3open.list_objects().iter_objects())
 
 
-def test_num_groups_unpushed_reopen_warns():
-    """A bare 'w' reopen before the first push can't know the creation grouping -
-    it must warn (pre-0.9.1 it silently resolved to per-key), and the fresh
-    create itself must NOT warn."""
+def test_num_groups_unpushed_reopen_reads_journal():
+    """0.10: the journal records the creation grouping, so a bare 'w' reopen
+    before the first push resolves it WITHOUT the kwarg and without the old
+    per-key-fallback warning. (The reopen warns about the pending REPLACEMENT
+    instead - the 'n' session never pushed.)"""
     conn = make_conn('ngwarn')
     p = local_path('ng-warn-writer')
 
@@ -495,20 +496,26 @@ def test_num_groups_unpushed_reopen_warns():
             eb['key000'] = b'v0'
             # close WITHOUT pushing
 
-    with pytest.warns(UserWarning, match=WARN_MATCH):
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter('always')
         with open_ebooklet(conn, p, flag='w') as eb:
-            assert eb._num_groups is None  # documented fallback: per-key
+            assert eb._num_groups == num_groups  # journaled choice, not per-key fallback
+    assert not [w for w in records if WARN_MATCH in str(w.message)], \
+        'journaled num_groups should silence the per-key-fallback warning'
+    assert [w for w in records if 'REPLACEMENT' in str(w.message)], \
+        'unpushed replacement reopen should warn'
 
-    # re-passing num_groups is the supported path - no warning
-    with warnings.catch_warnings():
-        warnings.simplefilter('error')
+    # re-passing the SAME num_groups also works - still only the REPLACEMENT warning
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter('always')
         with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
             assert eb._num_groups == num_groups
+    assert not [w for w in records if WARN_MATCH in str(w.message)]
 
 
 def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
-    """Re-passing num_groups on the first-push reopen keeps the grouped layout;
-    once pushed, bare reopens read num_groups from remote metadata (no warning)."""
+    """The first-push reopen keeps the grouped layout (journal-recorded);
+    once pushed, bare reopens read num_groups from remote metadata, silently."""
     conn = make_conn('ngrepass')
     p = local_path('ng-repass-writer')
 
@@ -516,9 +523,11 @@ def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
         eb['key000'] = b'v0'
         eb['key001'] = b'v1'
 
-    with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
-        assert eb._num_groups == num_groups
-        assert eb.changes().push() is True
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # pending-REPLACEMENT warning expected here
+        with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
+            assert eb._num_groups == num_groups
+            assert eb.changes().push() is True
 
     names = _remote_basenames(conn)
     assert 'key000' not in names                  # no raw per-key objects
@@ -527,23 +536,27 @@ def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
     vals, _ = read_all(conn, ['key000', 'key001'])
     assert vals == {'key000': b'v0', 'key001': b'v1'}
 
-    # remote initialized -> tier 1 wins, bare reopen is silent and grouped
+    # remote initialized + replacement completed -> bare reopen is silent and grouped
     with warnings.catch_warnings():
         warnings.simplefilter('error')
         with open_ebooklet(conn, p, flag='w') as eb:
             assert eb._num_groups == num_groups
 
 
-def test_num_groups_unpushed_reopen_warns_rcg():
-    """RemoteConnGroup flows through the same _init_common - same warning."""
+def test_num_groups_unpushed_reopen_journal_rcg():
+    """RemoteConnGroup flows through the same _init_common - same journal
+    resolution (no per-key-fallback warning; REPLACEMENT warning instead)."""
     conn = make_conn('ngwarnrcg')
     p = local_path('ng-warn-rcg')
     with open_rcg(conn, p, flag='n', num_groups=num_groups) as rcg:
         pass
 
-    with pytest.warns(UserWarning, match=WARN_MATCH):
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter('always')
         with open_rcg(conn, p, flag='w') as rcg:
-            pass
+            assert rcg._num_groups == num_groups
+    assert not [w for w in records if WARN_MATCH in str(w.message)]
+    assert [w for w in records if 'REPLACEMENT' in str(w.message)]
 
 
 #################################################
@@ -554,8 +567,9 @@ def test_flag_n_second_push_preserves_remote():
     ## Data-loss regression: every push in a flag='n' session used to re-run the
     ## remote wipe and re-upload only the current changelog's groups - a second
     ## push destroyed everything the first push uploaded (silently pre-0.9.3,
-    ## loudly after). The session must downgrade to 'w' after the replacement
-    ## push so the wipe happens exactly once.
+    ## loudly after). The replacement intent must clear after the replacement
+    ## push so the wipe happens exactly once (journal-backed since 0.10; _flag
+    ## itself stays frozen).
     (k1, k2, k3), c1 = colliding_keys()   # k* share one group; c1 in another
     conn = make_conn('nwipe')
 
@@ -565,7 +579,8 @@ def test_flag_n_second_push_preserves_remote():
         eb[c1] = b'vc'
         eb.set_metadata({'m': 1})
         assert eb.changes().push() is True     # replacement push (wipes, uploads all)
-        assert eb._flag == 'w'                 # downgraded: no further wipes
+        assert eb._flag == 'n'                              # frozen - no longer mutated
+        assert eb._journal.replace_pending is False         # intent cleared: no further wipes
 
         eb[k2] = b'v2'                         # touches only k1's group
         assert eb.changes().push() is True     # second push must NOT wipe c1's group

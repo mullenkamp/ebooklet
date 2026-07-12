@@ -1,7 +1,8 @@
 """
-Hermetic tests for the 0.9.5 warning + format-version additions: the
-close-time pending-deletions warning, the db-object format_version stamp and
-too-new refusal, and the non-HTTPS db_url warning.
+Hermetic tests for the warning + format-version behaviors: closing with
+unpushed deletions (journaled since 0.10 - no more loss warning), the
+db-object format_version stamp and too-new refusal, and the non-HTTPS db_url
+warning.
 """
 import warnings
 
@@ -16,7 +17,9 @@ def _no_matching_warning(records, needle):
     return not [w for w in records if needle in str(w.message)]
 
 
-def test_close_warns_on_unpushed_deletes(tmp_path):
+def test_close_with_unpushed_deletes_is_quiet_and_journaled(tmp_path):
+    """0.10: pending deletions survive the close in the journal (the 0.9.5
+    loss warning is gone because there is no longer a loss to warn about)."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
@@ -25,8 +28,19 @@ def test_close_warns_on_unpushed_deletes(tmp_path):
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     del eb['k']
-    with pytest.warns(UserWarning, match='pending deletion'):
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter('always')
         eb.close()
+    assert _no_matching_warning(records, 'pending deletion')
+
+    ## The deletion survived the close and the next session's push applies it.
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
+        assert 'k' not in eb
+        assert eb.changes().push() is True
+
+    fresh = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
+        assert 'k' not in eb
 
 
 def test_close_quiet_when_deletes_pushed(tmp_path):

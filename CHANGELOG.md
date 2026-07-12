@@ -4,6 +4,80 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.10.0 (unreleased)
+
+Phase 1 of the architecture-assessment roadmap (design dual-reviewed
+pre-implementation: `phase1-design-brief.md` + the two `phase1-review-*.md`
+reports). Releases together with the Phase-2 API pass as one release.
+Requires booklet >= 0.12.7 (reserved slots) and s3func >= 0.9.3 (lock verify
++ age-gated breaking). New dependencies: msgspec (serialization for all new
+ebooklet-owned formats); portalocker now declared (was only transitive).
+
+### Added — the persistent pending-change journal (Seam 2)
+- **Pending writes and deletions now survive the session** in a hidden journal
+  inside the local booklet file (a reserved slot - no sidecar files). Deletions
+  were memory-only: closing without pushing silently lost them (0.9.5 could
+  only warn); they are now journaled at `del` time (crash-safe), honored by
+  reads in later sessions, and applied by the next push, whenever it happens.
+- **Clock-skewed local edits now push.** An edit whose timestamp was at or
+  before the remote's never entered the timestamp-diff changelog - it silently
+  never uploaded (the 0.8.4 warning-only case). The changelog is now the UNION
+  of the timestamp diff and the journal, and a skew-stamped journaled edit has
+  its timestamp advanced (with a warning) so readers that already hold the
+  newer remote value pick up the edit.
+- **Read-your-writes.** A read used to pull a newer remote value OVER an
+  unpushed local edit, destroying it. Journaled pending writes are now served
+  from the local file unconditionally; no remote-driven path (reads, index
+  re-pulls, the missing-object re-check's cleanup, `prune(timestamp=...)`)
+  may overwrite or evict a journal-pending value.
+- **Deletions cannot resurrect.** Every fresh index copy (open and re-pull)
+  is replayed against the journal's pending deletions, so `in`/`keys()`/reads
+  stay consistent even after another writer's push refreshes the index.
+- **`flag='n'` replacement intent survives the session.** Previously an
+  unpushed 'n' session's intent was silently forgotten by a 'w' reopen and the
+  next push half-merged new keys into the old remote (neither old nor new).
+  The intent is journaled: the reopen warns loudly and the next push performs
+  the replacement. It clears only when a replacement push fully succeeds.
+- **num_groups is remembered.** The journal records the grouping choice
+  (tri-state - "per-key chosen" is distinct from "never recorded"), so
+  reopening a created-but-unpushed database no longer needs num_groups
+  re-passed and the 0.9.1 per-key-fallback warning is gone for 0.10 files.
+  A conflicting num_groups kwarg now raises.
+- **Journal clearing is commit-scoped**: entries clear only after the db-object
+  upload (the push's commit point) succeeds, for exactly the groups that
+  commit covered; a partially-failed replacement push clears nothing, so its
+  retry cannot purge locally-held keys.
+- `changes().pending_deletes` surfaces the journaled deletions;
+  `changes().discard()` now also cancels them (restoring their index entries
+  from the remote) and updates the journal.
+
+### Added — lock safety at push boundaries (F5)
+- **`push()` re-verifies the write lock** at push start and again immediately
+  before the db-object commit. A holder whose lock ticket was broken (another
+  client's force_lock) aborts BEFORE writing instead of pushing without mutual
+  exclusion; everything stays journaled for a retry.
+- `force_lock=True` is now age-gated via s3func 0.9.3: it breaks only lock
+  tickets older than 2 hours, so a live writer's session survives an impatient
+  force_lock (its own tickets are also never broken). This closes the 0.9.5
+  "crashed-writer lock orphans" residual: force_lock is now safe to use
+  routinely.
+
+### Changed
+- The 0.9.5 close-time "pending deletions will be LOST" warning is removed -
+  it is no longer true.
+- User keys equal to internal reserved key strings are rejected with
+  ValueError (previously only RemoteConnGroup.add checked, and only for the
+  metadata key).
+- The remote-index sidecar is opened writable in read-only sessions too
+  (needed by the deletion replay; safe - the local file holds an exclusive
+  OS lock in every mode, so no second process shares the sidecar).
+- Internal: session lifecycle state is decomposed (`_flag` is frozen after
+  open; the replacement intent lives in the journal; "remote exists" is the
+  session's `initialized` property) - the 0.9.4 flag downgrade is gone.
+- RemoteConnGroup entry validation and connection serialization use msgspec
+  (byte-identical JSON; the stored `'orjson'` value-serializer id in existing
+  local files is unchanged and still supported).
+
 ## 0.9.6 (2026-07-12)
 
 ### Fixed — data loss: deleting a key and re-setting it in the same session lost the key on push

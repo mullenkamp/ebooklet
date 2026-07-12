@@ -8,6 +8,7 @@ Created on Thu Jan  5 11:04:13 2023
 import logging
 import hashlib
 import struct
+import warnings
 import booklet
 import urllib3
 from datetime import datetime, timezone
@@ -24,6 +25,14 @@ logger = logging.getLogger(__name__)
 int_to_bytes = booklet.utils.int_to_bytes
 bytes_to_int = booklet.utils.bytes_to_int
 metadata_key_str = booklet.utils.metadata_key_bytes.decode()
+
+## Internal booklet keys (metadata + the reserved slots holding the journal and
+## remote-state cache) that user operations must never address directly - a
+## set()/del on one of these raw strings would write into the internal slot
+## through the ordinary keyed path.
+reserved_key_strs = frozenset(
+    {metadata_key_str} | {k.decode() for k in booklet.utils.reserved_slot_key_bytes.values()}
+)
 
 ## The remote storage format version this ebooklet reads and writes. Stamped
 ## into the db object's S3 metadata on every push; remotes whose stamp exceeds
@@ -125,10 +134,18 @@ def s3session_finalizer(session):
     session._session.clear()
 
 
-def ebooklet_finalizer(local_file, remote_index, remote_session, lock):
+def ebooklet_finalizer(local_file, remote_index, remote_session, lock, journal=None):
     """
-    The finalizer function for book instances.
+    The finalizer function for book instances. Persists the journal BEFORE the
+    local file closes, so a session torn down by garbage collection (close()
+    never called) still records its pending state; a finalizer must never
+    raise, so persistence failures are logged and swallowed.
     """
+    if journal is not None:
+        try:
+            journal.persist(local_file)
+        except Exception:
+            logger.exception('journal persistence failed during finalization; pending state may be stale')
     local_file.close()
     remote_index.close()
     remote_session.close()
@@ -142,7 +159,7 @@ def open_remote_conn(remote_conn, flag, local_file_exists):
     """
     remote_session = remote_conn.open(flag)
 
-    if flag == 'r' and (remote_session.uuid is None) and not local_file_exists:
+    if flag == 'r' and not remote_session.initialized and not local_file_exists:
         raise ValueError('No file was found in the remote, but the local file was open for read without creating a new file.')
 
     ebooklet_type = remote_session.type
@@ -226,7 +243,7 @@ def fetch_remote_index(dest_path, remote_session):
     success, False when there is nothing to fetch (no remote uuid, or a 404);
     raises on other HTTP errors.
     """
-    if not remote_session.uuid:
+    if not remote_session.initialized:
         return False
 
     index0 = remote_session.get_object()
@@ -242,8 +259,8 @@ def fetch_remote_index(dest_path, remote_session):
 
 def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
     """
-    Open the local remote-index booklet with the standard flag mapping (read-only
-    for 'r' sessions, writable otherwise, fresh file when none exists).
+    Open the local remote-index booklet (writable in every session mode - see
+    the in-function note; fresh file when none exists).
 
     Index entry layout (fixed value_len=15): timestamp(7) + offset(4) + length(4).
     Per-key mode: offset and length are always 0. Grouped mode: offset/length
@@ -253,10 +270,13 @@ def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
     db object's format_version metadata.
     """
     if remote_index_path.exists():
-        if flag == 'r':
-            return booklet.FixedLengthValue(remote_index_path, 'r')
-        else:
-            return booklet.FixedLengthValue(remote_index_path, 'w')
+        ## Writable in EVERY session mode since 0.10: replay-on-swap re-applies
+        ## journaled deletes to each fresh index copy (open and re-pull), and
+        ## 'r' sessions carry journals too. Safe: the local file is held under
+        ## an exclusive portalocker lock in every mode, so no second process
+        ## ever shares this sidecar. (Trade-off: 'r' sidecars lose the mmap
+        ## read path.)
+        return booklet.FixedLengthValue(remote_index_path, 'w')
     else:
         return booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
 
@@ -475,15 +495,28 @@ def check_local_vs_remote(local_file, remote_time_bytes, key):
 ### local/remote changelog
 
 
-def create_changelog(local_file_path, local_file, remote_index, remote_session):
+def create_changelog(local_file_path, local_file, remote_index, remote_session, journal=None):
     """
-    Only check and save by the microsecond timestamp. Might need to add in the md5 hash if this is not sufficient.
+    Build the push changelog: the UNION of the timestamp diff (local newer than
+    remote index) and the journal's pending writes. The timestamp diff catches
+    writes whose journal entry was lost in a crash window (booklet auto-flushes
+    data ahead of the sync-boundary journal persistence); the journal catches
+    clock-skewed edits the diff can never see, and is the only source of
+    deletes (which live outside the changelog file entirely).
+
+    Skew normalization: a journaled key whose local timestamp does not beat the
+    remote entry's is bumped to max(now, remote+1) BEFORE it enters the
+    changelog - without this the edit would push with its older stamp and
+    readers that already materialized the newer remote value would never pull
+    it (the 0.8.4 clock-skew case, now closed instead of warned about).
     """
     changelog_path = local_file_path.parent.joinpath(local_file_path.name + '.changelog')
     if remote_index is not None:
         n_buckets = remote_index._n_buckets
     else:
         n_buckets = local_file._n_buckets
+
+    journal_written = journal.written if journal is not None else ()
 
     with booklet.FixedLengthValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
         if remote_session.uuid and remote_index is not None:
@@ -498,6 +531,38 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session):
                 else:
                     local_bytes_us = int_to_bytes(local_int_us, 7)
                     f[key] = local_bytes_us + int_to_bytes(0, 7)
+
+            ## Journal union: pending writes the timestamp diff missed. The
+            ## only in-range candidates are skew-stamped edits (local <= remote)
+            ## and journal entries whose local value no longer exists.
+            now_int_us = booklet.utils.make_timestamp_int()
+            for key in sorted(journal_written):
+                if key in f:
+                    continue
+                local_int_us = local_file.get_timestamp(key)
+                if local_int_us is None:
+                    warnings.warn(
+                        f"The journal records an unpushed write for '{key}' but the key has no "
+                        'local value (evicted or externally removed) - it is DROPPED from this '
+                        'push. If the value mattered, re-set it before pushing.',
+                        UserWarning, stacklevel=3,
+                    )
+                    journal.discard_written(key)
+                    continue
+                remote_val = remote_index.get(key)
+                if remote_val:
+                    remote_int_us = bytes_to_int(remote_val[:7])
+                    new_ts = max(now_int_us, remote_int_us + 1)
+                    local_file.set_timestamp(key, new_ts)
+                    warnings.warn(
+                        f"The unpushed local edit of '{key}' carried a timestamp at or before the "
+                        "remote's (clock skew or an explicit set_timestamp); its timestamp was "
+                        'advanced so the edit propagates to readers that already hold the remote value.',
+                        UserWarning, stacklevel=3,
+                    )
+                    f[key] = int_to_bytes(new_ts, 7) + remote_val[:7]
+                else:
+                    f[key] = int_to_bytes(local_int_us, 7) + int_to_bytes(0, 7)
 
             # Metadata
             key = booklet.utils.metadata_key_bytes.decode()
@@ -518,6 +583,18 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session):
             for key, local_int_us in local_file.timestamps():
                 local_bytes_us = int_to_bytes(local_int_us, 7)
                 f[key] = local_bytes_us + int_to_bytes(0, 7)
+
+            ## Journal union, no-remote branch: every local key is already in
+            ## the changelog, so only the missing-local-value warning applies.
+            for key in sorted(journal_written):
+                if key not in f:
+                    warnings.warn(
+                        f"The journal records an unpushed write for '{key}' but the key has no "
+                        'local value (evicted or externally removed) - it is DROPPED from this '
+                        'push. If the value mattered, re-set it before pushing.',
+                        UserWarning, stacklevel=3,
+                    )
+                    journal.discard_written(key)
 
             # Metadata
             key = booklet.utils.metadata_key_bytes.decode()
@@ -570,17 +647,29 @@ def upload_value(key, local_file, remote_session):
         return None
 
 
-def update_remote(local_file, remote_index, changelog_path, remote_session, force_push, deletes, flag, ebooklet_type, num_groups=None):
+def update_remote(local_file, remote_index, changelog_path, remote_session, force_push, journal, replace_pending, ebooklet_type, num_groups=None, lock=None):
     """
-
+    Push the changelog to the remote. `journal` is the session's JournalState:
+    its deletes drive group repacking/object deletion, its written set gates
+    the pull loop (read-your-writes - a pending local write is never pulled
+    over), and its entries are cleared ONLY after the db-object commit
+    succeeds, for exactly the state that commit made durable (a failed or
+    skipped commit leaves everything retained for retry). `lock` (when given)
+    is re-verified immediately before the commit PUT - the point of no return.
     """
-    ## If file was open for replacement (n), then delete everything in the remote
-    if flag == 'n':
+    ## If a replacement is pending (flag 'n' intent, journal-persisted), delete
+    ## everything in the remote first. (Storage format 2 replaces this wipe-
+    ## first protocol with upload-then-commit-then-sweep.)
+    if replace_pending:
         remote_session.delete_remote()
+
+    deletes = journal.deletes   # read here; mutated only post-commit
 
     ## Upload data and update the remote_index file
     updated = False
     failures = {}
+    failed_gids = set()
+    metadata_uploaded = False
 
     with booklet.FixedLengthValue(changelog_path) as cl:
         if num_groups is not None:
@@ -627,6 +716,13 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                 if gid not in group_key_sets:
                     continue
                 group_key_sets[gid].add(key)
+                ## Read-your-writes gate: a journaled pending write is the
+                ## truth for its key - never pull the remote value over it
+                ## (this also covers the length==0 empty-value branch below).
+                ## Skew-stamped journaled edits were already timestamp-
+                ## normalized by create_changelog, so this gate is belt.
+                if key in journal.written:
+                    continue
                 if remote_val and check_local_vs_remote(local_file, remote_val[:7], key):
                     if local_file.get_timestamp(key) is not None:
                         logger.warning(f"Push is replacing the locally-stored value of '{key}' with the newer remote value before repacking its group - any unpushed local modification to it is discarded (its local timestamp is older than the remote's).")
@@ -703,6 +799,7 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                         if run_result is None:
                             remote_index[metadata_key_str] = cl[metadata_key_str][:7] + b'\x00' * 8
                             updated = True
+                            metadata_uploaded = True
                         else:
                             failures[identifier] = run_result
                     else:
@@ -720,20 +817,18 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                             failures[identifier] = error
 
             ## Deletions are handled by group re-packing (deleted keys excluded).
-            ## Only clear deletes whose group was successfully repacked and uploaded:
-            ## keeping a failed group's deletes in the set marks that group as
-            ## affected again on the next push, so its object is eventually repacked
-            ## (otherwise the deleted keys' bytes would stay orphaned in S3 forever).
+            ## Remove the index entries of deletes whose group repacked
+            ## successfully - the index bytes uploaded below must not reference
+            ## them. The JOURNAL is cleared only after the commit succeeds (a
+            ## failed group's deletes stay journaled either way, marking that
+            ## group as affected again on the next push so its object is
+            ## eventually repacked).
             failed_gids = {gid for gid in failures if isinstance(gid, int)}
-            retained_deletes = set()
             for key in deletes:
                 if key_to_group_id(key, num_groups) in failed_gids:
-                    retained_deletes.add(key)
                     continue
                 if key in remote_index:
                     del remote_index[key]
-            deletes.clear()
-            deletes.update(retained_deletes)
 
         else:
             ## Per-key upload path (legacy)
@@ -749,6 +844,8 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
                     if run_result is None:
                         remote_index[key] = cl[key][:7] + b'\x00' * 8
                         updated = True
+                        if key == metadata_key_str:
+                            metadata_uploaded = True
                     else:
                         failures[key] = run_result
 
@@ -758,10 +855,10 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
     ## Upload the remote_index file
     remote_index.sync()
 
-    ## Also write the db object when the remote does not exist yet (uuid is None) or
-    ## the remote was wiped (flag 'n'), so that creating/replacing an EMPTY database
-    ## still materializes the remote instead of being a silent no-op.
-    if updated or force_push or (deletes and num_groups is None) or flag == 'n' or remote_session.uuid is None:
+    ## Also write the db object when the remote does not exist yet or the
+    ## remote was wiped (replacement), so that creating/replacing an EMPTY
+    ## database still materializes the remote instead of being a silent no-op.
+    if updated or force_push or (deletes and num_groups is None) or replace_pending or not remote_session.initialized:
         time_int_us = booklet.utils.make_timestamp_int()
 
         ## Get main file init bytes. Direct _file access moves the shared file
@@ -791,17 +888,51 @@ def update_remote(local_file, remote_index, changelog_path, remote_session, forc
         if num_groups is not None:
             metadata['num_groups'] = str(num_groups)
 
+        ## The commit PUT is the point of no return: re-verify the write lock
+        ## so a holder whose ticket was broken (another client's force_lock)
+        ## aborts here instead of committing without mutual exclusion. All
+        ## pending state stays journaled for a retry.
+        if lock is not None and not lock.verify():
+            raise urllib3.exceptions.HTTPError(
+                "The write lock is no longer held (this session's lock ticket was broken by "
+                'another client) - aborting the push before the commit. All pending changes '
+                'are retained; re-open the file to re-acquire the lock and push again.'
+            )
+
         resp = remote_session.put_db_object(remote_index_bytes, metadata=metadata)
 
         if resp.status // 100 != 2:
             raise urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
 
-        ## remove deletes in remote (only for legacy per-key mode)
+        ## remove deletes in remote (only for legacy per-key mode). A raised
+        ## delete failure propagates BEFORE the journal clearing below, so the
+        ## pending deletes are retained for retry.
         if deletes and num_groups is None:
-            remote_session.delete_objects(deletes)
-            deletes.clear()
+            remote_session.delete_objects(list(deletes))
 
         updated = True
+
+        ## COMMIT SUCCEEDED - only now clear the journal, for exactly the
+        ## state this commit made durable (review-converged rule: never clear
+        ## on a failed or skipped commit; a partially-failed REPLACEMENT push
+        ## clears nothing, so the retry's purge cannot eat locally-held keys).
+        if replace_pending:
+            committed_written = set(journal.written) if not failures else set()
+            committed_deletes = set(journal.deletes) if not failures else set()
+        elif num_groups is not None:
+            committed_written = {k for k in journal.written if key_to_group_id(k, num_groups) not in failed_gids}
+            committed_deletes = {k for k in journal.deletes if key_to_group_id(k, num_groups) not in failed_gids}
+        else:
+            committed_written = journal.written - set(failures)
+            committed_deletes = set(journal.deletes)
+        journal.clear_committed(committed_written, committed_deletes)
+        if metadata_uploaded:
+            journal.set_meta_pending(False)
+        ## Record the storage-mode choice this commit materialized (tri-state:
+        ## per-key is num_groups=None WITH num_groups_set=True).
+        if not journal.num_groups_set:
+            journal.set_num_groups(num_groups)
+        journal.persist(local_file)
 
     if failures:
         return failures

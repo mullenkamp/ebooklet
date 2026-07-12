@@ -13,7 +13,7 @@ import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import booklet
-import orjson
+import msgspec
 import weakref
 from itertools import count
 from collections import deque
@@ -21,6 +21,7 @@ import urllib3
 
 from . import utils
 from . import remote
+from .journal import JournalState
 
 logger = logging.getLogger(__name__)
 
@@ -90,23 +91,37 @@ class Change:
         Determine if there are any changes between the local and remote databases.
         """
         self._ebooklet.sync()
-        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session)
+        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session, self._ebooklet._journal)
 
         self._changelog_path = changelog_path
 
 
     def iter_changes(self):
         """
-        Create an iterator of the changes.
+        Create an iterator of the changed/written keys. Pending DELETIONS are
+        not part of the changelog file - see pending_deletes.
         """
         if not self._changelog_path:
             self.update()
         return utils.view_changelog(self._changelog_path)
 
 
+    @property
+    def pending_deletes(self):
+        """
+        The keys whose deletion is journaled but not yet pushed (deletions are
+        applied to the remote by push()).
+        """
+        return frozenset(self._ebooklet._journal.deletes)
+
+
     def discard(self, keys=None):
         """
-        Removes changed keys in the local file. If keys is None, then removes all changed keys.
+        Discard pending local changes. Changed/written keys are removed from
+        the local file (their values transparently re-pull from the remote on
+        next access); pending DELETIONS are cancelled and their index entries
+        restored from the remote. If keys is None, discards all pending
+        changes.
         """
         if not self._ebooklet.writable:
             raise ValueError('File is open for read-only.')
@@ -114,15 +129,33 @@ class Change:
         if not self._changelog_path:
             self.update()
 
+        journal = self._ebooklet._journal
+
         with booklet.FixedLengthValue(self._changelog_path) as f:
             if keys is None:
-                rm_keys = f.keys()
+                rm_keys = list(f.keys())
             else:
                 rm_keys = [key for key in keys if key in f]
 
             for key in rm_keys:
-                # print(key)
                 del self._ebooklet._local_file[key]
+                journal.discard_written(key)
+
+        ## Cancel journaled deletions: forget them, then force an index
+        ## re-pull to restore the entries __delitem__ removed from the local
+        ## index copy (the timestamp-gated pull would skip an unchanged
+        ## remote).
+        if keys is None:
+            discard_deletes = set(journal.deletes)
+        else:
+            discard_deletes = journal.deletes & set(keys)
+        for key in discard_deletes:
+            journal.discard_delete(key)
+
+        journal.persist(self._ebooklet._local_file)
+
+        if discard_deletes:
+            self._ebooklet._pull_remote_index(force=True)
 
         self._changelog_path.unlink()
         self._changelog_path = None
@@ -139,12 +172,26 @@ class Change:
         if not self._ebooklet.writable:
             raise ValueError('File is open for read-only.')
 
-        ## flag 'n' replaces the database with THIS session's writes only: purge
-        ## everything else (transparently-read/materialized old keys and old index
-        ## entries) so reads can't resurrect old data into the new database and the
-        ## pushed index carries no dangling references to wiped objects.
-        if self._ebooklet._flag == 'n':
-            written = self._ebooklet._written_keys
+        ## Re-verify the write lock at the push boundary: a holder whose ticket
+        ## was broken (another client's force_lock) no longer has mutual
+        ## exclusion and must not push. (The commit PUT re-verifies again -
+        ## the point of no return.)
+        if self._ebooklet.lock is not None and not self._ebooklet.lock.verify():
+            raise urllib3.exceptions.HTTPError(
+                "The write lock is no longer held (this session's lock ticket was broken "
+                'by another client) - aborting the push. All pending changes are retained '
+                'in the journal; re-open the file to re-acquire the lock and push again.'
+            )
+
+        journal = self._ebooklet._journal
+
+        ## A pending replacement replaces the database with this local file's
+        ## written content only: purge everything else (transparently-read/
+        ## materialized old keys and old index entries) so reads can't
+        ## resurrect old data into the new database and the pushed index
+        ## carries no dangling references to wiped objects.
+        if journal.replace_pending:
+            written = journal.written
             stale_local = [k for k in self._ebooklet._local_file.keys()
                            if k != utils.metadata_key_str and k not in written]
             for k in stale_local:
@@ -156,30 +203,30 @@ class Change:
 
         self.update()
 
-        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, self._ebooklet._deletes, self._ebooklet._flag, self._ebooklet.type, self._ebooklet._num_groups)
+        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, journal, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock)
 
         if isinstance(result, dict):
             # Partial failure — don't clean up changelog so push can be retried.
-            # The 'n' flag is also kept so a retry redoes the full wipe-and-replace
-            # (the remote must never end up half old, half new).
+            # replace_pending is also kept so a retry redoes the full
+            # wipe-and-replace (the remote must never end up half old, half new).
             return result
 
-        ## A flag='n' session is a REPLACEMENT session only until the replacement
-        ## push completes - after that the remote IS this session's database, and
-        ## the session must behave like 'w'. Without this downgrade, every
-        ## subsequent push re-ran update_remote's wipe and re-uploaded only the
-        ## new changelog, silently destroying everything pushed earlier in the
-        ## session (data loss; found 2026-07-09 via cfdb's mid-session push test
-        ## once ebooklet 0.9.3 made missing objects loud).
-        if self._ebooklet._flag == 'n':
-            self._ebooklet._flag = 'w'
+        ## A replacement session is a REPLACEMENT only until the replacement
+        ## push completes - after that the remote IS this session's database,
+        ## and the session must behave like a plain writer. Without this,
+        ## every subsequent push re-ran update_remote's wipe and re-uploaded
+        ## only the new changelog, silently destroying everything pushed
+        ## earlier in the session (0.9.4's data-loss fix, now journal-backed
+        ## so the intent also survives sessions instead of dying with _flag).
+        if journal.replace_pending:
+            journal.set_replace_pending(False)
+            journal.persist(self._ebooklet._local_file)
 
         if result:
             self._changelog_path.unlink()
             self._changelog_path = None
-            self._ebooklet._deletes.clear()
 
-            if self._ebooklet._remote_session.uuid is None:
+            if not self._ebooklet._remote_session.initialized:
                 self._ebooklet._remote_session._load_db_metadata()
 
         return result
@@ -231,12 +278,16 @@ class EVariableLengthValue(MutableMapping):
                     msg = (
                         f'Could not acquire write lock within {lock_timeout}s. '
                         f'Blocked by existing lock(s) held for: {age_str}. '
-                        'If you are sure no other writer is active, re-open with force_lock=True to break stale locks.'
+                        'If you are sure no other writer is active, re-open with force_lock=True '
+                        '(age-gated: it only breaks lock tickets older than 2 hours, so a live '
+                        'writer is protected; to break YOUNGER tickets, call '
+                        'S3SessionWriter.break_other_locks(timestamp=<now>) directly).'
                     )
                 else:
                     msg = (
                         f'Could not acquire write lock within {lock_timeout}s. '
-                        'Re-open with force_lock=True to break stale locks.'
+                        'Re-open with force_lock=True to break stale locks (age-gated: only '
+                        'tickets older than 2 hours are broken).'
                     )
                 raise TimeoutError(msg)
             self.writable = True
@@ -273,23 +324,64 @@ class EVariableLengthValue(MutableMapping):
             local_file_existed = local_file_path.exists()
             local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
+            ## Load the persistent journal. flag 'n' recreates the local file,
+            ## which destroys any previous journal slot - exactly right, a
+            ## replacement starts with no pending history.
+            journal = JournalState.load(local_file)
+            if flag == 'n':
+                journal.set_replace_pending(True)
+            elif journal.replace_pending:
+                warnings.warn(
+                    "This local file carries an unpushed remote REPLACEMENT (a previous "
+                    "flag='n' session closed before pushing) - the next push will wipe and "
+                    'replace the remote database with this local content. To cancel the '
+                    'replacement instead, delete the local file and re-open from the remote.',
+                    UserWarning,
+                    stacklevel=4,
+                )
+
             remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
             ## Open remote index file
             remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size)
 
-            ## Resolve num_groups: remote metadata > user param
+            ## Replay journaled deletes onto the fresh index copy so deleted
+            ## keys cannot resurrect through contains/keys/len/reads (the
+            ## same replay runs after every _pull_remote_index handle swap).
+            for _k in journal.deletes:
+                if _k in remote_index:
+                    del remote_index[_k]
+
+            ## Resolve num_groups: remote metadata > journal > user param
             if remote_session.num_groups is not None:
                 resolved_num_groups = remote_session.num_groups
+                if journal.num_groups_set and journal.num_groups not in (None, resolved_num_groups):
+                    warnings.warn(
+                        f'The journal records num_groups={journal.num_groups} but the remote says '
+                        f'{resolved_num_groups}; the remote wins and the journal is updated.',
+                        UserWarning, stacklevel=4,
+                    )
+                journal.set_num_groups(resolved_num_groups)
+            elif journal.num_groups_set:
+                if num_groups is not None and num_groups != journal.num_groups:
+                    raise ValueError(
+                        f'num_groups={num_groups} conflicts with this local file\'s recorded choice '
+                        f'of {journal.num_groups}. Omit num_groups to keep the recorded choice, or '
+                        'recreate the database (flag=\'n\') to change the grouping.'
+                    )
+                resolved_num_groups = journal.num_groups
             else:
                 resolved_num_groups = num_groups
+                if resolved_num_groups is not None:
+                    journal.set_num_groups(resolved_num_groups)
 
-            ## Nothing local records the creation-time num_groups choice (a deliberate
-            ## trade-off to avoid another sidecar file), so reopening a
-            ## created-but-not-yet-pushed database without re-passing num_groups would
-            ## silently make the first push per-key. Warn loudly instead of guessing.
-            if (flag in ('w', 'c') and local_file_existed and remote_session.uuid is None
-                    and num_groups is None):
+            ## Reopening a created-but-not-yet-pushed database without a
+            ## recorded num_groups choice would silently make the first push
+            ## per-key. The journal records the choice since 0.10 (tri-state:
+            ## num_groups_set distinguishes "per-key chosen" from "never
+            ## recorded"), so this warning survives only for pre-journal files.
+            if (flag in ('w', 'c') and local_file_existed and not remote_session.initialized
+                    and num_groups is None and not journal.num_groups_set):
                 warnings.warn(
                     'This database has not been pushed to the remote yet and num_groups was not '
                     'provided - the first push will use per-key storage. If the database was '
@@ -312,10 +404,14 @@ class EVariableLengthValue(MutableMapping):
                 lock.release()
             raise
 
-        ## Finalizer
-        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock)
+        ## Finalizer (persists the journal before closing the local file, so a
+        ## GC'd session still records its pending state)
+        self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, local_file, remote_index, remote_session, lock, journal)
 
         ## Assign properties
+        ## _flag is FROZEN after open: the session-lifecycle facts it used to
+        ## proxy live in the journal (replace_pending) and the remote session
+        ## (initialized) - Seam-1 decomposition.
         self._flag = flag
         self.lock = lock
         self._local_file_path = local_file_path
@@ -328,17 +424,15 @@ class EVariableLengthValue(MutableMapping):
         ## under a concurrent reader. RLock: _resolve_missing holds it while
         ## calling _pull_remote_index.
         self._index_lock = threading.RLock()
-        self._deletes = set()
+        ## The persistent pending-change journal: written keys, pending deletes,
+        ## the num_groups choice, replacement intent, pending metadata. Replaces
+        ## the memory-only _written_keys/_deletes sets (Seam 2).
+        self._journal = journal
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
         self._buffer_size = buffer_size
         self.type = ebooklet_type
         self._num_groups = resolved_num_groups
-        ## Keys explicitly written during THIS session (set/__setitem__/update/
-        ## set_timestamp). Used by the flag 'n' push to build the replacement
-        ## database from true writes only - transparently-read (materialized) old
-        ## keys never leak into the new database.
-        self._written_keys = set()
 
 
     def set_metadata(self, data, timestamp=None):
@@ -347,6 +441,10 @@ class EVariableLengthValue(MutableMapping):
         """
         if self.writable:
             self._local_file.set_metadata(data, timestamp)
+            ## meta_pending marks an unpushed local metadata edit; it protects
+            ## the edit from being overwritten by remote refreshes and is
+            ## cleared when a push uploads the metadata.
+            self._journal.set_meta_pending(True)
         else:
             raise ValueError('File is open for read only.')
 
@@ -430,13 +528,14 @@ class EVariableLengthValue(MutableMapping):
         Set a timestamp for a specific key. The timestamp must be either an int of the number of microseconds in POSIX UTC time, an ISO 8601 datetime string with timezone, or a datetime object with timezone.
         """
         if self.writable:
+            if key in utils.reserved_key_strs:
+                raise ValueError(f"'{key}' is a reserved internal key.")
             self._local_file.set_timestamp(key, timestamp)
-            self._written_keys.add(key)
-            ## A re-written key must not stay in the pending-deletes set: the push's
-            ## delete pass runs after the upload pass and would remove the fresh
-            ## index entry, silently losing the key (mirror of __delitem__'s
-            ## _written_keys.discard).
-            self._deletes.discard(key)
+            ## record_write maintains the journal invariant written ∩ deletes = ∅
+            ## (a re-written key must not stay pending-delete: the push's delete
+            ## pass runs after the upload pass and would remove the fresh index
+            ## entry, silently losing the key).
+            self._journal.record_write(key)
         else:
             raise ValueError('File is open for read only.')
 
@@ -446,10 +545,11 @@ class EVariableLengthValue(MutableMapping):
         Set a value associated with a key.
         """
         if self.writable:
+            if key in utils.reserved_key_strs:
+                raise ValueError(f"'{key}' is a reserved internal key.")
             self._local_file.set(key, value, timestamp=timestamp, encode_value=encode_value)
-            self._written_keys.add(key)
-            ## A re-written key must not stay in the pending-deletes set (see set_timestamp).
-            self._deletes.discard(key)
+            ## record_write maintains written ∩ deletes = ∅ (see set_timestamp).
+            self._journal.record_write(key)
 
         else:
             raise ValueError('File is open for read only.')
@@ -513,7 +613,10 @@ class EVariableLengthValue(MutableMapping):
             ## timestamps (upstream bug, tracked in envlib OPEN_WORK).
             if timestamp is not None:
                 timestamp = booklet.utils.make_timestamp_int(timestamp)
-            removed = self._local_file.prune(timestamp=timestamp)
+            ## keep_keys: a timestamp eviction must never evict a journaled
+            ## PENDING write - that would silently launder unpushed data into
+            ## the changelog's dropped-key warning.
+            removed = self._local_file.prune(timestamp=timestamp, keep_keys=self._journal.written)
             self._n_buckets = self._local_file._n_buckets
 
             _ = self._remote_index.prune()
@@ -560,6 +663,11 @@ class EVariableLengthValue(MutableMapping):
                 if self._num_groups is not None:
                     groups_to_download = {}
                     for key, remote_val in items_iter:
+                        ## Read-your-writes gate: a journaled pending write is
+                        ## the truth for its key - never pull the remote value
+                        ## over it, regardless of timestamps.
+                        if key in self._journal.written:
+                            continue
                         remote_time_bytes = remote_val[:7] if remote_val else None
                         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                         if check:
@@ -578,6 +686,9 @@ class EVariableLengthValue(MutableMapping):
                         futures[f] = f'_group_{group_id}'
                 else:
                     for key, remote_val in items_iter:
+                        ## Read-your-writes gate (see the grouped branch).
+                        if key in self._journal.written:
+                            continue
                         remote_time_bytes = remote_val[:7] if remote_val else None
                         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                         if check:
@@ -604,11 +715,13 @@ class EVariableLengthValue(MutableMapping):
         return failure_dict
 
 
-    def _pull_remote_index(self):
+    def _pull_remote_index(self, force=False):
         """
         Refresh this session's view of the remote index (the body extracted from
         Change.pull; Change.pull delegates here). Holds _index_lock across the
         handle swap so point reads and load_items never observe a closed index.
+        force=True skips the timestamp freshness gate (used by discard() to
+        restore index entries a journaled delete removed locally).
         """
         with self._index_lock:
             self.sync()
@@ -623,10 +736,13 @@ class EVariableLengthValue(MutableMapping):
             ## reader opened before the first push) - adopt the remote's num_groups so
             ## subsequent reads use the right storage layout.
             if self._remote_session.num_groups is not None:
-                self._num_groups = self._remote_session.num_groups
+                if self._num_groups != self._remote_session.num_groups:
+                    self._num_groups = self._remote_session.num_groups
+                    self._journal.set_num_groups(self._num_groups)
+                    self._journal.persist(self._local_file)
 
             ## Determine if a change has occurred
-            overwrite_remote_index = utils.check_local_remote_sync(self._local_file, self._remote_session, self._flag)
+            overwrite_remote_index = force or utils.check_local_remote_sync(self._local_file, self._remote_session, self._flag)
             if not overwrite_remote_index:
                 return
 
@@ -647,8 +763,15 @@ class EVariableLengthValue(MutableMapping):
                 new_index = utils.open_remote_index(self._remote_index_path, self._flag, self._n_buckets, self._buffer_size)
                 self._remote_index = new_index
 
+            ## Replay journaled deletes onto the fresh index copy (still inside
+            ## _index_lock, atomic with the handle swap) so a re-pull cannot
+            ## resurrect a pending-delete key into contains/keys/reads.
+            for _k in self._journal.deletes:
+                if _k in new_index:
+                    del new_index[_k]
+
             self._finalizer.detach()
-            self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, new_index, self._remote_session, self.lock)
+            self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, new_index, self._remote_session, self.lock, self._journal)
 
             ## Record the freshness of this view so an immediate second pull() is a
             ## no-op. NOTE: this stamp must stay AFTER the fetch gate above - hoisting
@@ -700,6 +823,12 @@ class EVariableLengthValue(MutableMapping):
                     ## Legitimate deletion: clean up any stale materialized local
                     ## values so the key does not resurrect from the local file.
                     for k in marker.keys:
+                        ## Invariant: no remote-driven path may delete a
+                        ## journal-pending local value. Unreachable if the read
+                        ## gates are complete (a journaled key is never
+                        ## requested remotely), kept as the belt.
+                        if k in self._journal.written:
+                            continue
                         if k == utils.metadata_key_str:
                             ## booklet has no metadata unset; overwrite with null so
                             ## get_metadata() returns None (a raw skip would serve
@@ -720,6 +849,10 @@ class EVariableLengthValue(MutableMapping):
         """
 
         """
+        ## Read-your-writes gate: a journaled pending write is the truth for
+        ## its key - serve the local value, never pull the remote over it.
+        if key in self._journal.written:
+            return None
         with self._index_lock:
             remote_val = self._remote_index.get(key)
         remote_time_bytes = remote_val[:7] if remote_val else None
@@ -759,14 +892,25 @@ class EVariableLengthValue(MutableMapping):
 
     def __delitem__(self, key):
         if self.writable:
+            if key in utils.reserved_key_strs:
+                raise ValueError(f"'{key}' is a reserved internal key.")
             if key in self._remote_index:
                 del self._remote_index[key]
-                self._deletes.add(key)
+                self._journal.record_delete(key)
+            else:
+                ## A never-pushed key needs no remote delete, but a pending
+                ## write for it must not survive its local deletion.
+                self._journal.discard_written(key)
 
             if key in self._local_file:
                 del self._local_file[key]
 
-            self._written_keys.discard(key)
+            ## Deletes are rare and booklet delete-flags are already written
+            ## unbuffered, so persist the journal immediately - a hard crash
+            ## between here and the next sync boundary must not silently lose
+            ## the deletion (the union changelog covers crash-window WRITES
+            ## via the timestamp diff, but deletes have no other record).
+            self._journal.persist(self._local_file)
         else:
             raise ValueError('File is open for read only.')
 
@@ -782,6 +926,11 @@ class EVariableLengthValue(MutableMapping):
         """
         if self.writable:
             self._local_file.clear()
+            ## clear() truncates the file, destroying the journal slot. Local
+            ## values are gone so pending WRITES are moot, but pending DELETES
+            ## and a pending replacement survive - re-persist immediately.
+            self._journal.clear_written()
+            self._journal.persist(self._local_file, force=True)
 
         else:
             raise ValueError('File is open for read only.')
@@ -789,16 +938,11 @@ class EVariableLengthValue(MutableMapping):
     def close(self, force_shutdown=False):
         """
         Close all open objects. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
+
+        Pending (unpushed) writes and deletions survive the close: they are
+        recorded in the local file's persistent journal and will be included
+        in the next session's push.
         """
-        if self.writable and self._deletes:
-            warnings.warn(
-                f'{len(self._deletes)} pending deletion(s) have not been pushed - '
-                'deletions are tracked in memory only and are LOST when the session '
-                'closes (the deleted keys remain in the remote and can reappear). '
-                'Call push() before close() to apply them.',
-                UserWarning,
-                stacklevel=2,  # exact for direct close(); one frame off via __exit__
-            )
         self.sync()
         self._finalizer()
 
@@ -807,6 +951,9 @@ class EVariableLengthValue(MutableMapping):
         """
         Syncronize all cache to disk. This ensures all data has been saved to disk properly. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
+        ## Persist the journal first (if-dirty: a clean journal writes nothing,
+        ## so iterate-while-sync patterns are not invalidated by a no-op).
+        self._journal.persist(self._local_file)
         self._remote_index.sync()
         self._local_file.sync()
 
@@ -924,15 +1071,15 @@ class RemoteConnGroup(EVariableLengthValue):
         if key is not None:
             if not isinstance(key, str):
                 raise TypeError('key must be a str.')
-            if key == utils.metadata_key_str:
-                raise ValueError('key clashes with the internal metadata key.')
+            if key in utils.reserved_key_strs:
+                raise ValueError('key clashes with an internal reserved key.')
             if not rcg_key_pattern.match(key):
                 raise ValueError('key must match [A-Za-z0-9._-]+ (entry keys become S3 object-key suffixes; other characters are known to break request signing).')
 
         if user_meta is not None:
             try:
-                orjson.dumps(user_meta)
-            except TypeError as e:
+                msgspec.json.encode(user_meta)
+            except (TypeError, msgspec.EncodeError) as e:
                 raise TypeError(f'user_meta must be JSON-serializable: {e}')
 
         ## Get remote_conn metadata
@@ -962,7 +1109,7 @@ class RemoteConnGroup(EVariableLengthValue):
         ## member's timestamp - otherwise an upsert that changes only user_meta
         ## would never enter the changelog and would silently never push.
         self._local_file.set(key, conn_dict, None)
-        self._written_keys.add(key)
+        self._journal.record_write(key)
 
         ## Clean up a stale default-keyed entry for the same member (left by a
         ## pre-0.9.0-style add) when migrating to explicit keys.
