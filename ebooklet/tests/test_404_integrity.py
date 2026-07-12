@@ -166,7 +166,7 @@ def test_point_read_legit_deletion_quiet(caplog):
 
         with caplog.at_level(logging.INFO, logger='ebooklet.main'):
             assert reader.get(k) is None
-        assert any('deleted remotely' in rec.message for rec in caplog.records)
+        assert any('as absent after refreshing the index' in rec.message for rec in caplog.records)
 
         assert k not in reader
         with pytest.raises(KeyError):

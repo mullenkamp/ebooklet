@@ -4,6 +4,80 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.9.5 (unreleased)
+
+Phase 0 of the adopted architecture-assessment roadmap (see
+`architecture-assessment-synthesis.md`); design dual-reviewed pre-implementation
+(`phase0-design-brief.md` + the two `phase0-review-*.md` reports).
+
+### Fixed — data loss: S3 deletes were prefix-based, destroying unrelated objects
+- **Emptying one group deleted sibling groups.** `delete_object` issued a string-
+  PREFIX delete, and group objects are named by non-zero-padded decimal ids — so
+  deleting emptied group `1` also destroyed groups `10`, `11`, `12`, … (with
+  `num_groups=127`, up to ~38 sibling groups). The index entries survived, so
+  fresh readers then raised `RemoteIntegrityError` on perfectly live keys.
+  Reachable through any workflow that empties a group (e.g. cfdb chunk deletion).
+  Group deletes are now exact-key, all-versions deletes.
+- **`delete_remote()` deleted sibling databases.** It deleted by the bare
+  `db_key` prefix, so wiping `mydb` also wiped `mydb2` — and every `flag='n'`
+  push calls `delete_remote()` automatically. It now deletes exactly the db
+  object plus the `db_key + '/'` children.
+- **`delete_remote()` no longer deletes lock objects.** The bare prefix also
+  matched `db_key + '.lock.'`, so a `flag='n'` push deleted its OWN live lock
+  tickets mid-push, silently dropping mutual exclusion for the rest of the
+  session. Trade-off: a teardown no longer sweeps a crashed writer's stale
+  tickets — if a later writer blocks on them, use `force_lock=True` (age-gated
+  lock breaking is planned).
+- **The writability probe wrote outside the database's namespace.** Its test key
+  was `db_key + <hex>` (no separator) — a crashed probe left an orphan
+  indistinguishable from a sibling database. The probe now writes under
+  `db_key + '/_writable_probe_<hex>'`. Pre-existing orphans at the old location
+  cannot be swept safely and are left in place.
+- **Empty-valued grouped members were silently deleted by a repack.** A grouped
+  value of `b''` has index length 0, so the push pull-loop never materialized it
+  locally, and a repack from a session that didn't hold it locally dropped the
+  key entirely (the lost-keys path). Empty members are now materialized directly
+  (their value IS `b''`) before the repack. Pre-existing bug, found by this
+  round's design review.
+
+### Added
+- **Deleted-member reads are loud.** A member the index claims but its (present)
+  group object no longer contains now goes through the 0.9.3 re-check protocol,
+  like whole-object 404s already did: one index re-pull, then clean absence (key
+  legitimately deleted; stale local value purged) or `RemoteIntegrityError`.
+  Previously `key in db` said True while `db[key]` raised a bare KeyError with
+  no explanation. Pushes keep the deliberate self-heal (repack the group without
+  the dangling member and drop its index entry) — that remains the recovery
+  mechanism for the read-side error.
+- **`format_version`** stamped into the db object's S3 metadata (currently `1`;
+  absence = 1). Opening a remote with a newer stamp raises the new exported
+  **`UnsupportedFormatError`** (a `ValueError` — deliberately NOT a
+  `RemoteIntegrityError`, since a version mismatch is a compatibility fault, not
+  a store-vs-index inconsistency). This is the headroom the planned storage
+  redesign will bump.
+- **Close-time warning on unpushed deletions.** Deletions are tracked in memory
+  only (until the planned change journal); `close()` now emits a `UserWarning`
+  when pending deletions would be lost, including after a partial-failure push.
+- **Warning on plain-`http` `db_url`** at `S3Connection` construction (readers
+  would fetch the database unencrypted). `http` remains usable for local testing;
+  silence with `warnings.filterwarnings`. (A plain-`http` `endpoint_url` is a
+  separate concern — it carries signed requests — and is not warned about here.)
+- **README "Data Formats and Stability" section** documenting the remote
+  namespace, db-object metadata, the 15-byte index entry (including that
+  `length` may be 0 for empty grouped values and that the fixed `value_len` is
+  the layout discriminator), the group pack layout, and the **RCG entry schema
+  v1, now declared frozen**.
+- **Hermetic test layer** (`ebooklet/tests/fake_s3.py` + three new test files):
+  the first credential-free tests for the remote/push paths, driving the real
+  session and push code over an in-memory S3 fake. Version/purge semantics still
+  belong to the live tier (the fake models one version per key).
+
+### Changed
+- `S3SessionWriter.delete_object` now returns the error (or None) instead of
+  silently ignoring failures; a failed empty-group delete surfaces in the push's
+  partial-failure dict and is retried on the next push (previously it was
+  swallowed and the object orphaned).
+
 ## 0.9.4 (2026-07-12)
 
 ### Fixed — data loss: a second push in a `flag='n'` session wiped the remote again

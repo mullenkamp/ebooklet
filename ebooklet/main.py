@@ -701,8 +701,9 @@ class EVariableLengthValue(MutableMapping):
                         elif k in self._local_file:
                             del self._local_file[k]
                     logger.info(
-                        f"remote object '{marker.s3_key}' was deleted remotely; treating key(s) "
-                        f'{marker.keys} as absent after refreshing the index'
+                        f"the remote no longer provides key(s) {marker.keys} (object "
+                        f"'{marker.s3_key}' deleted, or repacked without them); treating them "
+                        f'as absent after refreshing the index'
                     )
                     out[fkey] = None
             return out
@@ -782,6 +783,15 @@ class EVariableLengthValue(MutableMapping):
         """
         Close all open objects. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
         """
+        if self.writable and self._deletes:
+            warnings.warn(
+                f'{len(self._deletes)} pending deletion(s) have not been pushed - '
+                'deletions are tracked in memory only and are LOST when the session '
+                'closes (the deleted keys remain in the remote and can reappear). '
+                'Call push() before close() to apply them.',
+                UserWarning,
+                stacklevel=2,  # exact for direct close(); one frame off via __exit__
+            )
         self.sync()
         self._finalizer()
 
@@ -887,7 +897,8 @@ class RemoteConnGroup(EVariableLengthValue):
             Caller-supplied metadata stored verbatim in the entry (e.g. a
             catalogue's queryable metadata dict).
 
-        Entry schema (version 1) - treat as a stable contract:
+        Entry schema (version 1) - FROZEN: consumers can rely on these fields
+        indefinitely; any future change arrives as a new entry_version.
         {'entry_version': 1,
          'type': <member ebooklet type>,
          'timestamp': <member remote's timestamp>,
