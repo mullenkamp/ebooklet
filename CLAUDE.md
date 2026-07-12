@@ -47,25 +47,27 @@ uv build
 
 2. **`main.py` — Database Layer**
    - `EVariableLengthValue(MutableMapping)` — the main database class. Maintains a local booklet file + a `.remote_index` file tracking what's on S3
-   - `RemoteConnGroup(EVariableLengthValue)` — specialized variant that stores `S3Connection` references (always uses `orjson` serializer)
-   - `Change` — manages sync workflow: `pull()` updates remote index, `update()` creates changelog, `push()` uploads changes
+   - `RemoteConnGroup(EVariableLengthValue)` — specialized variant that stores `S3Connection` references (stored with booklet's `'orjson'` value serializer — a file-format id, unrelated to the msgspec runtime serialization)
+   - `Change` — manages sync workflow: `pull()` updates remote index+manifest, `update()` creates the changelog (union of timestamp diff and the journal), `push()` runs the upload→commit→GC protocol, `pending_deletes`/`discard()` expose and cancel pending changes
    - `open_ebooklet()` — factory function for `EVariableLengthValue` databases
    - `open_rcg()` — factory function for `RemoteConnGroup` databases
 
+   Also `journal.py` — the persistent session state in booklet reserved slots: `JournalState` (slot 1: pending writes/deletes, num_groups tri-state, replace_pending, meta_pending — the source of read-your-writes and cross-session durability) and `RemoteState` (slot 2: the manifest + remote metadata section of the last in-sync db object). And `fsck.py` — `ebooklet.fsck()` orphan/integrity reporting + age-gated sweep.
+
 3. **`utils.py` — Sync Engine**
    - Handles local file initialization, remote index download, changelog creation, and multi-threaded upload/download via `ThreadPoolExecutor`
-   - `pack_group()` / `unpack_group()` — serialize/deserialize grouped key/value entries; `pack_group()` also returns byte-offset mapping
-   - `upload_group()` — packs and uploads a group, returns `(error, offsets_dict)`
-   - `get_remote_group_value()` — single-key byte-range S3 GET
-   - `get_remote_group_values()` — merged byte-range S3 GET for multiple keys in the same group
-   - `check_local_vs_remote()` — compares timestamps to decide if data needs downloading
+   - `pack_group()` / `unpack_group()` — serialize/deserialize grouped key/value entries; `pack_group()` also returns byte-offset mapping and enforces the 4 GiB cap (`GroupTooLargeError`)
+   - `upload_group()` — packs and uploads a group to a FRESH generation object, returns `(error, offsets_dict)`
+   - `get_remote_group_value(s)()` — byte-range S3 GETs against a group's live generation (resolved via the manifest)
+   - `check_local_vs_remote()` — compares timestamps to decide if data needs downloading (journaled pending writes are gated before this ever runs)
+   - `build_db_payload()` / `parse_db_payload()` — the format-2 db-object payload (manifest + metadata section + index bytes)
 
 ### Grouped S3 Storage
 
 When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_groups`). Each group is a single S3 object containing all key/value pairs for that bucket, packed via `pack_group()` / `unpack_group()` in `utils.py`.
 
 - **Byte-range reads:** The `remote_index` stores byte offset and length for each key within its group. Single-key reads use S3 byte-range GET requests to fetch only the needed bytes. Multi-key reads from the same group use a single merged byte-range GET (min offset → max offset+length).
-- **Grouped writes:** `push()` re-packs entire affected groups and uploads them. `upload_group()` returns offset info that gets stored in `remote_index`.
+- **Grouped writes:** `push()` re-packs entire affected groups and uploads each to a NEW immutable generation object (`{gid}.{gen13}`); offsets are STAGED and applied to `remote_index` only after the commit. Old generations are deleted (exact keys) after the commit; readers on the old manifest are never affected mid-push.
 - Per-key storage (no grouping) is used when `num_groups` is `None`.
 
 ### Data Flow
@@ -74,14 +76,14 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 - **Read path (grouped):** `db[key]` → check local file → if missing/stale, byte-range GET from group S3 object using stored offset/length → cache locally → return
 - **Bulk read (grouped):** `load_items()` → collect stale keys → group by group_id → one merged byte-range GET per group → cache locally
 - **Write path:** `db[key] = val` → write to local booklet file only
-- **Sync path:** `db.changes().push()` → create changelog (local vs remote timestamps) → upload changed items via thread pool → update remote index object on S3
+- **Sync path:** `db.changes().push()` → lock verify → changelog (timestamp diff ∪ journal; skew-stamped edits normalized) → pull unmaterialized group members (read-your-writes gated) → upload new generations via thread pool → lock verify → ONE db-object PUT (manifest+metadata+index — the atomic commit) → apply staged index entries, clear journal per committed group, persist remote-state → GC replaced generations (failures = invisible orphans for fsck)
 
 ### Key Files per Database
 
 - `{file_path}` — local booklet database
 - `{file_path}.remote_index` — tracks what's stored remotely (FixedLengthValue, 15 bytes per key: 7-byte timestamp + 4-byte offset + 4-byte length). For per-key mode, offset/length are zero-filled.
 - `{file_path}.changelog` — temporary diff file created during sync (14 bytes per key: 7-byte local timestamp + 7-byte remote timestamp)
-- S3: `{db_key}` (main index object) and `{db_key}/{key}` (individual values or group blobs)
+- S3: `{db_key}` (the db object: format-2 payload = manifest + metadata section + index; its single PUT is the push's commit point) and `{db_key}/{gid}.{gen13}` (immutable group generations) or `{db_key}/{key}` (per-key mode values)
 
 ### Concurrency Model
 
@@ -93,16 +95,18 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 ### Public API (`__init__.py`)
 
 ```python
-from ebooklet import open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup, S3Connection
+from ebooklet import (open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup,
+                      S3Connection, RemoteIntegrityError, UnsupportedFormatError,
+                      GroupTooLargeError, fsck, FsckReport)
 ```
 
 ### Dependencies
 
-Core: `booklet>=0.12.1`, `s3func>=0.7.2`, `urllib3>=2` (plus `uuid6`, `orjson`, `portalocker`, `base64`)
+Core: `booklet>=0.12.7` (reserved slots), `s3func>=0.9.3` (lock verify + age-gated breaking), `urllib3>=2`, `msgspec` (all ebooklet-owned serialization), `portalocker` (plus `uuid6` via booklet)
 
 ### Open Flags
 
 - `r` — read only (default)
 - `w` — read/write existing
 - `c` — read/write, create if missing
-- `n` — always create new (deletes existing remote data)
+- `n` — replace the remote: the intent is journaled (survives sessions; a 'w' reopen warns and completes it) and executed as upload→commit→sweep — a partially-failed replacement commits nothing and the old remote stays intact

@@ -17,6 +17,7 @@ Known fidelity limits (these belong to the live test tier):
 """
 import threading
 import io
+import datetime
 import uuid as _uuid
 
 from ebooklet import remote
@@ -42,9 +43,12 @@ class FakeListResp:
 
 
 class FakeLock:
-    """Single-process stand-in for the s3func bakery lock."""
+    """Single-process stand-in for the s3func bakery lock. verify() mirrors
+    s3func 0.9.3's contract minimally: True only while acquired. Tests that
+    need a broken-ticket scenario flip `broken` to make verify() fail."""
     def __init__(self):
         self._held = False
+        self.broken = False
 
     def acquire(self, blocking=True, timeout=-1, exclusive=True):
         self._held = True
@@ -52,6 +56,9 @@ class FakeLock:
 
     def release(self):
         self._held = False
+
+    def verify(self):
+        return self._held and not self.broken
 
     def other_locks(self):
         return {}
@@ -62,6 +69,10 @@ class FakeLock:
 
 class FakeS3Session:
     """Mimics s3func.S3Session over a shared in-memory dict {key: (bytes, metadata)}."""
+    ## upload timestamps are shared per STORE (like the objects themselves),
+    ## not per session - listings expose them; tests may back-date entries.
+    _upload_times_by_store = {}
+
     def __init__(self, store, store_lock=None, bucket='fake-bucket'):
         self.store = store
         self._lock = store_lock or threading.Lock()
@@ -70,6 +81,7 @@ class FakeS3Session:
         self._access_key_id = 'fake'
         self._access_key = 'fake'
         self.put_log = []           # every key ever PUT (survives deletes)
+        self.upload_times = self._upload_times_by_store.setdefault(id(store), {})
 
     # --- object ops -------------------------------------------------
     def put_object(self, key, obj, metadata=None, content_type=None):
@@ -80,6 +92,7 @@ class FakeS3Session:
         with self._lock:
             self.store[key] = (data, metadata)
             self.put_log.append(key)
+            self.upload_times[key] = datetime.datetime.now(datetime.timezone.utc)
         out_meta = dict(metadata)
         out_meta['version_id'] = _uuid.uuid4().hex
         return FakeResp(200, b'', out_meta)
@@ -124,7 +137,9 @@ class FakeS3Session:
 
     def list_objects(self, prefix=None, start_after=None, delimiter=None, max_keys=None):
         with self._lock:
-            items = [{'key': k, 'version_id': None} for k in sorted(self.store)
+            items = [{'key': k, 'version_id': None,
+                      'upload_timestamp': self.upload_times.get(k)}
+                     for k in sorted(self.store)
                      if prefix is None or k.startswith(prefix)]
         return FakeListResp(items)
 

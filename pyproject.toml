@@ -23,9 +23,11 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  "s3func>=0.9.2",
+  "s3func>=0.9.3",
   'urllib3>=2',
-  "booklet>=0.12.6",
+  "booklet>=0.12.7",
+  "msgspec>=0.18",
+  "portalocker",
 ]
 
 [dependency-groups]
@@ -38,6 +40,7 @@ dev = [
   "pytest-cov",
   "moto[s3]",
   "pytest-mock",
+  "pytest-xdist>=3.8.0",
 ]
 
 # [tool.ruff]

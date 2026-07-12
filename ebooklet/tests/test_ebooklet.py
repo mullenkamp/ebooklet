@@ -246,24 +246,40 @@ def test_prune():
 
     assert (removed_items > 0)  and (old_len > removed_items) and (new_len == old_len) and isinstance(test_value, int)
 
-    # Remove the rest via timestamp filter
+    # 0.10: a timestamp prune must NOT evict journaled pending (unpushed)
+    # writes - everything in this file is unpushed at this point.
     timestamp = booklet.utils.make_timestamp_int()
 
     with ebooklet.open_ebooklet(remote_conn, file_path, 'w') as f:
         removed_items = f.prune(timestamp=timestamp)
+        assert removed_items == 0, 'timestamp prune evicted unpushed journaled writes'
+        assert len(f) == old_len
+
+        # After a push the values are safely in the remote - NOW the timestamp
+        # eviction applies, and evicted values transparently re-pull.
+        assert f.changes().push() is True
+        removed_items = f.prune(timestamp=booklet.utils.make_timestamp_int())
         new_len = len(f)
         meta = f.get_metadata()
-
-    assert (old_len == removed_items) and (new_len == 0) and isinstance(meta, dict)
+        assert removed_items > 0
+        assert new_len == old_len            # index entries survive eviction
+        assert f['2'] == data_dict['2']      # transparent re-pull
+        assert isinstance(meta, dict)
 
 
 ## Always make this last!!!
 def test_clear():
+    ## clear() is LOCAL cache eviction only (the documented contract): the
+    ## local file empties, but keys stay visible through the remote index
+    ## (test_prune pushed this database) and re-pull transparently on access.
     with ebooklet.open_ebooklet(remote_conn, file_path, 'w') as f:
         f.clear()
-        f_meta = f.get_metadata()
 
-        assert (len(f) == 0) and (len(list(f.keys())) == 0) and (f_meta is None)
+        assert len(list(f._local_file.keys())) == 0   # local file emptied
+        assert len(f) == len(data)                    # remote index entries remain
+                                                      # (data excludes test_delete_len's deletions)
+        assert f['2'] == data_dict['2']               # transparent re-pull
+        assert f.get_metadata() == meta               # metadata re-pulls too
 
 
 #############################################################

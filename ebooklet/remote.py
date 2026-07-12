@@ -13,7 +13,8 @@ from typing import Union
 import s3func
 import warnings
 import weakref
-import orjson
+import msgspec
+import io
 import base64
 import datetime
 import concurrent.futures
@@ -142,7 +143,7 @@ class JsonSerializer:
         return d1
 
     def dumps(self):
-        return orjson.dumps(self.to_dict())
+        return msgspec.json.encode(self.to_dict())
 
 
 class S3SessionReader:
@@ -164,6 +165,16 @@ class S3SessionReader:
         Test to see if remote read access is possible. Same as .read_access.
         """
         return self.read_access
+
+    @property
+    def initialized(self):
+        """
+        Whether the remote database exists (its db object has been pushed at
+        least once). Maintained by _load_db_metadata: the 404 branch leaves
+        uuid None. This names the session-lifecycle fact directly instead of
+        scattering `uuid is None` checks (Seam-1 decomposition).
+        """
+        return self.uuid is not None
 
     def __enter__(self):
         return self
@@ -248,18 +259,15 @@ class S3SessionReader:
 
     def get_user_metadata(self):
         """
-        Get the user metadata.
+        Get the user metadata. Format 2 embeds it in the db-object payload
+        (killing the old separate '_metadata' object and its split-brain), so
+        this is a cheap ranged read of the payload's pre-index sections.
         """
-        s3_key = '_metadata' if self.num_groups is not None else f'{booklet.utils.metadata_key_bytes.decode()}'
-        resp_obj = self.get_object(s3_key)
-        if resp_obj.status == 200:
-            meta = orjson.loads(resp_obj.data)
-        elif resp_obj.status == 404:
-            meta = None
-        else:
-            raise urllib3.exceptions.HTTPError(resp_obj.error)
-
-        return meta
+        manifest, meta_section = utils.fetch_remote_state(self)
+        if manifest is None and meta_section is None:
+            return None
+        _ts, data = utils.parse_meta_section(meta_section)
+        return data
 
 
     def get_object(self, key: str=None, range_start: int=None, range_end: int=None):
@@ -403,7 +411,8 @@ class S3SessionWriter(S3SessionReader):
         'mydb2') and the lock namespace db_key + '.lock.', which must survive:
         the flag='n' push calls this while HOLDING its own session lock, and
         other writers' live tickets are theirs to release. Crashed writers'
-        stale tickets are left for force_lock (age-gated breaking is planned).
+        stale tickets are left for force_lock (age-gated since s3func 0.9.3:
+        only tickets older than 2 hours are broken, so live writers survive).
         """
         if self.writable:
             ## The db object is the existence marker - delete it first so a
@@ -439,10 +448,25 @@ class S3SessionWriter(S3SessionReader):
             if target_uuid is not None:
                 raise ValueError('The target remote already exists. Either delete_remote or use a different target.')
 
-            ## Get a list of all source objects
-            source_resp = self._write_session.list_objects(prefix=self.write_db_key + '/')
-            if source_resp.status // 100 != 2:
-                raise urllib3.exceptions.HTTPError(source_resp.error)
+            ## MANIFEST-DRIVEN object list (format 2): copy exactly what the
+            ## source db object references - the manifest's generation objects
+            ## (grouped mode) or the index's keys (per-key mode). A blind
+            ## prefix listing would also replicate orphans (abandoned
+            ## generations, crashed-probe leftovers).
+            db_resp = self.get_object()
+            if db_resp.status not in (200, 206):
+                raise urllib3.exceptions.HTTPError(db_resp.error)
+            src_manifest, _src_meta, src_index_bytes = utils.parse_db_payload(db_resp.data)
+
+            if src_manifest:
+                child_keys = [utils.group_obj_key(gid, gen) for gid, gen in src_manifest.items()]
+            else:
+                ## Per-key mode: the object names are the index's keys.
+                idx = booklet.FixedLengthValue(io.BytesIO(bytes(src_index_bytes)), 'r')
+                try:
+                    child_keys = [k for k in idx.keys() if k != booklet.utils.metadata_key_bytes.decode()]
+                finally:
+                    idx.close()
 
             ## Get all target objects
             target_resp = writer._write_session.list_objects(prefix=writer.write_db_key + '/')
@@ -462,9 +486,9 @@ class S3SessionWriter(S3SessionReader):
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-                    for obj in source_resp.iter_objects():
-                        source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
+                    for child in child_keys:
+                        source_key = self.write_db_key + '/' + child
+                        target_key = writer.write_db_key + '/' + child
                         if target_key not in target_exist_keys:
                             f = executor.submit(self._write_session.copy_object, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
@@ -489,9 +513,9 @@ class S3SessionWriter(S3SessionReader):
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-                    for obj in source_resp.iter_objects():
-                        source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
+                    for child in child_keys:
+                        source_key = self.write_db_key + '/' + child
+                        target_key = writer.write_db_key + '/' + child
                         if target_key not in target_exist_keys:
                             f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
@@ -541,7 +565,11 @@ class S3SessionWriter(S3SessionReader):
         Parameters
         ----------
         timestamp : str or datetime.datetime
-            All locks older than the timestamp will be removed. The default is now.
+            Lock tickets uploaded at or before the timestamp are removed. The
+            default is 2 hours ago (s3func's age gate): younger tickets are
+            presumed to belong to a LIVE writer, whose next push would then
+            abort at its lock re-verification. Pass an explicit now to break
+            everything regardless of age.
 
         Returns
         -------

@@ -28,9 +28,18 @@ def _keys_same_group(num_groups, n):
         i += 1
 
 
+def _group_store_key(store, db_key, gid):
+    """Find the live generation object of a group in the fake store."""
+    matches = [k for k in store if k.startswith(f'{db_key}/{gid}.')]
+    assert len(matches) == 1, f'expected exactly one generation of group {gid}, found {matches}'
+    return matches[0]
+
+
 def _repack_group_without(store, db_key, gid, drop_keys):
-    """Rewrite the group object excluding drop_keys; the index still claims them."""
-    gkey = f'{db_key}/{gid}'
+    """Rewrite the group object excluding drop_keys; the index still claims them.
+    (Damage primitive: writes IN PLACE at the live generation, simulating
+    corruption - a real push would create a new generation.)"""
+    gkey = _group_store_key(store, db_key, gid)
     data, meta = store[gkey]
     entries = [e for e in utils.unpack_group(data) if e[0] not in drop_keys]
     packed, _offsets = utils.pack_group(entries)
@@ -39,7 +48,7 @@ def _repack_group_without(store, db_key, gid, drop_keys):
 
 def _reorder_group(store, db_key, gid):
     """Rewrite the group object with entries reversed (offsets shift, all members present)."""
-    gkey = f'{db_key}/{gid}'
+    gkey = _group_store_key(store, db_key, gid)
     data, meta = store[gkey]
     entries = list(reversed(utils.unpack_group(data)))
     packed, _offsets = utils.pack_group(entries)

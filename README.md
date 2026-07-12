@@ -141,18 +141,34 @@ with ebooklet.open_rcg(remote_conn_rcg, '/tmp/rcg.blt', 'n') as rcg:
 
 ## Data Formats and Stability
 
-What EBooklet stores in a remote, and how stable each piece is. For a database at S3 key `D`:
+What EBooklet stores in a remote (storage **format 2**, since 0.10). For a database at S3 key `D`:
 
 | Object | Key | Contents |
 |--------|-----|----------|
-| db object | `D` | Body: the serialized remote-index booklet. S3 metadata: `timestamp`, `uuid`, `type`, `init_bytes`, `format_version`, and `num_groups` (grouped mode) |
-| children | `D/<name>` | Group objects (named by decimal group id), per-key values, and the user-metadata object `_metadata` |
+| db object | `D` | Body: the format-2 payload (below). S3 metadata: `timestamp`, `uuid`, `type`, `init_bytes`, `format_version`, and `num_groups` (grouped mode) |
+| group generations | `D/<gid>.<gen13>` | Immutable group objects: `gid` is the decimal group id, `gen13` a 13-hex generation token minted per push. Never overwritten — a repack creates a NEW generation and the commit un-references the old one before it is deleted |
+| per-key values | `D/<key>` | Per-key mode only (overwritten in place; each PUT is object-atomic, but there is no cross-key snapshot isolation — grouped mode is the recommended layout) |
 | lock tickets | `D.lock.<id>-<seq>` | Transient S3 lock objects for the active writer |
 
-- **`format_version`** (new in 0.9.5) stamps the remote storage format; the current version is 1, and remotes pushed by older versions (no stamp) are read as 1. An ebooklet refuses to open a remote whose `format_version` is newer than it supports (`UnsupportedFormatError`) — upgrade ebooklet instead.
-- **Remote-index entry** (15 bytes per key): `timestamp` (7 bytes) + `offset` (4) + `length` (4). In per-key mode, `offset` and `length` are always 0. In grouped mode they locate the member's value inside its group object — `length` is the value's byte length and **may be 0 for an empty value**. Future layouts will change the index's fixed entry size (`value_len`, 15 today), which is the layout discriminator — not the `length` field.
-- **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index.
+**db-object payload** — everything that must change together rides ONE object, whose single PUT is the push's atomic commit point:
+
+```
+magic b'ebooklet-db\x00' (12) | payload_version >H (2) | reserved (2)
+| manifest_len >Q (8) | meta_len >Q (8) | index_len >Q (8)
+| manifest: JSON {group_id: generation}      (empty in per-key mode)
+| meta:     JSON {"timestamp": µs, "data": ...}   (length 0 = no metadata)
+| index:    the serialized remote-index booklet
+```
+
+- **`format_version`** stamps the remote storage format; the current version is 2. Opening a remote with a NEWER stamp refuses with `UnsupportedFormatError` (upgrade ebooklet). Opening a **format-1** remote also refuses — 0.10 has no legacy read path. Upgrade recipe: push pending changes with 0.9.x, upgrade, then re-push each remote once with `flag='n'` (re-pass `num_groups`; it is not inherited), and re-`add` RemoteConnGroup members after the member remotes are upgraded.
+- **User metadata** is embedded in the payload's `meta` section (no separate `_metadata` object): it commits atomically with the data.
+- **Remote-index entry** (15 bytes per key): `timestamp` (7 bytes) + `offset` (4) + `length` (4). In per-key mode, `offset` and `length` are always 0. In grouped mode they locate the member's value inside its group's live generation (via the manifest) — `length` is the value's byte length and **may be 0 for an empty value**.
+- **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index. A group's packed size is capped at 4 GiB (`GroupTooLargeError` at pack time — use a larger `num_groups` for bigger databases).
 - **RCG entry schema v1**: frozen (see Remote Connection Groups above).
+
+**Integrity checking** — `ebooklet.fsck(remote_conn)` reports orphans (objects nothing references: abandoned generations from crashed pushes, failed GC leftovers), referenced-but-missing objects, and torn teardowns; `fsck(conn, delete_orphans=True)` sweeps aged orphans under the write lock (orphans are invisible to readers, so this is housekeeping, not repair).
+
+**Local state** — pending (unpushed) writes and deletions are journaled inside the local booklet file and survive sessions: reads always see your own unpushed changes, deletions cannot resurrect, and the next `push()` applies everything pending. `force_lock=True` on open breaks only lock tickets older than 2 hours (a live writer is protected; it would otherwise abort at its next push's lock re-verification).
 
 ## Open Flags
 

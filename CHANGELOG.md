@@ -4,7 +4,160 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.9.5 (unreleased)
+## 0.10.0 (2026-07-13)
+
+Phase 1 of the architecture-assessment roadmap (design dual-reviewed
+pre-implementation: `phase1-design-brief.md` + the two `phase1-review-*.md`
+reports). Releases together with the Phase-2 API pass as one release.
+Requires booklet >= 0.12.7 (reserved slots) and s3func >= 0.9.3 (lock verify
++ age-gated breaking). New dependencies: msgspec (serialization for all new
+ebooklet-owned formats); portalocker now declared (was only transitive).
+
+### Added — the persistent pending-change journal (Seam 2)
+- **Pending writes and deletions now survive the session** in a hidden journal
+  inside the local booklet file (a reserved slot - no sidecar files). Deletions
+  were memory-only: closing without pushing silently lost them (0.9.5 could
+  only warn); they are now journaled at `del` time (crash-safe), honored by
+  reads in later sessions, and applied by the next push, whenever it happens.
+- **Clock-skewed local edits now push.** An edit whose timestamp was at or
+  before the remote's never entered the timestamp-diff changelog - it silently
+  never uploaded (the 0.8.4 warning-only case). The changelog is now the UNION
+  of the timestamp diff and the journal, and a skew-stamped journaled edit has
+  its timestamp advanced (with a warning) so readers that already hold the
+  newer remote value pick up the edit.
+- **Read-your-writes.** A read used to pull a newer remote value OVER an
+  unpushed local edit, destroying it. Journaled pending writes are now served
+  from the local file unconditionally; no remote-driven path (reads, index
+  re-pulls, the missing-object re-check's cleanup, `prune(timestamp=...)`)
+  may overwrite or evict a journal-pending value.
+- **Deletions cannot resurrect.** Every fresh index copy (open and re-pull)
+  is replayed against the journal's pending deletions, so `in`/`keys()`/reads
+  stay consistent even after another writer's push refreshes the index.
+- **`flag='n'` replacement intent survives the session.** Previously an
+  unpushed 'n' session's intent was silently forgotten by a 'w' reopen and the
+  next push half-merged new keys into the old remote (neither old nor new).
+  The intent is journaled: the reopen warns loudly and the next push performs
+  the replacement. It clears only when a replacement push fully succeeds.
+- **num_groups is remembered.** The journal records the grouping choice
+  (tri-state - "per-key chosen" is distinct from "never recorded"), so
+  reopening a created-but-unpushed database no longer needs num_groups
+  re-passed and the 0.9.1 per-key-fallback warning is gone for 0.10 files.
+  A conflicting num_groups kwarg now raises.
+- **Journal clearing is commit-scoped**: entries clear only after the db-object
+  upload (the push's commit point) succeeds, for exactly the groups that
+  commit covered; a partially-failed replacement push clears nothing, so its
+  retry cannot purge locally-held keys.
+- `changes().pending_deletes` surfaces the journaled deletions;
+  `changes().discard()` now also cancels them (restoring their index entries
+  from the remote) and updates the journal.
+
+### Changed — storage format 2: generational immutable group objects
+The remote storage format is redesigned around one invariant: **no object a
+reader can reference is ever overwritten or deleted before the commit that
+un-references it**. Both independent architecture reviews converged on this
+design unprompted.
+
+- **Group objects are immutable generations**, named `{gid}.{gen13}`. A push
+  packs each changed group into a FRESH generation object; the old generation
+  is untouched until after the commit. The mid-push reader window is gone: a
+  reader's ranged GET can never hit a repacked object at stale offsets.
+- **The db object is the atomic commit point.** Its payload now carries the
+  manifest (group id -> live generation), the user-metadata section, and the
+  index - everything that must change together rides ONE PUT. A torn push
+  can no longer corrupt reader views: before the commit, readers see the old
+  state fully intact; after it, the new state; never a mixture.
+- **The push protocol is upload -> commit -> GC.** New generations upload
+  first (invisible); the db-object PUT commits; replaced/emptied generations
+  are deleted by exact key afterwards. GC failures are log-only orphans that
+  nothing references - `ebooklet.fsck` sweeps them. New index entries are
+  STAGED and applied to the local sidecar only after the commit, so a failed
+  commit leaves no local reference to uncommitted objects.
+- **Replacement pushes (`flag='n'`) no longer wipe first.** They upload, then
+  commit (the single PUT atomically flips readers to the replacement), then
+  sweep the namespace of everything the new manifest does not reference. A
+  partially-failed replacement commits NOTHING - the old remote stays fully
+  readable (previously it was left wiped and half-uploaded).
+- **The 0.9.3 re-check protocol now HEALS the routine reader race**: a value
+  fetch that hits a GC'd generation re-pulls the index+manifest and retries
+  once against the new generation. `RemoteIntegrityError` is reserved for
+  confirmed faults (the retry also failing). A re-pull that finds the remote
+  torn down treats outstanding fetches as clean absence, not integrity faults.
+- **User metadata is embedded in the db-object payload** - the separate
+  `_metadata` object and its split-brain with the db object are gone.
+  Metadata changes commit atomically with everything else; a push from a
+  session that never edited metadata carries the remote's section forward
+  verbatim; replacement pushes never resurrect the old remote's metadata; a
+  skew-stamped local `set_metadata` pushes with its timestamp advanced
+  (mirroring the key rule).
+- **`copy_remote` is manifest-driven**: it copies exactly the objects the
+  source db object references - orphans are no longer replicated.
+- **`format_version` is 2**, stamped in the db object's S3 metadata. There is
+  NO format-1 read path (a deliberate no-compatibility decision - all
+  existing remotes are under the author's control): 0.10 refuses format-1
+  remotes for r/w/c with `UnsupportedFormatError`, and pre-0.10 clients
+  refuse format-2 remotes via the 0.9.5 reader guard. **Upgrade recipe**:
+  push pending changes with 0.9.x, upgrade, then re-push each remote once
+  with `flag='n'` (re-pass num_groups - it is not inherited); re-add
+  RemoteConnGroup members after the member remotes are upgraded.
+- **>4 GiB groups are guarded at pack time** (`GroupTooLargeError`, exported):
+  previously an oversized group overflowed the 4-byte offset/length fields
+  mid-push. The failure is per-group and marked non-retryable in the log
+  (re-shard with a larger num_groups).
+- Per-key mode (num_groups=None) keeps in-place per-object semantics: each
+  PUT is object-atomic, but there is no cross-key snapshot isolation
+  (documented; grouped mode is the recommended layout).
+
+### Added — `ebooklet.fsck`
+`fsck(remote_conn, delete_orphans=False, min_age=timedelta(hours=24),
+check_objects=False) -> FsckReport`: the manifest makes integrity checking
+trivial - it IS the list of objects the database references. Reports orphans
+(abandoned/unGC'd generations, aged probe leftovers), referenced-but-missing
+objects (real integrity faults), unmanifested group ids, and torn teardowns
+(children without a db object). The optional sweep takes the write lock and
+age-gates every deletion (default 24h) so an in-flight or promptly-retried
+push is never robbed of its fresh uploads.
+
+### Added — lock safety at push boundaries (F5)
+- **`push()` re-verifies the write lock** at push start and again immediately
+  before the db-object commit. A holder whose lock ticket was broken (another
+  client's force_lock) aborts BEFORE writing instead of pushing without mutual
+  exclusion; everything stays journaled for a retry.
+- `force_lock=True` is now age-gated via s3func 0.9.3: it breaks only lock
+  tickets older than 2 hours, so a live writer's session survives an impatient
+  force_lock (its own tickets are also never broken). This closes the 0.9.5
+  "crashed-writer lock orphans" residual: force_lock is now safe to use
+  routinely.
+
+### Changed
+- The 0.9.5 close-time "pending deletions will be LOST" warning is removed -
+  it is no longer true.
+- User keys equal to internal reserved key strings are rejected with
+  ValueError (previously only RemoteConnGroup.add checked, and only for the
+  metadata key).
+- The remote-index sidecar is opened writable in read-only sessions too
+  (needed by the deletion replay; safe - the local file holds an exclusive
+  OS lock in every mode, so no second process shares the sidecar).
+- Internal: session lifecycle state is decomposed (`_flag` is frozen after
+  open; the replacement intent lives in the journal; "remote exists" is the
+  session's `initialized` property) - the 0.9.4 flag downgrade is gone.
+- RemoteConnGroup entry validation and connection serialization use msgspec
+  (byte-identical JSON; the stored `'orjson'` value-serializer id in existing
+  local files is unchanged and still supported).
+
+## 0.9.6 (2026-07-12)
+
+### Fixed — data loss: deleting a key and re-setting it in the same session lost the key on push
+`del eb[key]` followed by `eb[key] = new_value` (or a `set_timestamp`) in the same
+session left the key in the pending-deletes set: the push's delete pass runs after
+the upload pass and removed the index entry the upload had just written. The push
+reported success; fresh readers raised KeyError; the new bytes sat unreferenced in
+the group object. Reachable through any delete-then-recreate workflow (e.g. deleting
+a cfdb variable and recreating it in one session). `set`/`set_timestamp` now remove
+the key from the pending deletes — the mirror of what deletion already did to the
+pending writes. Present since deletes were introduced. Found by the Phase-1 design
+review (`phase1-review-claude.md`, F-1) and verified against 0.9.5.
+
+## 0.9.5 (2026-07-12)
 
 Phase 0 of the adopted architecture-assessment roadmap (see
 `architecture-assessment-synthesis.md`); design dual-reviewed pre-implementation
