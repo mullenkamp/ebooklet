@@ -432,6 +432,11 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self._local_file.set_timestamp(key, timestamp)
             self._written_keys.add(key)
+            ## A re-written key must not stay in the pending-deletes set: the push's
+            ## delete pass runs after the upload pass and would remove the fresh
+            ## index entry, silently losing the key (mirror of __delitem__'s
+            ## _written_keys.discard).
+            self._deletes.discard(key)
         else:
             raise ValueError('File is open for read only.')
 
@@ -443,6 +448,8 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self._local_file.set(key, value, timestamp=timestamp, encode_value=encode_value)
             self._written_keys.add(key)
+            ## A re-written key must not stay in the pending-deletes set (see set_timestamp).
+            self._deletes.discard(key)
 
         else:
             raise ValueError('File is open for read only.')

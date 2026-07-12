@@ -4,7 +4,20 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.9.5 (unreleased)
+## 0.9.6 (2026-07-12)
+
+### Fixed — data loss: deleting a key and re-setting it in the same session lost the key on push
+`del eb[key]` followed by `eb[key] = new_value` (or a `set_timestamp`) in the same
+session left the key in the pending-deletes set: the push's delete pass runs after
+the upload pass and removed the index entry the upload had just written. The push
+reported success; fresh readers raised KeyError; the new bytes sat unreferenced in
+the group object. Reachable through any delete-then-recreate workflow (e.g. deleting
+a cfdb variable and recreating it in one session). `set`/`set_timestamp` now remove
+the key from the pending deletes — the mirror of what deletion already did to the
+pending writes. Present since deletes were introduced. Found by the Phase-1 design
+review (`phase1-review-claude.md`, F-1) and verified against 0.9.5.
+
+## 0.9.5 (2026-07-12)
 
 Phase 0 of the adopted architecture-assessment roadmap (see
 `architecture-assessment-synthesis.md`); design dual-reviewed pre-implementation
