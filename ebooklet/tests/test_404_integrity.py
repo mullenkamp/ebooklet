@@ -200,7 +200,11 @@ def test_point_read_legit_deletion_quiet_per_key_mode():
 ### Metadata
 
 
-def test_metadata_integrity_raises():
+def test_metadata_reads_are_local_in_format2():
+    ## Format 2: metadata rides the db-object payload and is refreshed into the
+    ## local slot at open/pull - a reader's get_metadata never performs a value
+    ## fetch, so injected value-fetch 404s cannot touch it (the old separate
+    ## '_metadata' object and its integrity-failure mode are gone).
     k = sole_member_key()
     conn = make_conn('metaint')
     p = local_path('metaint-seed')
@@ -211,8 +215,7 @@ def test_metadata_integrity_raises():
 
     with open_ebooklet(conn, local_path('metaint-reader'), flag='r') as eb:
         patch_value_fetches_404(eb)
-        with pytest.raises(RemoteIntegrityError):
-            eb.get_metadata()
+        assert eb.get_metadata() == {'m': 1}
 
 
 def test_metadata_legit_deletion_branch_unsets_local():
@@ -366,7 +369,11 @@ def test_live_group_object_deleted_under_reader():
 
     with open_ebooklet(conn, local_path('live-reader'), flag='r') as eb:
         with conn.open('w') as s:
-            s.delete_object(str(gid))
+            ## Find and delete the group's LIVE generation object (format 2).
+            children = [o['key'] for o in s.list_objects().iter_objects()]
+            live = [k for k in children if k.startswith(f'{conn.db_key}/{gid}.')]
+            assert live, f'no generation object found for group {gid}'
+            s.delete_object(live[0].removeprefix(conn.db_key + '/'))
 
         with pytest.raises(RemoteIntegrityError, match='integrity'):
             eb.get(k)

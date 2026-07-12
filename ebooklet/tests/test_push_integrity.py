@@ -187,7 +187,7 @@ def test_grouped_delete_all_members():
     gid = key_to_group_id(k1, num_groups)
     with conn.open('w') as s:
         object_keys = [o['key'] for o in s.list_objects().iter_objects()]
-    assert f'{conn.db_key}/{gid}' not in object_keys
+    assert not any(k.startswith(f'{conn.db_key}/{gid}.') for k in object_keys)
 
 
 #################################################
@@ -271,7 +271,12 @@ def test_corrupted_group_object_recovery():
 
     packed, _ = pack_group([(k2, k2_ts, b'value-K2')])
     with conn.open('w') as s:
-        resp = s.put_object(str(gid), packed)
+        ## Corrupt the group's LIVE generation IN PLACE (format 2 pushes never
+        ## do this - that is the point of the damage primitive).
+        children = [o['key'] for o in s.list_objects().iter_objects()]
+        live = [k for k in children if k.startswith(f'{conn.db_key}/{gid}.')]
+        assert live, f'no generation object found for group {gid}'
+        resp = s.put_object(live[0].removeprefix(conn.db_key + '/'), packed)
         assert resp.status // 100 == 2
 
     with open_ebooklet(conn, local_path('corrupt-writer'), flag='w') as eb:
@@ -531,7 +536,7 @@ def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
 
     names = _remote_basenames(conn)
     assert 'key000' not in names                  # no raw per-key objects
-    assert any(name.isdigit() for name in names)  # group objects present
+    assert any(name.split('.')[0].isdigit() for name in names)  # group objects present
 
     vals, _ = read_all(conn, ['key000', 'key001'])
     assert vals == {'key000': b'v0', 'key001': b'v1'}

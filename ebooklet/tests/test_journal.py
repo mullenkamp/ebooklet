@@ -210,7 +210,7 @@ def test_partial_failure_retains_failed_groups_only(tmp_path):
         orig_put = session.put_object
         gid_a = utils.key_to_group_id(k_a, num_groups)
         def failing_put(key, data, metadata=None):
-            if key == f'testdb/{gid_a}':
+            if key.startswith(f'testdb/{gid_a}.'):   # any generation of group A
                 return fake_s3.FakeResp(status=500, error={'message': 'induced failure'})
             return orig_put(key, data, metadata)
         session.put_object = failing_put
@@ -368,7 +368,7 @@ def test_num_groups_tristate_reopen(tmp_path):
     finally:
         eb.close()
 
-    assert 'testdb/1' in store or any(k.startswith('testdb/') and k.split('/')[1].isdigit() for k in store), \
+    assert any(k.startswith('testdb/') and k.split('/')[1].split('.')[0].isdigit() for k in store), \
         'first push was not grouped'
 
 

@@ -55,15 +55,18 @@ def test_emptied_group_delete_spares_sibling_groups(tmp_path):
         eb[k12] = b'twelve'
         assert eb.changes().push() is True
 
-    assert 'testdb/1' in store and 'testdb/10' in store and 'testdb/12' in store
+    def _has_group(gid):
+        return any(k.startswith(f'testdb/{gid}.') for k in store)
+
+    assert _has_group(1) and _has_group(10) and _has_group(12)
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         del eb[k1]
         assert eb.changes().push() is True
 
-    assert 'testdb/1' not in store
-    assert 'testdb/10' in store, 'prefix delete of group 1 destroyed group 10'
-    assert 'testdb/12' in store, 'prefix delete of group 1 destroyed group 12'
+    assert not _has_group(1)
+    assert _has_group(10), 'delete of group 1 destroyed group 10'
+    assert _has_group(12), 'delete of group 1 destroyed group 12'
 
     ## The surviving members must still be readable by a fresh reader.
     conn2 = fake_s3.FakeS3Connection(store, 'testdb')

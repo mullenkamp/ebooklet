@@ -82,7 +82,7 @@ def test_db_object_metadata_carries_format_version(tmp_path):
         assert eb.changes().push() is True
 
     _data, meta = store['testdb']
-    assert meta['format_version'] == '1'
+    assert meta['format_version'] == '2'
 
 
 def test_too_new_format_version_is_refused(tmp_path):
@@ -94,7 +94,7 @@ def test_too_new_format_version_is_refused(tmp_path):
 
     data, meta = store['testdb']
     meta = dict(meta)
-    meta['format_version'] = '2'
+    meta['format_version'] = '3'
     store['testdb'] = (data, meta)
 
     conn2 = fake_s3.FakeS3Connection(store, 'testdb')
@@ -106,8 +106,10 @@ def test_too_new_format_version_is_refused(tmp_path):
     assert not issubclass(UnsupportedFormatError, ebooklet.RemoteIntegrityError)
 
 
-def test_absent_format_version_means_v1(tmp_path):
-    """Remotes pushed by <=0.9.4 carry no stamp and must keep opening."""
+def test_format_1_is_refused_except_replacement(tmp_path):
+    """0.10 no-compat contract: a format-1 remote (absent stamp = v1) refuses
+    r/w/c loudly; flag='n' replacement proceeds (index-fetch-suppressed) and
+    its commit upgrades the remote to format 2."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
@@ -116,12 +118,28 @@ def test_absent_format_version_means_v1(tmp_path):
 
     data, meta = store['testdb']
     meta = dict(meta)
-    del meta['format_version']
+    del meta['format_version']      # absent stamp = format 1
     store['testdb'] = (data, meta)
 
     conn2 = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn2, tmp_path / 'r.blt', flag='r') as eb:
-        assert eb['k'] == b'v'
+    with pytest.raises(UnsupportedFormatError, match='format-1|format_version 1|no format-1'):
+        open_ebooklet(conn2, tmp_path / 'r.blt', flag='r')
+    with pytest.raises(UnsupportedFormatError):
+        open_ebooklet(conn2, tmp_path / 'w2.blt', flag='w')
+
+    ## The replacement path works and upgrades the remote to format 2.
+    conn3 = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn3, tmp_path / 'n.blt', flag='n', num_groups=5) as eb:
+        eb['fresh'] = b'f1'
+        assert 'k' not in eb        # v1 content is never read (suppressed)
+        assert eb.changes().push() is True
+
+    _data2, meta2 = store['testdb']
+    assert meta2['format_version'] == '2'
+    conn4 = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn4, tmp_path / 'r2.blt', flag='r') as eb:
+        assert eb['fresh'] == b'f1'
+        assert 'k' not in eb
 
 
 def test_http_db_url_warns():

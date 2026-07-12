@@ -169,3 +169,67 @@ class JournalState:
         if self.meta_pending != value:
             self.meta_pending = value
             self._dirty = True
+
+
+class RemoteStateRecord(msgspec.Struct):
+    """
+    The serialized form of the remote-state cache (reserved slot 2): the
+    manifest (gid -> live generation) and metadata section of the LAST db
+    object this local file is in sync with, keyed by that object's timestamp.
+    Needed because an in-sync session never re-fetches the db object - a
+    memory-only manifest would strand grouped reads after a restart.
+    """
+    v: int = 1
+    remote_ts: int | None = None
+    manifest: dict[int, str] = {}
+    meta_section: bytes | None = None
+
+
+class RemoteState:
+    """
+    Live remote-state cache: the manifest grouped reads resolve generations
+    through, and the metadata section pushes carry forward. Persisted to
+    reserved slot 2 whenever the committed/pulled remote state changes.
+    """
+
+    __slots__ = ('remote_ts', 'manifest', 'meta_section', '_dirty')
+
+    def __init__(self, record: RemoteStateRecord = None):
+        if record is None:
+            record = RemoteStateRecord()
+        self.remote_ts = record.remote_ts
+        self.manifest = dict(record.manifest)
+        self.meta_section = record.meta_section
+        self._dirty = False
+
+    @classmethod
+    def load(cls, local_file):
+        raw = local_file.get_reserved(REMOTE_STATE_SLOT)
+        if raw is None:
+            return cls()
+        record = msgspec.json.decode(raw, type=RemoteStateRecord)
+        if record.v > 1:
+            raise ValueError(
+                f'This local file carries a remote-state cache with version {record.v}, '
+                'which this ebooklet does not support. Upgrade ebooklet to open it.'
+            )
+        return cls(record)
+
+    def persist(self, local_file, force: bool = False):
+        if not (self._dirty or force):
+            return
+        record = RemoteStateRecord(
+            v=1,
+            remote_ts=self.remote_ts,
+            manifest=self.manifest,
+            meta_section=self.meta_section,
+            )
+        local_file.set_reserved(REMOTE_STATE_SLOT, msgspec.json.encode(record))
+        self._dirty = False
+
+    def update_committed(self, manifest, meta_section, remote_ts):
+        """Adopt the state a commit (or a pull of the db object) published."""
+        self.manifest = dict(manifest)
+        self.meta_section = meta_section
+        self.remote_ts = remote_ts
+        self._dirty = True

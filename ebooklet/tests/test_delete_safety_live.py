@@ -109,17 +109,18 @@ def test_live_emptied_group_delete_spares_siblings():
         del eb[k1]
         assert eb.changes().push() is True
 
-    ## Real listing: exactly group 1 gone, siblings present.
+    ## Real listing: exactly group 1 gone (all its generations), siblings present.
     with conn.open('w') as s3open:
         child_keys = {o['key'] for o in s3open.list_objects().iter_objects()}
-        assert f'{db_key}/1' not in child_keys
-        assert f'{db_key}/10' in child_keys, 'exact-key delete removed sibling group 10'
-        assert f'{db_key}/12' in child_keys, 'exact-key delete removed sibling group 12'
-        ## Version-level proof: no version of 'db/1' survives (the purge), while
-        ## sibling groups keep theirs.
-        version_keys = [o['key'] for o in s3open._write_session.list_object_versions(prefix=f'{db_key}/1').iter_objects()]
-        assert f'{db_key}/1' not in version_keys
-        assert f'{db_key}/10' in version_keys
+        assert not any(k.startswith(f'{db_key}/1.') for k in child_keys)
+        assert any(k.startswith(f'{db_key}/10.') for k in child_keys), 'delete removed sibling group 10'
+        assert any(k.startswith(f'{db_key}/12.') for k in child_keys), 'delete removed sibling group 12'
+        ## Version-level proof: no version of any group-1 generation survives
+        ## (the purge), while sibling groups keep theirs.
+        version_keys_1 = [o['key'] for o in s3open._write_session.list_object_versions(prefix=f'{db_key}/1.').iter_objects()]
+        assert not version_keys_1
+        version_keys_10 = [o['key'] for o in s3open._write_session.list_object_versions(prefix=f'{db_key}/10.').iter_objects()]
+        assert version_keys_10
 
     with open_ebooklet(conn, local_path('grp-r'), flag='r') as eb:
         assert eb[k10] == b'ten'

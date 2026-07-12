@@ -21,7 +21,7 @@ import urllib3
 
 from . import utils
 from . import remote
-from .journal import JournalState
+from .journal import JournalState, RemoteState
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,13 @@ class Change:
         for key in discard_deletes:
             journal.discard_delete(key)
 
+        ## A full discard also reverts an unpushed metadata edit: restore the
+        ## local slot from the cached remote metadata section.
+        if keys is None and journal.meta_pending:
+            remote_ts, data = utils.parse_meta_section(self._ebooklet._remote_state.meta_section)
+            self._ebooklet._local_file.set_metadata(data, timestamp=remote_ts)
+            journal.set_meta_pending(False)
+
         journal.persist(self._ebooklet._local_file)
 
         if discard_deletes:
@@ -193,17 +200,19 @@ class Change:
         if journal.replace_pending:
             written = journal.written
             stale_local = [k for k in self._ebooklet._local_file.keys()
-                           if k != utils.metadata_key_str and k not in written]
+                           if k not in written]
             for k in stale_local:
                 del self._ebooklet._local_file[k]
+            ## The index purge includes any stale metadata entry (metadata has
+            ## no index entry in format 2).
             stale_index = [k for k in self._ebooklet._remote_index.keys()
-                           if k != utils.metadata_key_str and k not in written]
+                           if k not in written]
             for k in stale_index:
                 del self._ebooklet._remote_index[k]
 
         self.update()
 
-        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._changelog_path, self._ebooklet._remote_session, force_push, journal, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock)
+        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock)
 
         if isinstance(result, dict):
             # Partial failure — don't clean up changelog so push can be retried.
@@ -221,6 +230,12 @@ class Change:
         if journal.replace_pending:
             journal.set_replace_pending(False)
             journal.persist(self._ebooklet._local_file)
+
+        ## After this session's own v2 commit, a formerly format-1 remote is
+        ## format 2 - index fetches are allowed again.
+        if self._ebooklet._index_fetch_suppressed:
+            self._ebooklet._index_fetch_suppressed = False
+            self._ebooklet._remote_session._load_db_metadata()
 
         if result:
             self._changelog_path.unlink()
@@ -312,8 +327,13 @@ class EVariableLengthValue(MutableMapping):
         try:
             ## flag 'n' guard: the 'n' contract keeps the old remote readable until
             ## push, and those reads need the OLD grouping - a conflicting
-            ## num_groups cannot be honored.
-            if flag == 'n' and num_groups is not None and remote_session.num_groups is not None and num_groups != remote_session.num_groups:
+            ## num_groups cannot be honored. Carve-out: a format-1 remote is
+            ## never read (index-fetch-suppressed replacement), so its old
+            ## grouping is irrelevant and a fresh num_groups choice is fine.
+            v1_remote = (remote_session.initialized and remote_session.format_version is not None
+                         and remote_session.format_version < utils.SUPPORTED_FORMAT_VERSION)
+            if (flag == 'n' and not v1_remote and num_groups is not None
+                    and remote_session.num_groups is not None and num_groups != remote_session.num_groups):
                 raise ValueError(
                     f"num_groups={num_groups} conflicts with the existing remote's num_groups={remote_session.num_groups}. "
                     "flag 'n' keeps the old remote readable until push, which requires the existing grouping. "
@@ -333,17 +353,64 @@ class EVariableLengthValue(MutableMapping):
             elif journal.replace_pending:
                 warnings.warn(
                     "This local file carries an unpushed remote REPLACEMENT (a previous "
-                    "flag='n' session closed before pushing) - the next push will wipe and "
-                    'replace the remote database with this local content. To cancel the '
+                    "flag='n' session closed before pushing) - the next push will replace "
+                    'the remote database with this local content. To cancel the '
                     'replacement instead, delete the local file and re-open from the remote.',
                     UserWarning,
                     stacklevel=4,
                 )
 
-            remote_index_path = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
+            ## Format gate (no-compat ruling): 0.10 reads ONLY format-2
+            ## remotes. A format-1 remote is refused for r/w/c; the two
+            ## REPLACEMENT paths (flag='n', and 'w' recovering a crashed 'n'
+            ## via the journaled intent) may proceed, but run "index-fetch-
+            ## suppressed": no v1 index body is ever ingested - reads serve
+            ## only the local image until this session's own v2 commit.
+            index_fetch_suppressed = False
+            if v1_remote:
+                if flag == 'n' or journal.replace_pending:
+                    index_fetch_suppressed = True
+                else:
+                    raise utils.UnsupportedFormatError(
+                        f'This remote database uses storage format_version '
+                        f'{remote_session.format_version}; 0.10 has no format-1 read path. '
+                        "Re-create the remote by re-pushing it with flag='n' (re-pass "
+                        'num_groups - it is not inherited from the old remote).'
+                    )
+
+            if index_fetch_suppressed:
+                ## Never fetch the format-1 body. flag='n' starts from a fresh
+                ## EMPTY index (old keys read as absent - the documented
+                ## semantic narrowing of a replacement over v1); 'w'-recovery
+                ## keeps the crashed session's sidecar (the replacement image).
+                remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
+                if flag == 'n' and remote_index_path.exists():
+                    remote_index_path.unlink()
+                fetched_manifest = None
+                fetched_meta = None
+            else:
+                remote_index_path, fetched_manifest, fetched_meta = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
             ## Open remote index file
             remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size)
+
+            ## The persistent remote-state cache (manifest + metadata section
+            ## of the last in-sync db object). Refresh it from what the open
+            ## fetched, or - when the local stamp says in-sync but the cache
+            ## disagrees (a crash window) - from a cheap ranged GET.
+            remote_state = RemoteState.load(local_file)
+            if fetched_manifest is not None:
+                remote_state.update_committed(fetched_manifest, fetched_meta, remote_session.timestamp)
+                utils.refresh_local_metadata(local_file, journal, fetched_meta)
+                remote_state.persist(local_file)
+            elif (not index_fetch_suppressed and remote_session.initialized
+                    and remote_session.timestamp is not None
+                    and remote_state.remote_ts != remote_session.timestamp
+                    and remote_session.num_groups is not None):
+                rs_manifest, rs_meta = utils.fetch_remote_state(remote_session)
+                if rs_manifest is not None:
+                    remote_state.update_committed(rs_manifest, rs_meta, remote_session.timestamp)
+                    remote_state.persist(local_file)
 
             ## Replay journaled deletes onto the fresh index copy so deleted
             ## keys cannot resurrect through contains/keys/len/reads (the
@@ -352,8 +419,10 @@ class EVariableLengthValue(MutableMapping):
                 if _k in remote_index:
                     del remote_index[_k]
 
-            ## Resolve num_groups: remote metadata > journal > user param
-            if remote_session.num_groups is not None:
+            ## Resolve num_groups: remote metadata > journal > user param.
+            ## (A v1 remote's grouping is never inherited - its objects are
+            ## never read; the replacement chooses fresh.)
+            if remote_session.num_groups is not None and not index_fetch_suppressed:
                 resolved_num_groups = remote_session.num_groups
                 if journal.num_groups_set and journal.num_groups not in (None, resolved_num_groups):
                     warnings.warn(
@@ -428,6 +497,13 @@ class EVariableLengthValue(MutableMapping):
         ## the num_groups choice, replacement intent, pending metadata. Replaces
         ## the memory-only _written_keys/_deletes sets (Seam 2).
         self._journal = journal
+        ## The persistent remote-state cache: the manifest (gid -> live
+        ## generation) grouped reads resolve through, and the metadata section
+        ## pushes carry forward (reserved slot 2).
+        self._remote_state = remote_state
+        ## True while this session sits over a format-1 remote it will
+        ## replace: no index-body fetch may happen until its own v2 commit.
+        self._index_fetch_suppressed = index_fetch_suppressed
         self._remote_session = remote_session
         self._n_buckets = local_file._n_buckets
         self._buffer_size = buffer_size
@@ -453,11 +529,10 @@ class EVariableLengthValue(MutableMapping):
         """
         Get the metadata. Optionally include the timestamp in the output.
         Will return None if no metadata has been assigned.
-        """
-        failure = self._load_item(booklet.utils.metadata_key_bytes.decode())
-        if failure:
-            raise _failure_exception(failure)
 
+        Metadata rides the db-object payload (format 2): the local slot is
+        refreshed whenever the index is pulled, so this is a local read.
+        """
         self._local_file.sync()
 
         return self._local_file.get_metadata(include_timestamp=include_timestamp)
@@ -663,6 +738,10 @@ class EVariableLengthValue(MutableMapping):
                 if self._num_groups is not None:
                     groups_to_download = {}
                     for key, remote_val in items_iter:
+                        ## Stale metadata entries can survive in indexes built
+                        ## from pre-format-2 local files - never fetched.
+                        if key == utils.metadata_key_str:
+                            continue
                         ## Read-your-writes gate: a journaled pending write is
                         ## the truth for its key - never pull the remote value
                         ## over it, regardless of timestamps.
@@ -671,18 +750,25 @@ class EVariableLengthValue(MutableMapping):
                         remote_time_bytes = remote_val[:7] if remote_val else None
                         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                         if check:
-                            if key == utils.metadata_key_str:
-                                f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                                futures[f] = key
-                            else:
-                                group_id = utils.key_to_group_id(key, self._num_groups)
-                                offset = utils.bytes_to_int(remote_val[7:11])
-                                length = utils.bytes_to_int(remote_val[11:15])
-                                timestamp_int = utils.bytes_to_int(remote_val[:7])
-                                groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
+                            group_id = utils.key_to_group_id(key, self._num_groups)
+                            offset = utils.bytes_to_int(remote_val[7:11])
+                            length = utils.bytes_to_int(remote_val[11:15])
+                            timestamp_int = utils.bytes_to_int(remote_val[:7])
+                            groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
 
+                    ## Resolve generations INSIDE _index_lock: the manifest is
+                    ## updated atomically with the index handle, so the pairs
+                    ## are consistent here.
                     for group_id, key_infos in groups_to_download.items():
-                        f = executor.submit(utils.get_remote_group_values, group_id, key_infos, self._local_file, self._remote_session)
+                        gen = self._remote_state.manifest.get(group_id)
+                        if gen is None:
+                            ## The index claims members of a group the manifest
+                            ## does not reference - route through the re-check
+                            ## protocol like any missing backing object.
+                            failure_dict[f'_group_{group_id}'] = utils.MissingRemoteObject(
+                                f'{group_id}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
+                            continue
+                        f = executor.submit(utils.get_remote_group_values, group_id, gen, key_infos, self._local_file, self._remote_session)
                         futures[f] = f'_group_{group_id}'
                 else:
                     for key, remote_val in items_iter:
@@ -724,6 +810,12 @@ class EVariableLengthValue(MutableMapping):
         restore index entries a journaled delete removed locally).
         """
         with self._index_lock:
+            ## An index-fetch-suppressed session (replacing a format-1 remote)
+            ## must never ingest the old body; its view is the local image
+            ## until its own v2 commit.
+            if self._index_fetch_suppressed:
+                return
+
             self.sync()
 
             ## Reload the full remote db metadata - not just the timestamp. A session
@@ -750,7 +842,7 @@ class EVariableLengthValue(MutableMapping):
             ## session untouched (a close-then-fetch order would strand the session
             ## with a closed index handle).
             tmp_path = self._remote_index_path.parent.joinpath(self._remote_index_path.name + '.tmp')
-            fetched = utils.fetch_remote_index(tmp_path, self._remote_session)
+            fetched, manifest, meta_section = utils.fetch_remote_index(tmp_path, self._remote_session)
             if not fetched:
                 return
 
@@ -770,8 +862,20 @@ class EVariableLengthValue(MutableMapping):
                 if _k in new_index:
                     del new_index[_k]
 
+            ## Adopt the pulled manifest + metadata INSIDE the same critical
+            ## section as the handle swap - load_items must never pair a new
+            ## index with an old manifest.
+            self._remote_state.update_committed(manifest, meta_section, self._remote_session.timestamp)
+            utils.refresh_local_metadata(self._local_file, self._journal, meta_section)
+
             self._finalizer.detach()
             self._finalizer = weakref.finalize(self, utils.ebooklet_finalizer, self._local_file, new_index, self._remote_session, self.lock, self._journal)
+
+            ## Persist the remote-state cache BEFORE stamping freshness: a
+            ## crash between the two must leave the stamp OLD (forcing a
+            ## harmless re-fetch) rather than claiming freshness over a stale
+            ## manifest.
+            self._remote_state.persist(self._local_file)
 
             ## Record the freshness of this view so an immediate second pull() is a
             ## no-op. NOTE: this stamp must stay AFTER the fetch gate above - hoisting
@@ -796,10 +900,17 @@ class EVariableLengthValue(MutableMapping):
         deleter can exist for them: their re-pull is a no-op (remote timestamp
         unchanged) -> still-claims -> loud, which is the intended behavior.
 
-        Accepted residual: a reader re-checking during a writer's mid-push
-        window (an emptied group object already deleted, the new db object not
-        yet uploaded) re-pulls the OLD index and reports a loud failure for
-        what is really a transient race.
+        Generational storage (format 2) makes "still claimed" the COMMON
+        HEALABLE case for readers: a writer committed and GC'd the old
+        generation between this reader's index pull and its value fetch. The
+        re-pull refreshes both the index and the manifest, so the fetch is
+        re-issued ONCE against the new generation; only a second failure goes
+        loud. (Residual: a false RemoteIntegrityError needs two full writer
+        commit+GC cycles inside one reader operation - an extremely hot
+        writer, not corruption.)
+
+        A re-pull that finds the remote GONE (torn down) treats every
+        outstanding marker as clean absence, not an integrity fault.
         """
         with self._index_lock:
             try:
@@ -812,37 +923,93 @@ class EVariableLengthValue(MutableMapping):
                 )
                 raise
 
+            ## Whole-remote absence: the database itself no longer exists -
+            ## every outstanding marker is clean absence (with local cleanup),
+            ## never an integrity fault.
+            remote_gone = not self._remote_session.initialized
+
             out = {}
             for fkey, marker in missing.items():
-                still_claimed = [k for k in marker.keys if self._remote_index.get(k) is not None]
-                if still_claimed:
-                    marker.keys = still_claimed
-                    logger.warning(repr(marker))
-                    out[fkey] = marker
+                if remote_gone:
+                    still_claimed = []
                 else:
-                    ## Legitimate deletion: clean up any stale materialized local
-                    ## values so the key does not resurrect from the local file.
-                    for k in marker.keys:
-                        ## Invariant: no remote-driven path may delete a
-                        ## journal-pending local value. Unreachable if the read
-                        ## gates are complete (a journaled key is never
-                        ## requested remotely), kept as the belt.
-                        if k in self._journal.written:
-                            continue
-                        if k == utils.metadata_key_str:
-                            ## booklet has no metadata unset; overwrite with null so
-                            ## get_metadata() returns None (a raw skip would serve
-                            ## stale metadata after a legitimate remote deletion).
-                            self._local_file.set_metadata(None)
-                        elif k in self._local_file:
-                            del self._local_file[k]
+                    still_claimed = [k for k in marker.keys if self._remote_index.get(k) is not None]
+
+                ## Keys the FRESH index no longer claims were legitimately
+                ## deleted: clean up stale materialized local values so they
+                ## do not resurrect from the local file.
+                cleanly_absent = [k for k in marker.keys if k not in still_claimed]
+                for k in cleanly_absent:
+                    ## Invariant: no remote-driven path may delete a
+                    ## journal-pending local value. Unreachable if the read
+                    ## gates are complete (a journaled key is never
+                    ## requested remotely), kept as the belt.
+                    if k in self._journal.written:
+                        continue
+                    if k == utils.metadata_key_str:
+                        ## booklet has no metadata unset; overwrite with null so
+                        ## get_metadata() returns None (a raw skip would serve
+                        ## stale metadata after a legitimate remote deletion).
+                        self._local_file.set_metadata(None)
+                    elif k in self._local_file:
+                        del self._local_file[k]
+                if cleanly_absent:
                     logger.info(
-                        f"the remote no longer provides key(s) {marker.keys} (object "
-                        f"'{marker.s3_key}' deleted, or repacked without them); treating them "
-                        f'as absent after refreshing the index'
+                        f"the remote no longer provides key(s) {cleanly_absent} (object "
+                        f"'{marker.s3_key}' deleted, torn down, or repacked without them); "
+                        f'treating them as absent after refreshing the index'
                     )
+
+                if not still_claimed:
                     out[fkey] = None
+                    continue
+
+                ## Still claimed: re-issue the fetch ONCE against the
+                ## refreshed index + manifest (the healable generational-GC
+                ## race); only a second failure is a confirmed integrity
+                ## fault.
+                retry_failure = self._retry_fetch(still_claimed)
+                if retry_failure is None:
+                    out[fkey] = None
+                else:
+                    if isinstance(retry_failure, utils.MissingRemoteObject):
+                        logger.warning(repr(retry_failure))
+                    out[fkey] = retry_failure
             return out
+
+
+    def _retry_fetch(self, keys):
+        """
+        Re-fetch keys the refreshed index still claims, through the refreshed
+        manifest. Returns None when everything materialized, or the remaining
+        failure (marker or error). Caller holds _index_lock.
+        """
+        if self._num_groups is not None:
+            by_group = {}
+            for k in keys:
+                remote_val = self._remote_index.get(k)
+                if remote_val is None:
+                    continue
+                gid = utils.key_to_group_id(k, self._num_groups)
+                offset = utils.bytes_to_int(remote_val[7:11])
+                length = utils.bytes_to_int(remote_val[11:15])
+                timestamp_int = utils.bytes_to_int(remote_val[:7])
+                by_group.setdefault(gid, []).append((k, offset, length, timestamp_int))
+            for gid, key_infos in by_group.items():
+                gen = self._remote_state.manifest.get(gid)
+                if gen is None:
+                    return utils.MissingRemoteObject(
+                        f'{gid}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
+                failure = utils.get_remote_group_values(gid, gen, key_infos, self._local_file, self._remote_session)
+                if failure is not None:
+                    return failure
+            return None
+        else:
+            for k in keys:
+                failure = utils.get_remote_value(self._local_file, k, self._remote_session)
+                if failure is not None:
+                    return failure
+            return None
 
 
     def _load_item(self, key):
@@ -855,16 +1022,24 @@ class EVariableLengthValue(MutableMapping):
             return None
         with self._index_lock:
             remote_val = self._remote_index.get(key)
+            ## Resolve the generation inside the lock (manifest and index are
+            ## updated atomically).
+            gen = self._remote_state.manifest.get(utils.key_to_group_id(key, self._num_groups)) if self._num_groups is not None else None
         remote_time_bytes = remote_val[:7] if remote_val else None
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
             if self._num_groups is not None and key != utils.metadata_key_str:
                 group_id = utils.key_to_group_id(key, self._num_groups)
-                offset = utils.bytes_to_int(remote_val[7:11])
-                length = utils.bytes_to_int(remote_val[11:15])
-                timestamp_int = utils.bytes_to_int(remote_val[:7])
-                failure = utils.get_remote_group_value(group_id, key, offset, length, timestamp_int, self._local_file, self._remote_session)
+                if gen is None:
+                    ## Index claims the key, manifest lacks its group - treat
+                    ## like a missing backing object (re-check protocol).
+                    failure = utils.MissingRemoteObject(f'{group_id}.<unmanifested>', [key])
+                else:
+                    offset = utils.bytes_to_int(remote_val[7:11])
+                    length = utils.bytes_to_int(remote_val[11:15])
+                    timestamp_int = utils.bytes_to_int(remote_val[:7])
+                    failure = utils.get_remote_group_value(group_id, gen, key, offset, length, timestamp_int, self._local_file, self._remote_session)
             else:
                 failure = utils.get_remote_value(self._local_file, key, self._remote_session)
 
@@ -926,11 +1101,19 @@ class EVariableLengthValue(MutableMapping):
         """
         if self.writable:
             self._local_file.clear()
-            ## clear() truncates the file, destroying the journal slot. Local
-            ## values are gone so pending WRITES are moot, but pending DELETES
-            ## and a pending replacement survive - re-persist immediately.
+            ## clear() truncates the file, destroying BOTH reserved slots.
+            ## Local values are gone so pending WRITES (incl. an unpushed
+            ## metadata edit) are moot, but pending DELETES, a pending
+            ## replacement, and the remote-state cache survive - re-persist
+            ## both immediately.
             self._journal.clear_written()
+            self._journal.set_meta_pending(False)
             self._journal.persist(self._local_file, force=True)
+            self._remote_state.persist(self._local_file, force=True)
+            ## clear is LOCAL cache eviction: values transparently re-pull on
+            ## access, and the remote's metadata stays visible too - restore
+            ## it into the fresh local slot from the cached section.
+            utils.refresh_local_metadata(self._local_file, self._journal, self._remote_state.meta_section)
 
         else:
             raise ValueError('File is open for read only.')

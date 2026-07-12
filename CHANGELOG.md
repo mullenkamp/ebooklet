@@ -4,7 +4,7 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.10.0 (unreleased)
+## 0.10.0 (2026-07-13)
 
 Phase 1 of the architecture-assessment roadmap (design dual-reviewed
 pre-implementation: `phase1-design-brief.md` + the two `phase1-review-*.md`
@@ -50,6 +50,72 @@ ebooklet-owned formats); portalocker now declared (was only transitive).
 - `changes().pending_deletes` surfaces the journaled deletions;
   `changes().discard()` now also cancels them (restoring their index entries
   from the remote) and updates the journal.
+
+### Changed — storage format 2: generational immutable group objects
+The remote storage format is redesigned around one invariant: **no object a
+reader can reference is ever overwritten or deleted before the commit that
+un-references it**. Both independent architecture reviews converged on this
+design unprompted.
+
+- **Group objects are immutable generations**, named `{gid}.{gen13}`. A push
+  packs each changed group into a FRESH generation object; the old generation
+  is untouched until after the commit. The mid-push reader window is gone: a
+  reader's ranged GET can never hit a repacked object at stale offsets.
+- **The db object is the atomic commit point.** Its payload now carries the
+  manifest (group id -> live generation), the user-metadata section, and the
+  index - everything that must change together rides ONE PUT. A torn push
+  can no longer corrupt reader views: before the commit, readers see the old
+  state fully intact; after it, the new state; never a mixture.
+- **The push protocol is upload -> commit -> GC.** New generations upload
+  first (invisible); the db-object PUT commits; replaced/emptied generations
+  are deleted by exact key afterwards. GC failures are log-only orphans that
+  nothing references - `ebooklet.fsck` sweeps them. New index entries are
+  STAGED and applied to the local sidecar only after the commit, so a failed
+  commit leaves no local reference to uncommitted objects.
+- **Replacement pushes (`flag='n'`) no longer wipe first.** They upload, then
+  commit (the single PUT atomically flips readers to the replacement), then
+  sweep the namespace of everything the new manifest does not reference. A
+  partially-failed replacement commits NOTHING - the old remote stays fully
+  readable (previously it was left wiped and half-uploaded).
+- **The 0.9.3 re-check protocol now HEALS the routine reader race**: a value
+  fetch that hits a GC'd generation re-pulls the index+manifest and retries
+  once against the new generation. `RemoteIntegrityError` is reserved for
+  confirmed faults (the retry also failing). A re-pull that finds the remote
+  torn down treats outstanding fetches as clean absence, not integrity faults.
+- **User metadata is embedded in the db-object payload** - the separate
+  `_metadata` object and its split-brain with the db object are gone.
+  Metadata changes commit atomically with everything else; a push from a
+  session that never edited metadata carries the remote's section forward
+  verbatim; replacement pushes never resurrect the old remote's metadata; a
+  skew-stamped local `set_metadata` pushes with its timestamp advanced
+  (mirroring the key rule).
+- **`copy_remote` is manifest-driven**: it copies exactly the objects the
+  source db object references - orphans are no longer replicated.
+- **`format_version` is 2**, stamped in the db object's S3 metadata. There is
+  NO format-1 read path (a deliberate no-compatibility decision - all
+  existing remotes are under the author's control): 0.10 refuses format-1
+  remotes for r/w/c with `UnsupportedFormatError`, and pre-0.10 clients
+  refuse format-2 remotes via the 0.9.5 reader guard. **Upgrade recipe**:
+  push pending changes with 0.9.x, upgrade, then re-push each remote once
+  with `flag='n'` (re-pass num_groups - it is not inherited); re-add
+  RemoteConnGroup members after the member remotes are upgraded.
+- **>4 GiB groups are guarded at pack time** (`GroupTooLargeError`, exported):
+  previously an oversized group overflowed the 4-byte offset/length fields
+  mid-push. The failure is per-group and marked non-retryable in the log
+  (re-shard with a larger num_groups).
+- Per-key mode (num_groups=None) keeps in-place per-object semantics: each
+  PUT is object-atomic, but there is no cross-key snapshot isolation
+  (documented; grouped mode is the recommended layout).
+
+### Added — `ebooklet.fsck`
+`fsck(remote_conn, delete_orphans=False, min_age=timedelta(hours=24),
+check_objects=False) -> FsckReport`: the manifest makes integrity checking
+trivial - it IS the list of objects the database references. Reports orphans
+(abandoned/unGC'd generations, aged probe leftovers), referenced-but-missing
+objects (real integrity faults), unmanifested group ids, and torn teardowns
+(children without a db object). The optional sweep takes the write lock and
+age-gates every deletion (default 24h) so an in-flight or promptly-retried
+push is never robbed of its fresh uploads.
 
 ### Added — lock safety at push boundaries (F5)
 - **`push()` re-verifies the write lock** at push start and again immediately

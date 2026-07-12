@@ -14,7 +14,7 @@ import s3func
 import warnings
 import weakref
 import msgspec
-import orjson   # remaining use: the user-metadata object decode (dies with the format-2 metadata embedding)
+import io
 import base64
 import datetime
 import concurrent.futures
@@ -259,18 +259,15 @@ class S3SessionReader:
 
     def get_user_metadata(self):
         """
-        Get the user metadata.
+        Get the user metadata. Format 2 embeds it in the db-object payload
+        (killing the old separate '_metadata' object and its split-brain), so
+        this is a cheap ranged read of the payload's pre-index sections.
         """
-        s3_key = '_metadata' if self.num_groups is not None else f'{booklet.utils.metadata_key_bytes.decode()}'
-        resp_obj = self.get_object(s3_key)
-        if resp_obj.status == 200:
-            meta = orjson.loads(resp_obj.data)
-        elif resp_obj.status == 404:
-            meta = None
-        else:
-            raise urllib3.exceptions.HTTPError(resp_obj.error)
-
-        return meta
+        manifest, meta_section = utils.fetch_remote_state(self)
+        if manifest is None and meta_section is None:
+            return None
+        _ts, data = utils.parse_meta_section(meta_section)
+        return data
 
 
     def get_object(self, key: str=None, range_start: int=None, range_end: int=None):
@@ -451,10 +448,25 @@ class S3SessionWriter(S3SessionReader):
             if target_uuid is not None:
                 raise ValueError('The target remote already exists. Either delete_remote or use a different target.')
 
-            ## Get a list of all source objects
-            source_resp = self._write_session.list_objects(prefix=self.write_db_key + '/')
-            if source_resp.status // 100 != 2:
-                raise urllib3.exceptions.HTTPError(source_resp.error)
+            ## MANIFEST-DRIVEN object list (format 2): copy exactly what the
+            ## source db object references - the manifest's generation objects
+            ## (grouped mode) or the index's keys (per-key mode). A blind
+            ## prefix listing would also replicate orphans (abandoned
+            ## generations, crashed-probe leftovers).
+            db_resp = self.get_object()
+            if db_resp.status not in (200, 206):
+                raise urllib3.exceptions.HTTPError(db_resp.error)
+            src_manifest, _src_meta, src_index_bytes = utils.parse_db_payload(db_resp.data)
+
+            if src_manifest:
+                child_keys = [utils.group_obj_key(gid, gen) for gid, gen in src_manifest.items()]
+            else:
+                ## Per-key mode: the object names are the index's keys.
+                idx = booklet.FixedLengthValue(io.BytesIO(bytes(src_index_bytes)), 'r')
+                try:
+                    child_keys = [k for k in idx.keys() if k != booklet.utils.metadata_key_bytes.decode()]
+                finally:
+                    idx.close()
 
             ## Get all target objects
             target_resp = writer._write_session.list_objects(prefix=writer.write_db_key + '/')
@@ -474,9 +486,9 @@ class S3SessionWriter(S3SessionReader):
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-                    for obj in source_resp.iter_objects():
-                        source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
+                    for child in child_keys:
+                        source_key = self.write_db_key + '/' + child
+                        target_key = writer.write_db_key + '/' + child
                         if target_key not in target_exist_keys:
                             f = executor.submit(self._write_session.copy_object, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
@@ -501,9 +513,9 @@ class S3SessionWriter(S3SessionReader):
                 futures = {}
                 failures = {}
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
-                    for obj in source_resp.iter_objects():
-                        source_key = obj['key']
-                        target_key = writer.write_db_key + source_key.removeprefix(self.write_db_key)
+                    for child in child_keys:
+                        source_key = self.write_db_key + '/' + child
+                        target_key = writer.write_db_key + '/' + child
                         if target_key not in target_exist_keys:
                             f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
