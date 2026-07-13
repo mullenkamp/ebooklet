@@ -257,7 +257,7 @@ def test_prune():
 
         # After a push the values are safely in the remote - NOW the timestamp
         # eviction applies, and evicted values transparently re-pull.
-        assert f.changes().push() is True
+        assert f.changes().push()
         removed_items = f.prune(timestamp=booklet.utils.make_timestamp_int())
         new_len = len(f)
         meta = f.get_metadata()
@@ -269,17 +269,24 @@ def test_prune():
 
 ## Always make this last!!!
 def test_clear():
-    ## clear() is LOCAL cache eviction only (the documented contract): the
-    ## local file empties, but keys stay visible through the remote index
-    ## (test_prune pushed this database) and re-pull transparently on access.
+    ## clear() is a TRUE clear (0.10): every key is journaled as a deletion
+    ## and len/keys go to zero; until pushed it is cancellable via discard()
+    ## (used here, leaving the shared remote untouched for the sections that
+    ## follow). Local cache eviction's idiom is prune(timestamp=<now>).
     with ebooklet.open_ebooklet(remote_conn, file_path, 'w') as f:
+        n_before = len(f)
+        assert n_before == len(data)                  # (data excludes test_delete_len's deletions)
         f.clear()
 
         assert len(list(f._local_file.keys())) == 0   # local file emptied
-        assert len(f) == len(data)                    # remote index entries remain
-                                                      # (data excludes test_delete_len's deletions)
+        assert len(f) == 0                            # every key journaled as a delete
+        assert len(f.changes().pending_deletes) == n_before
+        assert f.get_metadata() == meta               # metadata survives a clear
+        ## Cancel the clear: entries restore from the remote index and values
+        ## transparently re-pull on access.
+        f.changes().discard()
+        assert len(f) == n_before
         assert f['2'] == data_dict['2']               # transparent re-pull
-        assert f.get_metadata() == meta               # metadata re-pulls too
 
 
 #############################################################

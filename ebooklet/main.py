@@ -22,6 +22,15 @@ import urllib3
 from . import utils
 from . import remote
 from .journal import JournalState, RemoteState
+from .errors import (
+    Error,
+    ReadOnlyError,
+    RemoteMissingError,
+    RemoteIntegrityError,
+    LockLostError,
+    OfflineError,
+    TRANSPORT_ERRORS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +42,8 @@ logger = logging.getLogger(__name__)
 _MISSING = object()
 
 
-class RemoteIntegrityError(urllib3.exceptions.HTTPError):
-    """
-    The remote store contradicts its own index: the index claims key(s) whose
-    backing object is missing (404), and a fresh index re-pull confirmed the
-    claim. Distinct from connectivity errors so callers can tell "the remote
-    is inconsistent" apart from "the remote is unreachable"; subclasses
-    urllib3's HTTPError so existing handlers keep working.
-    """
+## RemoteIntegrityError moved to errors.py in 0.10.0 (typed taxonomy); the
+## import above keeps the old main.RemoteIntegrityError attribute path working.
 
 
 def _failure_exception(failure):
@@ -54,6 +57,42 @@ def _failure_exception(failure):
     if isinstance(failure, dict) and any(isinstance(v, utils.MissingRemoteObject) for v in failure.values()):
         return RemoteIntegrityError(failure)
     return urllib3.exceptions.HTTPError(failure)
+
+
+class PushResult(msgspec.Struct):
+    """
+    The result of a push.
+
+    updated: the remote changed (the db-object commit happened, or - per-key
+    mode - objects were written/deleted). A partial REPLACEMENT push commits
+    nothing, so its updated is False; a partial ordinary push has already
+    committed its successful groups/keys, so its updated is True.
+
+    failures: per-key/per-group upload failures as 'ExceptionClassName:
+    message' strings; empty means no failures. The pending changes for failed
+    entries stay journaled - fix the cause and push again. (Failures of the
+    commit itself are the OTHER failure channel: they RAISE - HTTPError for a
+    failed commit PUT, LockLostError for a lost write lock - rather than
+    returning a PushResult.)
+
+    Truthiness: bool(result) is True only for a fully-successful push that
+    changed the remote - a no-op push and any push with failures are falsy.
+    (Before 0.10.0 push returned True/False/dict, and a non-empty partial-
+    failure dict was truthy.)
+    """
+    updated: bool
+    failures: dict
+
+    def __bool__(self):
+        return self.updated and not self.failures
+
+
+def _failure_str(value):
+    """Normalize a push-failure value ('ClassName: message' for exception-like
+    values, plain str otherwise - s3func error payloads are dicts)."""
+    if isinstance(value, (BaseException, utils.MissingRemoteObject)):
+        return f'{type(value).__name__}: {value}'
+    return str(value)
 
 ## RCG entry keys become S3 object-key suffixes in per-key mode; characters outside
 ## this set are known to break request signing (e.g. '!' fails B2 signature validation).
@@ -86,9 +125,11 @@ class Change:
         self._ebooklet._pull_remote_index()
 
 
-    def update(self):
+    def build_changelog(self):
         """
-        Determine if there are any changes between the local and remote databases.
+        Determine if there are any changes between the local and remote
+        databases (renamed from update() in 0.10.0 - the old name was easily
+        confused with the MutableMapping update() on the ebooklet itself).
         """
         self._ebooklet.sync()
         changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session, self._ebooklet._journal)
@@ -102,7 +143,7 @@ class Change:
         not part of the changelog file - see pending_deletes.
         """
         if not self._changelog_path:
-            self.update()
+            self.build_changelog()
         return utils.view_changelog(self._changelog_path)
 
 
@@ -124,10 +165,10 @@ class Change:
         changes.
         """
         if not self._ebooklet.writable:
-            raise ValueError('File is open for read-only.')
+            raise ReadOnlyError('File is open for read-only.')
 
         if not self._changelog_path:
-            self.update()
+            self.build_changelog()
 
         journal = self._ebooklet._journal
 
@@ -170,21 +211,32 @@ class Change:
 
     def push(self, force_push=False):
         """
-        Updates the remote. It will regenerate the changelog to ensure the changelog is up-to-date. Returns True if the remote has been updated and False if no updates were made (due to nothing needing updating). If upload failures have occurred, then it will return a list of the keys that failed.
-        Force_push will push the main file and the remote_index to the remote regardless of changes. Only necessary if upload failures occurred during a previous push.
+        Updates the remote. It will regenerate the changelog to ensure the
+        changelog is up-to-date. Returns a PushResult: `updated` says whether
+        the remote changed, `failures` maps failed keys/groups to error
+        strings (the pending changes for failed entries stay journaled for a
+        retry), and `bool(result)` is True only for a fully-successful push
+        that changed the remote. Failures of the COMMIT itself raise instead
+        of returning: HTTPError for a failed commit PUT, LockLostError when
+        the write lock was lost.
+        Force_push will push the main file and the remote_index to the remote
+        regardless of changes. Only necessary if upload failures occurred
+        during a previous push.
         """
-        if not self._ebooklet._remote_session.writable:
-            raise ValueError('Remote is not writable.')
-
+        ## File-mode check FIRST: a flag='r' session's remote session is a
+        ## reader object with no writable attribute at all.
         if not self._ebooklet.writable:
-            raise ValueError('File is open for read-only.')
+            raise ReadOnlyError('File is open for read-only.')
+
+        if not self._ebooklet._remote_session.writable:
+            raise ReadOnlyError('Remote is not writable.')
 
         ## Re-verify the write lock at the push boundary: a holder whose ticket
         ## was broken (another client's force_lock) no longer has mutual
         ## exclusion and must not push. (The commit PUT re-verifies again -
         ## the point of no return.)
         if self._ebooklet.lock is not None and not self._ebooklet.lock.verify():
-            raise urllib3.exceptions.HTTPError(
+            raise LockLostError(
                 "The write lock is no longer held (this session's lock ticket was broken "
                 'by another client) - aborting the push. All pending changes are retained '
                 'in the journal; re-open the file to re-acquire the lock and push again.'
@@ -210,7 +262,7 @@ class Change:
             for k in stale_index:
                 del self._ebooklet._remote_index[k]
 
-        self.update()
+        self.build_changelog()
 
         result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock)
 
@@ -218,7 +270,11 @@ class Change:
             # Partial failure — don't clean up changelog so push can be retried.
             # replace_pending is also kept so a retry redoes the full
             # wipe-and-replace (the remote must never end up half old, half new).
-            return result
+            # updated: a partial REPLACEMENT commits nothing (the old remote is
+            # untouched); a partial ordinary push has already committed its
+            # successful groups/keys (a failed commit PUT raises, never returns).
+            failures = {key: _failure_str(value) for key, value in result.items()}
+            return PushResult(updated=not journal.replace_pending, failures=failures)
 
         ## A replacement session is a REPLACEMENT only until the replacement
         ## push completes - after that the remote IS this session's database,
@@ -244,7 +300,7 @@ class Change:
             if not self._ebooklet._remote_session.initialized:
                 self._ebooklet._remote_session._load_db_metadata()
 
-        return result
+        return PushResult(updated=bool(result), failures={})
 
 
 class EVariableLengthValue(MutableMapping):
@@ -505,10 +561,24 @@ class EVariableLengthValue(MutableMapping):
         ## replace: no index-body fetch may happen until its own v2 commit.
         self._index_fetch_suppressed = index_fetch_suppressed
         self._remote_session = remote_session
+        ## Offline session: reads serve the local cache only; anything that
+        ## needs the remote raises OfflineError.
+        self._offline = isinstance(remote_session, remote.OfflineSession)
         self._n_buckets = local_file._n_buckets
         self._buffer_size = buffer_size
         self.type = ebooklet_type
         self._num_groups = resolved_num_groups
+
+
+    @property
+    def offline(self):
+        """
+        True when this session was opened offline (offline=True, or
+        offline='auto' fell back because the remote was unreachable). Offline
+        reads serve the local cache as-is; values not materialized locally
+        raise OfflineError.
+        """
+        return self._offline
 
 
     def set_metadata(self, data, timestamp=None):
@@ -522,7 +592,7 @@ class EVariableLengthValue(MutableMapping):
             ## cleared when a push uploads the metadata.
             self._journal.set_meta_pending(True)
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
 
     def get_metadata(self, include_timestamp=False):
@@ -612,7 +682,7 @@ class EVariableLengthValue(MutableMapping):
             ## entry, silently losing the key).
             self._journal.record_write(key)
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
 
     def set(self, key, value, timestamp=None, encode_value=True):
@@ -627,7 +697,7 @@ class EVariableLengthValue(MutableMapping):
             self._journal.record_write(key)
 
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
 
     def __iter__(self):
@@ -660,15 +730,25 @@ class EVariableLengthValue(MutableMapping):
         return self._local_file.get(key, default=default)
 
 
-    def update(self, key_value: MutableMapping):
+    def update(self, other=(), /, **kwargs):
         """
-        Set many keys/values from a dict.
+        Set many keys/values with dict.update semantics: accepts a mapping, an
+        iterable of key/value pairs, and/or keyword arguments. Every pair
+        routes through __setitem__, so the reserved-key and serializer rules
+        apply per key.
         """
-        if self.writable:
-            for key, value in key_value.items():
-                self[key] = value
+        if not self.writable:
+            raise ReadOnlyError('File is open for read only.')
+        if isinstance(other, Mapping):
+            items = other.items()
+        elif hasattr(other, 'keys'):
+            items = ((key, other[key]) for key in other.keys())
         else:
-            raise ValueError('File is open for read only.')
+            items = other
+        for key, value in items:
+            self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
 
 
     def prune(self, timestamp=None):
@@ -698,7 +778,7 @@ class EVariableLengthValue(MutableMapping):
 
             return removed
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
 
     def get_items(self, keys, default=None):
@@ -756,6 +836,17 @@ class EVariableLengthValue(MutableMapping):
                             timestamp_int = utils.bytes_to_int(remote_val[:7])
                             groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
 
+                    ## Offline: never dispatch fetch workers - raise ONE named
+                    ## error before any future exists (a worker raise would
+                    ## surface as a raw future exception, not a clean error).
+                    if self._offline and groups_to_download:
+                        needed = sorted(k for infos in groups_to_download.values()
+                                        for k, _o, _l, _t in infos)
+                        raise OfflineError(
+                            f'This session is offline and the value(s) for key(s) {needed} '
+                            'are not materialized in the local cache.'
+                        )
+
                     ## Resolve generations INSIDE _index_lock: the manifest is
                     ## updated atomically with the index handle, so the pairs
                     ## are consistent here.
@@ -771,6 +862,7 @@ class EVariableLengthValue(MutableMapping):
                         f = executor.submit(utils.get_remote_group_values, group_id, gen, key_infos, self._local_file, self._remote_session)
                         futures[f] = f'_group_{group_id}'
                 else:
+                    to_fetch = []
                     for key, remote_val in items_iter:
                         ## Read-your-writes gate (see the grouped branch).
                         if key in self._journal.written:
@@ -778,8 +870,16 @@ class EVariableLengthValue(MutableMapping):
                         remote_time_bytes = remote_val[:7] if remote_val else None
                         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
                         if check:
-                            f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                            futures[f] = key
+                            to_fetch.append(key)
+                    ## Offline: see the grouped branch - one named error, no workers.
+                    if self._offline and to_fetch:
+                        raise OfflineError(
+                            f'This session is offline and the value(s) for key(s) '
+                            f'{sorted(to_fetch)} are not materialized in the local cache.'
+                        )
+                    for key in to_fetch:
+                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                        futures[f] = key
 
             for f in as_completed(futures):
                 key = futures[f]
@@ -1029,6 +1129,12 @@ class EVariableLengthValue(MutableMapping):
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
         if check:
+            if self._offline:
+                raise OfflineError(
+                    f"The value for key '{key}' is not materialized in the local cache "
+                    'and this session is offline. (The key exists; its value needs the '
+                    'remote.)'
+                )
             if self._num_groups is not None and key != utils.metadata_key_str:
                 group_id = utils.key_to_group_id(key, self._num_groups)
                 if gen is None:
@@ -1063,12 +1169,18 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self.set(key, value)
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
     def __delitem__(self, key):
         if self.writable:
             if key in utils.reserved_key_strs:
                 raise ValueError(f"'{key}' is a reserved internal key.")
+            ## MutableMapping contract (0.10.0): deleting a missing key raises
+            ## KeyError (was a silent no-op). Presence = __contains__: in the
+            ## remote index OR in the local file (a freshly-written unpushed
+            ## key lives only in the local file).
+            if key not in self:
+                raise KeyError(key)
             if key in self._remote_index:
                 del self._remote_index[key]
                 self._journal.record_delete(key)
@@ -1087,7 +1199,7 @@ class EVariableLengthValue(MutableMapping):
             ## via the timestamp diff, but deletes have no other record).
             self._journal.persist(self._local_file)
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
     def __enter__(self):
         return self
@@ -1097,30 +1209,51 @@ class EVariableLengthValue(MutableMapping):
 
     def clear(self):
         """
-        Remove all keys and values from the local file.
+        Remove EVERY key from the database (0.10.0: a true clear, no longer
+        local cache eviction). All keys are journaled as deletions and applied
+        to the remote at the next push; until then the clear is cancellable
+        with changes().discard(). Unpushed pending writes are dropped as part
+        of the clear. For local cache eviction (keys stay, evicted values
+        re-pull on demand) use prune(timestamp=<now>) instead.
         """
-        if self.writable:
-            self._local_file.clear()
-            ## clear() truncates the file, destroying BOTH reserved slots.
-            ## Local values are gone so pending WRITES (incl. an unpushed
-            ## metadata edit) are moot, but pending DELETES, a pending
-            ## replacement, and the remote-state cache survive - re-persist
-            ## both immediately.
-            self._journal.clear_written()
-            self._journal.set_meta_pending(False)
-            self._journal.persist(self._local_file, force=True)
-            self._remote_state.persist(self._local_file, force=True)
-            ## clear is LOCAL cache eviction: values transparently re-pull on
-            ## access, and the remote's metadata stays visible too - restore
-            ## it into the fresh local slot from the cached section.
-            utils.refresh_local_metadata(self._local_file, self._journal, self._remote_state.meta_section)
+        if not self.writable:
+            raise ReadOnlyError('File is open for read only.')
 
-        else:
-            raise ValueError('File is open for read only.')
+        ## Flush buffered writes to disk first: the truncate below removes
+        ## on-disk entries only, and a key still sitting in booklet's write
+        ## buffer would resurface into iteration after the clear.
+        self.sync()
 
-    def close(self, force_shutdown=False):
+        ## Snapshot before mutating (booklet raises on mutation during
+        ## iteration); reserved/metadata entries are internal, never user keys.
+        index_keys = [k for k in self._remote_index.keys()
+                      if k not in utils.reserved_key_strs]
+        for key in index_keys:
+            del self._remote_index[key]
+            self._journal.record_delete(key)
+
+        ## Pending writes are cancelled by the clear (their keys either just
+        ## became journaled deletes, or - never-pushed keys - simply cease to
+        ## exist when the local file truncates below).
+        self._journal.clear_written()
+        self._journal.set_meta_pending(False)
+
+        ## Truncate the local file LAST-BUT-ONE: it destroys BOTH reserved
+        ## slots, so the journal (now carrying every delete) and the
+        ## remote-state cache MUST be re-persisted AFTER it - persisting
+        ## before the truncate would silently lose the journaled deletes on
+        ## an unpushed close.
+        self._local_file.clear()
+        self._journal.persist(self._local_file, force=True)
+        self._remote_state.persist(self._local_file, force=True)
+        ## The remote's metadata stays visible (metadata is cleared by
+        ## set_metadata(None), not by clear()) - restore the local slot from
+        ## the cached remote section.
+        utils.refresh_local_metadata(self._local_file, self._journal, self._remote_state.meta_section)
+
+    def close(self):
         """
-        Close all open objects. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
+        Close all open objects.
 
         Pending (unpushed) writes and deletions survive the close: they are
         recorded in the local file's persistent journal and will be included
@@ -1130,9 +1263,9 @@ class EVariableLengthValue(MutableMapping):
         self._finalizer()
 
 
-    def sync(self, force_shutdown=False):
+    def sync(self):
         """
-        Syncronize all cache to disk. This ensures all data has been saved to disk properly. If force_shutdown is True, then it will immediately end any processes running in the background (not recommended unless there's a deadlock).
+        Syncronize all cache to disk. This ensures all data has been saved to disk properly.
         """
         ## Persist the journal first (if-dirty: a clean journal writes nothing,
         ## so iterate-while-sync patterns are not invalidated by a no-op).
@@ -1154,7 +1287,7 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self._remote_session.delete_remote()
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
 
     def copy_remote(self, remote_conn):
@@ -1164,7 +1297,7 @@ class EVariableLengthValue(MutableMapping):
         if self.writable:
             self._remote_session.copy_remote(remote_conn)
         else:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
     def map(self, func, keys=None, n_workers=None):
         """
@@ -1246,7 +1379,7 @@ class RemoteConnGroup(EVariableLengthValue):
         under 'user_meta'.
         """
         if not self.writable:
-            raise ValueError('File is open for read only.')
+            raise ReadOnlyError('File is open for read only.')
 
         if not isinstance(remote_conn, remote.S3Connection):
             raise TypeError('remote_conn/value must be a remote.S3Connection')
@@ -1269,7 +1402,7 @@ class RemoteConnGroup(EVariableLengthValue):
         with remote_conn.open() as rc:
             uuid0 = rc.get_uuid()
             if uuid0 is None:
-                raise ValueError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
+                raise RemoteMissingError('Remote does not exist. It must exist to be added to a RemoteConnGroup.')
 
             uuid_hex = uuid0.hex
 
@@ -1307,6 +1440,13 @@ class RemoteConnGroup(EVariableLengthValue):
         self.add(remote_conn, key=key)
 
 
+def _check_offline_arg(offline, flag):
+    if not (offline is False or offline is True or offline == 'auto'):
+        raise ValueError("offline must be False, 'auto', or True.")
+    if offline and flag != 'r':
+        raise ValueError("offline mode is read-only - open with flag='r'.")
+
+
 def open_ebooklet(
     remote_conn: Union[remote.S3Connection, str, dict],
     file_path: Union[str, pathlib.Path],
@@ -1317,6 +1457,7 @@ def open_ebooklet(
     num_groups: int = None,
     lock_timeout: int = 300,
     force_lock: bool = False,
+    offline: Union[bool, str] = False,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -1353,6 +1494,19 @@ def open_ebooklet(
     force_lock : bool
         If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
+    offline : False, 'auto', or True
+        Offline READ mode (requires flag='r'). True: never touch the remote -
+        serve the existing local file as-is (raises OfflineError if it does
+        not exist); reads of values not materialized locally raise
+        OfflineError. 'auto': try a normal online open, and fall back to the
+        offline behavior (with a UserWarning) ONLY when the remote is
+        unreachable at the transport level (DNS/connect/timeout) - integrity,
+        format, uuid, and HTTP status errors (e.g. bad credentials) still
+        raise. The session's `.offline` property says which mode it ended up
+        in. Note the local data may be stale (no remote sync check runs), and
+        the remote type guard is skipped - use the factory matching the
+        database type.
+
     Returns
     -------
     EVariableLengthValue
@@ -1380,7 +1534,31 @@ def open_ebooklet(
     if num_groups is not None:
         num_groups = utils.next_prime(num_groups)
 
+    _check_offline_arg(offline, flag)
+
     local_file_path = pathlib.Path(file_path)
+
+    if offline is True:
+        if not local_file_path.exists():
+            raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
+        return EVariableLengthValue(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+
+    if offline == 'auto':
+        ## Wrap the WHOLE online open (both remote touches: the metadata HEAD
+        ## and the index fetch) - a transport failure from either falls back.
+        try:
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False)
+        except TRANSPORT_ERRORS as err:
+            ## Typed ebooklet errors never fall back (TRANSPORT_ERRORS lists
+            ## transport classes only; this is the belt to the design rule).
+            if isinstance(err, Error):
+                raise
+            warnings.warn(
+                f'The remote is unreachable ({type(err).__name__}); opening offline and '
+                f'serving the local data at {local_file_path} as-is (it may be stale).',
+                UserWarning, stacklevel=2,
+            )
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True)
 
     local_file_exists = local_file_path.exists()
 
@@ -1403,6 +1581,7 @@ def open_rcg(
     num_groups: int = None,
     lock_timeout: int = 300,
     force_lock: bool = False,
+    offline: Union[bool, str] = False,
     ):
     """
     Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
@@ -1436,6 +1615,11 @@ def open_rcg(
     force_lock : bool
         If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
 
+    offline : False, 'auto', or True
+        Offline READ mode (requires flag='r') - see open_ebooklet for the full
+        semantics. Note offline covers THIS catalogue only: opening a member
+        remote still requires connectivity.
+
     Returns
     -------
     RemoteConnGroup
@@ -1463,7 +1647,28 @@ def open_rcg(
     if num_groups is not None:
         num_groups = utils.next_prime(num_groups)
 
+    _check_offline_arg(offline, flag)
+
     local_file_path = pathlib.Path(file_path)
+
+    if offline is True:
+        if not local_file_path.exists():
+            raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
+        return RemoteConnGroup(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+
+    if offline == 'auto':
+        ## Wrap the WHOLE online open (both remote touches) - see open_ebooklet.
+        try:
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False)
+        except TRANSPORT_ERRORS as err:
+            if isinstance(err, Error):
+                raise
+            warnings.warn(
+                f'The remote is unreachable ({type(err).__name__}); opening offline and '
+                f'serving the local data at {local_file_path} as-is (it may be stale).',
+                UserWarning, stacklevel=2,
+            )
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True)
 
     local_file_exists = local_file_path.exists()
 

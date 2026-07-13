@@ -88,7 +88,7 @@ def seed_remote(conn, keys_values):
     with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
         for k, v in keys_values.items():
             eb[k] = v
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
 
 def read_all(conn, keys):
@@ -148,7 +148,7 @@ def test_grouped_push_preserves_unmaterialized_members():
     ## be pulled and repacked, not dropped.
     with open_ebooklet(conn, local_path('writer2'), flag='w') as eb:
         eb[k3] = b'value-K3'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     values, stored_keys = read_all(conn, [k1, k2, k3, c1])
     assert values == {k1: b'value-K1', k2: b'value-K2', k3: b'value-K3', c1: b'value-C1'}
@@ -217,7 +217,7 @@ def test_bootstrap_race_second_writer_preserves_first():
     ## A creates the remote and pushes its entry
     with open_rcg(rcg_conn, local_path('race-a'), flag='n') as a:
         a.add(seed_a)
-        assert a.changes().push() is True
+        assert a.changes().push()
 
     ## Precondition for the regression: B's cached view predates A's push
     assert stale_session.uuid is None
@@ -235,7 +235,7 @@ def test_bootstrap_race_second_writer_preserves_first():
 def test_empty_push_materializes_remote():
     conn = make_conn('empty-eb')
     with open_ebooklet(conn, local_path('empty-writer'), flag='n', num_groups=num_groups) as eb:
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## Pre-fix this raised: 'No file was found in the remote...'
     with open_ebooklet(conn, local_path('empty-reader'), flag='r') as eb:
@@ -245,7 +245,7 @@ def test_empty_push_materializes_remote():
 def test_empty_push_materializes_remote_rcg():
     conn = make_conn('empty-rcg')
     with open_rcg(conn, local_path('empty-rcg-writer'), flag='n') as rcg:
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(conn, local_path('empty-rcg-reader'), flag='r') as rcg:
         assert list(rcg.keys()) == []
@@ -316,10 +316,10 @@ def test_deletes_retained_when_group_pull_fails():
         result = eb.changes().push()
         eb._remote_session.get_object = original_get
 
-        assert isinstance(result, dict) and result   # push reported the failure
+        assert result.failures                       # push reported the failure
         assert k1 in eb._journal.deletes             # retry signal retained
 
-        assert eb.changes().push() is True           # retry completes the delete
+        assert eb.changes().push()           # retry completes the delete
 
     values, stored_keys = read_all(conn, [k1, k2])
     assert values == {k1: None, k2: b'v2'}
@@ -371,7 +371,7 @@ def test_flag_n_writes_only_push():
     with open_ebooklet(conn, local_path('nwrites-w'), flag='n', num_groups=num_groups) as eb:
         assert eb.get('old1') == b'old-1'  # transparent read still works pre-push
         eb['new1'] = b'new-1'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, local_path('nwrites-r'), flag='r') as eb:
         assert sorted(eb.keys()) == ['new1']
@@ -395,7 +395,7 @@ def test_pull_stranded_reader():
 
     with open_ebooklet(conn, producer_path, flag='w', num_groups=num_groups) as eb:
         eb['k2'] = b'v2'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     reader.changes().pull()
     assert sorted(reader.keys()) == ['k1', 'k2']
@@ -412,7 +412,7 @@ def test_pull_sees_remote_advance():
 
     with open_ebooklet(conn, local_path('pull-adv-w'), flag='w') as eb:
         eb['k2'] = b'v2'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     reader.changes().pull()
     assert reader.get('k2') == b'v2'
@@ -430,7 +430,7 @@ def test_pull_fetch_failure_leaves_session_usable():
 
     with open_ebooklet(conn, local_path('pull-fail-w'), flag='w') as eb:
         eb['k2'] = b'v2'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     original_get = reader._remote_session.get_object
 
@@ -465,7 +465,7 @@ def test_prune_local_eviction_contract():
         assert removed >= len(keys)          # local eviction happened
         assert eb.get('pk0') == keys['pk0']  # transparently re-pulls
         eb['pk_new'] = b'new'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, local_path('prune-r'), flag='r') as eb:
         for k, v in keys.items():
@@ -532,7 +532,7 @@ def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
         warnings.simplefilter('ignore')  # pending-REPLACEMENT warning expected here
         with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
             assert eb._num_groups == num_groups
-            assert eb.changes().push() is True
+            assert eb.changes().push()
 
     names = _remote_basenames(conn)
     assert 'key000' not in names                  # no raw per-key objects
@@ -583,12 +583,12 @@ def test_flag_n_second_push_preserves_remote():
         eb[k1] = b'v1'
         eb[c1] = b'vc'
         eb.set_metadata({'m': 1})
-        assert eb.changes().push() is True     # replacement push (wipes, uploads all)
+        assert eb.changes().push()     # replacement push (wipes, uploads all)
         assert eb._flag == 'n'                              # frozen - no longer mutated
         assert eb._journal.replace_pending is False         # intent cleared: no further wipes
 
         eb[k2] = b'v2'                         # touches only k1's group
-        assert eb.changes().push() is True     # second push must NOT wipe c1's group
+        assert eb.changes().push()     # second push must NOT wipe c1's group
 
     values, stored_keys = read_all(conn, [k1, k2, c1])
     assert values == {k1: b'v1', k2: b'v2', c1: b'vc'}   # c1 survived (was destroyed pre-fix)

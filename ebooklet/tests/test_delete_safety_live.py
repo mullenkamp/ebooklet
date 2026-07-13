@@ -103,11 +103,11 @@ def test_live_emptied_group_delete_spares_siblings():
         eb[k1] = b'one'
         eb[k10] = b'ten'
         eb[k12] = b'twelve'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, local_path('grp-w2'), flag='w') as eb:
         del eb[k1]
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## Real listing: exactly group 1 gone (all its generations), siblings present.
     with conn.open('w') as s3open:
@@ -140,12 +140,12 @@ def test_live_delete_remote_spares_sibling_db_and_own_lock():
     ## Seed the sibling database first.
     with open_ebooklet(sib_conn, local_path('sib-w'), flag='n', num_groups=5) as eb:
         eb['other'] = b'precious'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## Seed the target database.
     with open_ebooklet(conn, local_path('tgt-w'), flag='n', num_groups=5) as eb:
         eb['mine'] = b'value'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## A write session holds its lock for its whole lifetime - delete the remote
     ## UNDER it and check the tickets survive (0.9.4's bare-prefix delete

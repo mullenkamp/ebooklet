@@ -54,5 +54,6 @@ watch:
 
 nav:
     - About: index.md
+    - Operations guide: ops.md
     - Reference:
         - ebooklet: reference/ebooklet.md

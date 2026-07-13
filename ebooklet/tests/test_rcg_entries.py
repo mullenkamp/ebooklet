@@ -59,7 +59,7 @@ def seed_member(suffix):
     conn = make_conn(f'member-{suffix}')
     with open_ebooklet(conn, local_path(f'member-{suffix}'), flag='n') as eb:
         eb['seed'] = b'x'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     return conn
 
 
@@ -100,7 +100,7 @@ def test_add_with_key_and_user_meta_roundtrip():
 
     with open_rcg(rcg_conn, local_path('w1'), flag='n') as rcg:
         rcg.add(member, key=key, user_meta=meta)
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('r1'), flag='r') as rcg:
         assert sorted(rcg.keys()) == [key]
@@ -119,7 +119,7 @@ def test_default_key_is_uuid_hex():
 
     with open_rcg(rcg_conn, local_path('w2'), flag='n') as rcg:
         rcg.add(member)
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('r2'), flag='r') as rcg:
         assert list(rcg.keys()) == [member_uuid_hex(member)]
@@ -134,11 +134,11 @@ def test_metadata_only_upsert_pushes():
 
     with open_rcg(rcg_conn, local_path('w3'), flag='n') as rcg:
         rcg.add(member, key='k1', user_meta={'state': 'v1'})
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('w3b'), flag='w') as rcg:
         rcg.add(member, key='k1', user_meta={'state': 'v2'})
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('r3'), flag='r') as rcg:
         assert rcg.get('k1')['user_meta'] == {'state': 'v2'}
@@ -152,7 +152,7 @@ def test_explicit_key_upsert_cleans_default_entry():
 
     with open_rcg(rcg_conn, local_path('w4'), flag='n') as rcg:
         rcg.add(member)
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('w4b'), flag='w') as rcg:
         rcg.add(member, key='dataset123')
@@ -168,7 +168,7 @@ def test_setitem_and_delete_roundtrip():
 
     with open_rcg(rcg_conn, local_path('w5'), flag='n') as rcg:
         rcg['entry-a'] = member
-        assert rcg.changes().push() is True
+        assert rcg.changes().push()
 
     with open_rcg(rcg_conn, local_path('w5b'), flag='w') as rcg:
         assert rcg.get('entry-a')['user_meta'] is None

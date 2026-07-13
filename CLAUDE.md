@@ -48,9 +48,11 @@ uv build
 2. **`main.py` — Database Layer**
    - `EVariableLengthValue(MutableMapping)` — the main database class. Maintains a local booklet file + a `.remote_index` file tracking what's on S3
    - `RemoteConnGroup(EVariableLengthValue)` — specialized variant that stores `S3Connection` references (stored with booklet's `'orjson'` value serializer — a file-format id, unrelated to the msgspec runtime serialization)
-   - `Change` — manages sync workflow: `pull()` updates remote index+manifest, `update()` creates the changelog (union of timestamp diff and the journal), `push()` runs the upload→commit→GC protocol, `pending_deletes`/`discard()` expose and cancel pending changes
+   - `Change` — manages sync workflow: `pull()` updates remote index+manifest, `build_changelog()` creates the changelog (union of timestamp diff and the journal; renamed from `update()` in 0.10), `push()` runs the upload→commit→GC protocol and returns a `PushResult` (`updated`, `failures` as `'ClassName: message'` strings, `__bool__` = fully-successful; commit failures RAISE — HTTPError / `LockLostError`), `pending_deletes`/`discard()` expose and cancel pending changes
    - `open_ebooklet()` — factory function for `EVariableLengthValue` databases
    - `open_rcg()` — factory function for `RemoteConnGroup` databases
+   - Both factories take `offline=False|'auto'|True` (flag='r' only): True never touches the remote (stub `OfflineSession` in remote.py; unmaterialized reads raise `OfflineError`), 'auto' falls back to offline ONLY on transport-level unreachability (`errors.TRANSPORT_ERRORS`); sessions expose `.offline`
+   - `errors.py` — the typed taxonomy (0.10): everything derives from `ebooklet.Error`; pre-taxonomy parentage kept via dual inheritance (`ReadOnlyError`/`UUIDMismatchError`/`RemoteMissingError`/`UnsupportedFormatError`/`GroupTooLargeError` are ValueErrors; `RemoteIntegrityError` stays an HTTPError; `LockLostError` deliberately is NOT). `clear()` is a TRUE clear (journaled deletes, push-applied, discard-cancellable); cache eviction = `prune(timestamp=now)`; `del` of a missing key raises KeyError; `update()` has dict.update semantics
 
    Also `journal.py` — the persistent session state in booklet reserved slots: `JournalState` (slot 1: pending writes/deletes, num_groups tri-state, replace_pending, meta_pending — the source of read-your-writes and cross-session durability) and `RemoteState` (slot 2: the manifest + remote metadata section of the last in-sync db object). And `fsck.py` — `ebooklet.fsck()` orphan/integrity reporting + age-gated sweep.
 

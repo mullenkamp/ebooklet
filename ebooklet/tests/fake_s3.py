@@ -6,7 +6,7 @@ S3SessionReader/S3SessionWriter classes are constructed over it, so every code
 path above the HTTP layer is the real production code. No network is touched.
 
 Adapted from the architecture-assessment harness
-(architecture-assessment-harness-fake_s3.py at the repo root, kept verbatim as
+(planning/architecture-assessment-harness-fake_s3.py, kept verbatim as
 an assessment artifact).
 
 Known fidelity limits (these belong to the live test tier):

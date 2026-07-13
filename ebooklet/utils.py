@@ -58,22 +58,18 @@ PAYLOAD_VERSION = 2
 PAYLOAD_HEADER_LEN = 40
 
 
-class UnsupportedFormatError(ValueError):
-    """
-    The remote database's storage format_version does not match what this
-    ebooklet version supports (too new: upgrade ebooklet; too old: the remote
-    must be re-created - 0.10 dropped the format-1 read path). A compatibility
-    fault, deliberately distinct from RemoteIntegrityError (which means the
-    store contradicts its own index).
-    """
-
-
-class GroupTooLargeError(ValueError):
-    """
-    A group's packed size would exceed the 4-byte offset/length fields
-    (2**32 - 1 bytes). Not retryable as-is: re-shard the database with a
-    larger num_groups (flag='n' re-creation), or store smaller values.
-    """
+## The exception classes moved to errors.py in 0.10.0 (typed taxonomy); these
+## explicit re-exports keep the old attribute paths
+## (utils.UnsupportedFormatError etc.) working for existing callers.
+from .errors import (  # noqa: E402
+    UnsupportedFormatError as UnsupportedFormatError,
+    GroupTooLargeError as GroupTooLargeError,
+    ReadOnlyError as ReadOnlyError,
+    UUIDMismatchError as UUIDMismatchError,
+    RemoteMissingError as RemoteMissingError,
+    LockLostError as LockLostError,
+    OfflineError as OfflineError,
+)
 
 
 def build_db_payload(manifest, meta_section, index_bytes):
@@ -290,7 +286,7 @@ def open_remote_conn(remote_conn, flag, local_file_exists):
     remote_session = remote_conn.open(flag)
 
     if flag == 'r' and not remote_session.initialized and not local_file_exists:
-        raise ValueError('No file was found in the remote, but the local file was open for read without creating a new file.')
+        raise RemoteMissingError('No file was found in the remote, but the local file was open for read without creating a new file.')
 
     ebooklet_type = remote_session.type
 
@@ -308,7 +304,7 @@ def check_local_remote_sync(local_file, remote_session, flag):
         local_uuid = local_file.uuid
 
         if remote_uuid != local_uuid:
-            raise ValueError('The local file has a different UUID than the remote. Use a different local file path or delete the existing one.')
+            raise UUIDMismatchError('The local file has a different UUID than the remote. Use a different local file path or delete the existing one.')
 
         ## Check timestamp to determine if the local remote_index needs to be updated
         if (remote_session.timestamp > local_file._file_timestamp):
@@ -1118,7 +1114,10 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             local_file._file.seek(0)
             local_init_bytes = bytearray(local_file._file.read(200))
         if local_init_bytes[:16] != booklet.utils.uuid_variable_blt:
-            raise ValueError(local_init_bytes)
+            raise ValueError(
+                'The local file does not start with the variable-length booklet magic - '
+                f'not an ebooklet local file (first bytes: {bytes(local_init_bytes[:16])!r}).'
+            )
 
         n_keys_pos = booklet.utils.n_keys_pos
         local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
@@ -1160,7 +1159,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         ## aborts here instead of committing without mutual exclusion. All
         ## pending state stays journaled for a retry.
         if lock is not None and not lock.verify():
-            raise urllib3.exceptions.HTTPError(
+            raise LockLostError(
                 "The write lock is no longer held (this session's lock ticket was broken by "
                 'another client) - aborting the push before the commit. All pending changes '
                 'are retained; re-open the file to re-acquire the lock and push again.'

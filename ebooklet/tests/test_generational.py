@@ -23,7 +23,7 @@ def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=5, me
             eb[k] = v
         if metadata is not None:
             eb.set_metadata(metadata)
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     return conn
 
 
@@ -39,9 +39,9 @@ def test_generations_are_never_overwritten(tmp_path):
 
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
         eb['k1'] = b'v1b'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
         eb['k2'] = b'v2b'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
         put_log = eb._remote_session._write_session.put_log
 
     group_puts = [k for k in put_log if re.match(r'testdb/\d+\.[0-9a-f]{13}$', k)]
@@ -92,7 +92,7 @@ def test_failed_commit_leaves_readers_and_sidecar_untouched(tmp_path):
 
         ## The retry converges.
         session.put_object = orig_put
-        assert eb.changes().push(force_push=True) is True
+        assert eb.changes().push(force_push=True)
     finally:
         eb.close()
 
@@ -114,7 +114,7 @@ def test_gc_failure_is_invisible_orphan(tmp_path):
         session = eb._remote_session._write_session
         orig_del = session.delete_object
         session.delete_object = lambda key: {'message': 'induced GC failure'}
-        assert eb.changes().push() is True, 'a GC failure must not fail the push'
+        assert eb.changes().push(), 'a GC failure must not fail the push'
         session.delete_object = orig_del
     finally:
         eb.close()
@@ -141,7 +141,7 @@ def test_reader_heals_after_generational_gc(tmp_path):
         ## manifest still points at.
         with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
             eb['k1'] = b'v1-NEW'
-            assert eb.changes().push() is True
+            assert eb.changes().push()
 
         ## The reader's stale-manifest fetch 404s, re-pulls, retries, heals.
         assert reader['k1'] == b'v1-NEW'
@@ -169,14 +169,14 @@ def test_emptied_group_lifecycle(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=num_groups) as eb:
         eb[k_a] = b'a'
         eb[k_b] = b'b'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     manifest = utils.parse_db_payload(store['testdb'][0])[0]
     assert 1 in manifest and 2 in manifest
 
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
         del eb[k_a]
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     manifest = utils.parse_db_payload(store['testdb'][0])[0]
     assert 1 not in manifest, 'emptied group still in the manifest'
@@ -225,7 +225,8 @@ def test_replacement_partial_failure_commits_nothing(tmp_path):
         session.put_object = failing_put
 
         result = eb.changes().push()
-        assert isinstance(result, dict), 'induced failure did not surface'
+        assert result.failures, 'induced failure did not surface'
+        assert result.updated is False   # a partial REPLACEMENT commits nothing
 
         ## The OLD remote is untouched and fully readable.
         fresh = fake_s3.FakeS3Connection(store, 'testdb')
@@ -235,7 +236,7 @@ def test_replacement_partial_failure_commits_nothing(tmp_path):
 
         ## Retry converges to the replacement.
         session.put_object = orig_put
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     finally:
         eb.close()
 
@@ -270,7 +271,7 @@ def test_replacement_sweep_aborts_on_lost_lock(tmp_path):
             return calls['n'] < 3
         eb.lock.verify = verify
 
-        assert eb.changes().push() is True    # commit landed; sweep skipped
+        assert eb.changes().push()    # commit landed; sweep skipped
     finally:
         eb.close()
 
@@ -296,7 +297,7 @@ def test_metadata_carry_forward_preserves_remote(tmp_path):
     try:
         eb._local_file.set_metadata(None)
         eb['k3'] = b'v3'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     finally:
         eb.close()
 
@@ -314,7 +315,7 @@ def test_metadata_replacement_never_carries_forward(tmp_path):
         warnings.simplefilter('ignore')
         with open_ebooklet(conn, tmp_path / 'n.blt', flag='n', num_groups=5) as eb:
             eb['fresh'] = b'f'
-            assert eb.changes().push() is True
+            assert eb.changes().push()
 
     with fake_s3.FakeS3Connection(store, 'testdb').open('r') as rs:
         assert rs.get_user_metadata() is None, "replacement resurrected the old remote's metadata"
@@ -330,7 +331,7 @@ def test_metadata_skewed_local_edit_wins(tmp_path):
     try:
         eb.set_metadata({'m': 2}, timestamp=1_000_000_000_000_000)   # older than remote's
         with pytest.warns(UserWarning, match='metadata edit'):
-            assert eb.changes().push() is True
+            assert eb.changes().push()
     finally:
         eb.close()
 
@@ -353,11 +354,11 @@ def test_group_too_large_guard(tmp_path):
             result = eb.changes().push()
         finally:
             utils._MAX_GROUP_BYTES = orig_max
-        assert isinstance(result, dict)
-        assert any(isinstance(v, utils.GroupTooLargeError) for v in result.values())
+        assert result.failures
+        assert any('GroupTooLargeError' in v for v in result.failures.values())
         assert 'k1' in eb._journal.written
 
-        assert eb.changes().push() is True   # with the real limit, converges
+        assert eb.changes().push()   # with the real limit, converges
     finally:
         eb.close()
 
@@ -373,7 +374,7 @@ def test_per_key_mode_on_v2_payload(tmp_path):
             eb['alpha'] = b'a'
             eb['beta'] = b'b'
             eb.set_metadata({'mode': 'per-key'})
-            assert eb.changes().push() is True
+            assert eb.changes().push()
 
     manifest, meta_section, _idx = utils.parse_db_payload(store['testdb'][0])
     assert manifest == {}

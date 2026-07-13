@@ -71,7 +71,7 @@ def seed_remote(conn, keys_values, ng=num_groups):
     with open_ebooklet(conn, p, flag='n', **kwargs) as eb:
         for k, v in keys_values.items():
             eb[k] = v
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
 
 def sole_member_key(ng=num_groups):
@@ -162,7 +162,7 @@ def test_point_read_legit_deletion_quiet(caplog):
         ## reader now holds the OLD index (claims k)
         with open_ebooklet(conn, local_path('legit-writer'), flag='w') as w:
             del w[k]
-            assert w.changes().push() is True
+            assert w.changes().push()
 
         with caplog.at_level(logging.INFO, logger='ebooklet.main'):
             assert reader.get(k) is None
@@ -188,7 +188,7 @@ def test_point_read_legit_deletion_quiet_per_key_mode():
     try:
         with open_ebooklet(conn, local_path('legitpk-writer'), flag='w') as w:
             del w[k]
-            assert w.changes().push() is True
+            assert w.changes().push()
 
         assert reader.get(k) is None
         assert k not in reader
@@ -211,7 +211,7 @@ def test_metadata_reads_are_local_in_format2():
     with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
         eb[k] = b'v1'
         eb.set_metadata({'m': 1})
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, local_path('metaint-reader'), flag='r') as eb:
         patch_value_fetches_404(eb)
@@ -302,11 +302,11 @@ def test_push_pull_404_is_loud_and_retryable():
         result = eb.changes().push()
         eb._remote_session.get_object = original_get
 
-        assert isinstance(result, dict) and result
-        assert any(isinstance(v, MissingRemoteObject) for v in result.values())
+        assert result.failures
+        assert any('MissingRemoteObject' in v for v in result.failures.values())
         assert k1 in eb._journal.deletes         # retry signal retained
 
-        assert eb.changes().push() is True       # retry completes
+        assert eb.changes().push()       # retry completes
 
     with open_ebooklet(conn, local_path('pushfail-reader'), flag='r') as eb:
         assert eb.get(k1) is None
@@ -329,7 +329,7 @@ def test_concurrent_readers_during_recheck():
     try:
         with open_ebooklet(conn, local_path('conc-writer'), flag='w') as w:
             del w[k]
-            assert w.changes().push() is True
+            assert w.changes().push()
 
         errors = []
         stop = threading.Event()

@@ -21,6 +21,7 @@ import concurrent.futures
 
 logger = logging.getLogger(__name__)
 from . import utils
+from .errors import ReadOnlyError, RemoteMissingError, UUIDMismatchError, OfflineError
 
 
 ###############################################
@@ -353,7 +354,7 @@ class S3SessionWriter(S3SessionReader):
         if self.writable:
             return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
 
     def put_object(self, key: str, data: bytes, metadata=None):
@@ -366,7 +367,7 @@ class S3SessionWriter(S3SessionReader):
             key1 = self.write_db_key + '/' + key
             return self._write_session.put_object(key1, data, metadata=metadata)
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
 
     def delete_object(self, key: str):
@@ -390,7 +391,7 @@ class S3SessionWriter(S3SessionReader):
                 return err
             return None
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
     def delete_objects(self, keys):
         """
@@ -400,7 +401,7 @@ class S3SessionWriter(S3SessionReader):
             full_keys = [self.write_db_key + '/' + key for key in keys]
             self._write_session.delete_objects(keys=full_keys, purge=True)
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
 
     def delete_remote(self):
@@ -425,7 +426,7 @@ class S3SessionWriter(S3SessionReader):
             self._init_bytes = None
             self.uuid = None
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
     def copy_remote(self, remote_conn):
         """
@@ -436,14 +437,16 @@ class S3SessionWriter(S3SessionReader):
         with remote_conn.open('w') as writer:
 
             if not writer.writable:
-                raise ValueError('target remote is not writable.')
+                raise ReadOnlyError('target remote is not writable.')
 
             ## Check if source exists
             source_uuid = self.get_uuid()
             if source_uuid is None:
-                raise ValueError('The source remote does not exist.')
+                raise RemoteMissingError('The source remote does not exist.')
 
             ## Check is target exists
+            ## (Deliberately a builtin ValueError, not a taxonomy class: an
+            ## occupied target is argument validation, not a remote fault.)
             target_uuid = writer.get_uuid()
             if target_uuid is not None:
                 raise ValueError('The target remote already exists. Either delete_remote or use a different target.')
@@ -556,7 +559,7 @@ class S3SessionWriter(S3SessionReader):
             lock = self._write_session.lock(self.write_db_key)
             return lock
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
     def break_other_locks(self, timestamp: str | datetime.datetime=None):
         """
@@ -581,7 +584,7 @@ class S3SessionWriter(S3SessionReader):
 
             return other_keys
         else:
-            raise ValueError('Session is not writable.')
+            raise ReadOnlyError('Session is not writable.')
 
 
     def _head_object_writer(self, key: str=None):
@@ -608,6 +611,53 @@ class S3SessionWriter(S3SessionReader):
             raise urllib3.exceptions.HTTPError(resp_obj.error)
 
         return uuid1
+
+
+def _offline_op(name):
+    def _raise(self, *args, **kwargs):
+        raise OfflineError(
+            f'This session is offline - the remote operation {name!r} is unavailable. '
+            "Re-open without offline (or with offline='auto' and a reachable remote) "
+            'to use the remote.'
+        )
+    _raise.__name__ = name
+    return _raise
+
+
+class OfflineSession:
+    """
+    Stands in for the remote session when a database is opened offline
+    (open_ebooklet/open_rcg with offline=True, or the offline='auto'
+    fallback). Reports an uninitialized remote (uuid None), which makes every
+    open-time remote interaction skip itself (index fetch, sync check,
+    remote-state refresh), and raises OfflineError from any method that would
+    actually touch the network. Read-only by construction: the factories
+    restrict offline mode to flag='r', so no lock is ever created.
+    """
+    writable = False
+    initialized = False
+    uuid = None
+    timestamp = None
+    num_groups = None
+    format_version = None
+    type = None
+    _init_bytes = None
+    threads = 1
+
+    def close(self):
+        pass
+
+    _load_db_metadata = _offline_op('_load_db_metadata')
+    get_object = _offline_op('get_object')
+    put_object = _offline_op('put_object')
+    put_db_object = _offline_op('put_db_object')
+    delete_object = _offline_op('delete_object')
+    delete_objects = _offline_op('delete_objects')
+    delete_remote = _offline_op('delete_remote')
+    copy_remote = _offline_op('copy_remote')
+    list_objects = _offline_op('list_objects')
+    write_db_key = _offline_op('write_db_key')
+    create_lock = _offline_op('create_lock')
 
 
 class S3Connection(JsonSerializer):
@@ -742,7 +792,7 @@ class S3Connection(JsonSerializer):
             # Check to make sure the uuids are the same if the read and write sessions are different
             if isinstance(read_session, s3func.HttpSession) and session_writer.uuid is not None:
                 if session_writer._get_uuid_writer() != session_writer.uuid:
-                    raise ValueError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
+                    raise UUIDMismatchError('The UUIDs of the http connection and the S3 connection are different. Check to make sure the they are pointing to the right file.')
 
             return session_writer
 
