@@ -15,7 +15,7 @@ def _seed(store, db_key, tmp_path, items=None, num_groups=5):
     with open_ebooklet(conn, tmp_path / 'seed.blt', flag='n', num_groups=num_groups) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     return conn
 
 
@@ -123,7 +123,7 @@ def test_per_key_mode_expected_set(tmp_path):
         _w.simplefilter('ignore')
         with open_ebooklet(conn, tmp_path / 'w.blt', flag='n') as eb:
             eb['alpha'] = b'a'
-            assert eb.changes().push() is True
+            assert eb.changes().push()
 
     store['testdb/orphan-child'] = (b'x', {})
     report = fsck(conn, check_objects=True)

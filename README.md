@@ -170,6 +170,8 @@ magic b'ebooklet-db\x00' (12) | payload_version >H (2) | reserved (2)
 
 **Local state** — pending (unpushed) writes and deletions are journaled inside the local booklet file and survive sessions: reads always see your own unpushed changes, deletions cannot resurrect, and the next `push()` applies everything pending. `force_lock=True` on open breaks only lock tickets older than 2 hours (a live writer is protected; it would otherwise abort at its next push's lock re-verification).
 
+**Recovery recipes** — partial-failure retry, `force_push` after a failed commit, lock triage, `RemoteIntegrityError` triage, offline mode, and the format upgrade recipe live in the operations guide: [`docs/ops.md`](docs/ops.md).
+
 ## Open Flags
 
 | Flag | Meaning |

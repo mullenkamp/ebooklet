@@ -53,7 +53,7 @@ def test_emptied_group_delete_spares_sibling_groups(tmp_path):
         eb[k1] = b'one'
         eb[k10] = b'ten'
         eb[k12] = b'twelve'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     def _has_group(gid):
         return any(k.startswith(f'testdb/{gid}.') for k in store)
@@ -62,7 +62,7 @@ def test_emptied_group_delete_spares_sibling_groups(tmp_path):
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         del eb[k1]
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     assert not _has_group(1)
     assert _has_group(10), 'delete of group 1 destroyed group 10'
@@ -110,7 +110,7 @@ def test_flag_n_push_spares_siblings_and_locks(tmp_path):
     conn2 = fake_s3.FakeS3Connection(store, 'mydb2')
     with open_ebooklet(conn2, tmp_path / 'db2.blt', flag='n', num_groups=5) as eb:
         eb['other'] = b'precious'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## A (foreign) lock ticket for mydb, as if another contender crashed.
     store['mydb.lock.zzz999-0'] = (b'', {})
@@ -118,7 +118,7 @@ def test_flag_n_push_spares_siblings_and_locks(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'mydb')
     with open_ebooklet(conn, tmp_path / 'db1.blt', flag='n', num_groups=5) as eb:
         eb['mine'] = b'value'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     assert 'mydb2' in store, "flag='n' push on 'mydb' wiped sibling 'mydb2'"
     assert 'mydb.lock.zzz999-0' in store, "flag='n' push deleted lock-namespace objects"
@@ -153,12 +153,12 @@ def test_delete_then_set_survives_push(tmp_path):
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=num_groups) as eb:
         for i in range(6):
             eb[f'key{i}'] = b'v%d' % i
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         del eb['key2']
         eb['key2'] = b'NEWVAL'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -179,14 +179,14 @@ def test_delete_then_set_timestamp_survives_push(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=5) as eb:
         eb['key1'] = b'v1'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         del eb['key1']
         eb.set('key1', b'NEW', timestamp=1_500_000_000_000_000)
         eb.sync()   # set_timestamp needs the new block flushed out of the write buffer
         eb.set_timestamp('key1', 1_600_000_000_000_000)
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -202,12 +202,12 @@ def test_set_then_delete_still_deletes(tmp_path):
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=5) as eb:
         eb['keep'] = b'keep'
         eb['gone'] = b'v1'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         eb['gone'] = b'v2'
         del eb['gone']
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -224,7 +224,7 @@ def test_delete_then_set_of_never_pushed_key(tmp_path):
         eb['newkey'] = b'v1'
         del eb['newkey']
         eb['newkey'] = b'v2'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:

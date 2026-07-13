@@ -24,7 +24,7 @@ def test_close_with_unpushed_deletes_is_quiet_and_journaled(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     del eb['k']
@@ -36,7 +36,7 @@ def test_close_with_unpushed_deletes_is_quiet_and_journaled(tmp_path):
     ## The deletion survived the close and the next session's push applies it.
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
         assert 'k' not in eb
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -49,11 +49,11 @@ def test_close_quiet_when_deletes_pushed(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
         eb['k2'] = b'v2'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     del eb['k']
-    assert eb.changes().push() is True
+    assert eb.changes().push()
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter('always')
         eb.close()
@@ -65,7 +65,7 @@ def test_close_quiet_for_readers(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     eb = open_ebooklet(conn, tmp_path / 'r.blt', flag='r')
     with warnings.catch_warnings(record=True) as records:
@@ -79,7 +79,7 @@ def test_db_object_metadata_carries_format_version(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     _data, meta = store['testdb']
     assert meta['format_version'] == '2'
@@ -90,7 +90,7 @@ def test_too_new_format_version_is_refused(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     data, meta = store['testdb']
     meta = dict(meta)
@@ -114,7 +114,7 @@ def test_format_1_is_refused_except_replacement(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb['k'] = b'v'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     data, meta = store['testdb']
     meta = dict(meta)
@@ -132,7 +132,7 @@ def test_format_1_is_refused_except_replacement(tmp_path):
     with open_ebooklet(conn3, tmp_path / 'n.blt', flag='n', num_groups=5) as eb:
         eb['fresh'] = b'f1'
         assert 'k' not in eb        # v1 content is never read (suppressed)
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     _data2, meta2 = store['testdb']
     assert meta2['format_version'] == '2'

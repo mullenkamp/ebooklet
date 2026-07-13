@@ -27,7 +27,7 @@ def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=5):
     with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     return conn
 
 
@@ -47,7 +47,7 @@ def test_cross_session_delete_survives_close(tmp_path):
 
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
         assert 'k1' not in eb, 'journaled delete not honored after reopen'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -67,7 +67,7 @@ def test_skewed_local_edit_pushes(tmp_path):
         eb.set('k1', b'SKEWED', timestamp=1_000_000_000_000_000)
         with pytest.warns(UserWarning, match='timestamp was advanced'):
             result = eb.changes().push()
-        assert result is True
+        assert result
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -106,7 +106,7 @@ def test_unpushed_replacement_survives_reopen(tmp_path):
     with pytest.warns(UserWarning, match='REPLACEMENT'):
         eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     try:
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     finally:
         eb.close()
 
@@ -147,7 +147,7 @@ def test_union_changelog_covers_stale_journal(tmp_path):
         ## Simulate a lost journal entry (crash window): the data block is
         ## durable, the journal never heard of it.
         eb._journal.written.clear()
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
@@ -171,7 +171,7 @@ def test_journal_cleared_only_after_commit(tmp_path):
         assert 'k1' in eb._journal.deletes
 
         eb.lock.broken = False
-        assert eb.changes().push() is True
+        assert eb.changes().push()
         assert not eb._journal.written
         assert not eb._journal.deletes
     finally:
@@ -198,7 +198,7 @@ def test_partial_failure_retains_failed_groups_only(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=num_groups) as eb:
         eb[k_a] = b'a1'
         eb[k_b] = b'b1'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     try:
@@ -216,12 +216,13 @@ def test_partial_failure_retains_failed_groups_only(tmp_path):
         session.put_object = failing_put
 
         result = eb.changes().push()
-        assert isinstance(result, dict), 'induced group failure did not surface'
+        assert result.failures, 'induced group failure did not surface'
+        assert result.updated is True   # non-replacement partial: successful groups committed
         assert k_a in eb._journal.written, "failed group's journal entry was cleared"
         assert k_b not in eb._journal.written, "committed group's journal entry was retained"
 
         session.put_object = orig_put
-        assert eb.changes().push() is True
+        assert eb.changes().push()
         assert not eb._journal.written
     finally:
         eb.close()
@@ -249,7 +250,7 @@ def test_replay_on_swap_prevents_resurrection(tmp_path):
         conn_b = fake_s3.FakeS3Connection(store, 'testdb')
         with open_ebooklet(conn_b, tmp_path / 'b.blt', flag='w') as eb_b:
             eb_b['k9'] = b'v9'
-            assert eb_b.changes().push() is True
+            assert eb_b.changes().push()
 
         ## A pulls the fresh index - k1's entry is in it, replay removes it.
         eb_a.changes().pull()
@@ -319,7 +320,7 @@ def test_prune_protects_journaled_writes(tmp_path):
         assert eb['k1'] == b'OLD-BUT-MINE', 'prune evicted a journaled pending write'
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter('always')
-            assert eb.changes().push() is True
+            assert eb.changes().push()
         assert not [w for w in records if 'DROPPED' in str(w.message)]
     finally:
         eb.close()
@@ -364,7 +365,7 @@ def test_num_groups_tristate_reopen(tmp_path):
     assert not [w for w in records if 'per-key storage' in str(w.message)], \
         'journaled num_groups did not silence the reopen warning'
     try:
-        assert eb.changes().push() is True
+        assert eb.changes().push()
     finally:
         eb.close()
 
@@ -412,7 +413,7 @@ def test_meta_pending_lifecycle(tmp_path):
     try:
         eb.set_metadata({'a': 1})
         assert eb._journal.meta_pending is True
-        assert eb.changes().push() is True
+        assert eb.changes().push()
         assert eb._journal.meta_pending is False
     finally:
         eb.close()

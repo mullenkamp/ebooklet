@@ -6,9 +6,12 @@ Entries for 0.8.3 and earlier were reconstructed from commit history after the f
 
 ## 0.10.0 (2026-07-13)
 
-Phase 1 of the architecture-assessment roadmap (design dual-reviewed
-pre-implementation: `phase1-design-brief.md` + the two `phase1-review-*.md`
-reports). Releases together with the Phase-2 API pass as one release.
+Phases 1 and 2 of the architecture-assessment roadmap, shipped as one release
+(each phase's design dual-reviewed pre-implementation: `planning/phase{1,2}-design-brief.md`
++ the four `planning/phase{1,2}-review-*.md` reports). Phase 1 is the structural round
+(journal, generational format 2, fsck, lock safety); Phase 2 is the pre-1.0
+API round (typed exceptions, MutableMapping conformance, PushResult, offline
+read mode, the ops guide).
 Requires booklet >= 0.12.7 (reserved slots) and s3func >= 0.9.3 (lock verify
 + age-gated breaking). New dependencies: msgspec (serialization for all new
 ebooklet-owned formats); portalocker now declared (was only transitive).
@@ -144,6 +147,84 @@ push is never robbed of its fresh uploads.
   (byte-identical JSON; the stored `'orjson'` value-serializer id in existing
   local files is unchanged and still supported).
 
+### Added — typed exception taxonomy (Phase 2)
+Every ebooklet-raised consumer-facing error now derives from `ebooklet.Error`
+(new `errors` module, all classes exported at the package root). Existing
+handlers keep working: the new classes keep their legacy parentage via dual
+inheritance for this release.
+- `ReadOnlyError(Error, ValueError)` — every "read only"/"not writable" guard
+  (covers both flag='r' sessions and missing write credentials).
+- `UUIDMismatchError(Error, ValueError)` — local file vs remote, and http vs
+  S3 connection identity mismatches (previously bare ValueErrors that
+  consumers had to string-match).
+- `RemoteMissingError(Error, ValueError)` — read-open with no remote and no
+  local file; RCG member registration of a nonexistent remote; `copy_remote`
+  from a nonexistent source.
+- `UnsupportedFormatError` and `GroupTooLargeError` re-parented under `Error`
+  (still ValueErrors); `RemoteIntegrityError` gains `Error` and KEEPS its
+  urllib3 `HTTPError` parentage.
+- New `LockLostError(Error)` replaces the bare HTTPError at the two
+  push-boundary lock verifications. Deliberately NOT an HTTPError: a lost
+  lock is not connectivity, and connectivity handlers must not treat it as
+  such. The lock-acquire timeout stays the builtin `TimeoutError`; argument/
+  configuration validation stays builtin ValueError/TypeError (incl.
+  `copy_remote`'s target-already-exists).
+- New `OfflineError(Error)` — see offline read mode below.
+
+### Changed — MutableMapping conformance + true clear() (Phase 2)
+- **`del eb[key]` of a missing key raises `KeyError`** (was a silent no-op).
+  "Missing" follows `in`: not in the remote index and not in the local file.
+- **`update()` implements full dict.update semantics** — a mapping, an
+  iterable of key/value pairs, and/or keyword arguments (was: one mapping).
+- **`clear()` is a TRUE clear** (was: local cache eviction). Every key is
+  journaled as a deletion and applied by the next push, which commits an
+  atomically-empty database; until pushed, `changes().discard()` cancels it.
+  Unpushed pending writes are dropped by a clear (deliberately, without a
+  warning — clear means clear). Local cache eviction's replacement idiom is
+  `prune(timestamp=<now>)` (journal-pending writes are never evicted).
+- The dead `force_shutdown` parameter is removed from `close()`/`sync()`
+  (it had no callers and no longer had an implementation to serve).
+- `Change.update()` is renamed **`build_changelog()`** (the old name was
+  easily confused with the MutableMapping `update()` on the ebooklet itself;
+  it was only called internally).
+- `push()` on a read-only session now raises `ReadOnlyError` (previously an
+  AttributeError, because the remote-writability guard ran first against a
+  reader session object that has no such attribute).
+
+### Changed — `push()` returns `PushResult` (Phase 2)
+`push()` now returns a `PushResult` (msgspec Struct) instead of
+True/False/dict: `updated` (the remote changed), `failures` (per-key/group
+upload failures as `'ExceptionClassName: message'` strings; pending changes
+for failed entries stay journaled), and `bool(result)` = fully-successful
+push that changed the remote. Semantics fixes ride along: the legacy
+partial-failure dict was accidentally TRUTHY (`if push():` misread partial
+failure as success — any failure is now falsy), and `updated` is precise
+about partial pushes (an ordinary partial push HAS committed its successful
+groups → True; a partial replacement push commits nothing → False). Commit
+failures still raise (HTTPError / LockLostError) rather than returning — see
+`docs/ops.md` for the two failure channels.
+
+### Added — offline read mode (Phase 2)
+`open_ebooklet(..., offline=False|'auto'|True)` and the same on `open_rcg`
+(read-only: requires flag='r'; the session exposes an `.offline` property).
+`offline=True` never touches the remote: it serves the existing local file
+as-is; reads of values not materialized locally raise `OfflineError` (the
+key exists — its value needs the remote; bulk reads raise ONE error naming
+the keys before any fetch is attempted). `offline='auto'` opens online and
+falls back to offline (with a UserWarning) ONLY on transport-level
+unreachability (DNS/connect/timeout) — integrity/format/uuid faults and HTTP
+status errors (e.g. bad credentials) still raise, so a broken remote is
+never masked by stale local data. Offline covers the opened database only:
+an RCG opened offline browses the catalogue, but member opens still need
+connectivity.
+
+### Added — operations guide
+`docs/ops.md`: the recovery recipes in one place — partial-failure retry,
+`force_push` after a failed commit, fsck usage, lost/stuck locks and the
+force_lock age gate, `RemoteIntegrityError` triage, `flag='n'` replacement
+guidance ("use 'c' unless you mean to replace"), offline mode, and the
+format-1 → format-2 upgrade recipe.
+
 ## 0.9.6 (2026-07-12)
 
 ### Fixed — data loss: deleting a key and re-setting it in the same session lost the key on push
@@ -155,13 +236,13 @@ the group object. Reachable through any delete-then-recreate workflow (e.g. dele
 a cfdb variable and recreating it in one session). `set`/`set_timestamp` now remove
 the key from the pending deletes — the mirror of what deletion already did to the
 pending writes. Present since deletes were introduced. Found by the Phase-1 design
-review (`phase1-review-claude.md`, F-1) and verified against 0.9.5.
+review (`planning/phase1-review-claude.md`, F-1) and verified against 0.9.5.
 
 ## 0.9.5 (2026-07-12)
 
 Phase 0 of the adopted architecture-assessment roadmap (see
-`architecture-assessment-synthesis.md`); design dual-reviewed pre-implementation
-(`phase0-design-brief.md` + the two `phase0-review-*.md` reports).
+`planning/architecture-assessment-synthesis.md`); design dual-reviewed pre-implementation
+(`planning/phase0-design-brief.md` + the two `planning/phase0-review-*.md` reports).
 
 ### Fixed — data loss: S3 deletes were prefix-based, destroying unrelated objects
 - **Emptying one group deleted sibling groups.** `delete_object` issued a string-

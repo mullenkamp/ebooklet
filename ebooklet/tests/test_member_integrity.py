@@ -66,7 +66,7 @@ def test_missing_member_is_loud_on_read(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     _repack_group_without(store, 'testdb', gid, {kb})
 
@@ -89,7 +89,7 @@ def test_legit_member_deletion_resolves_to_clean_absence(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## Reader opens now - its index snapshot claims kb.
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
@@ -101,7 +101,7 @@ def test_legit_member_deletion_resolves_to_clean_absence(tmp_path):
         conn_w = fake_s3.FakeS3Connection(store, 'testdb')
         with open_ebooklet(conn_w, tmp_path / 'w2.blt', flag='w') as eb2:
             del eb2[kb]
-            assert eb2.changes().push() is True
+            assert eb2.changes().push()
 
         assert reader.get(kb) is None         # re-check resolves to clean absence
         assert kb not in reader               # ...and the index was refreshed
@@ -122,7 +122,7 @@ def test_push_self_heal_preserved(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     _repack_group_without(store, 'testdb', gid, {kb})
 
@@ -131,7 +131,7 @@ def test_push_self_heal_preserved(tmp_path):
     with open_ebooklet(conn_w, tmp_path / 'w2.blt', flag='w') as eb2:
         eb2[kc] = b'ccc'
         result = eb2.changes().push()
-        assert result is True, f'push self-heal failed loudly: {result}'
+        assert result, f'push self-heal failed loudly: {result}'
 
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn_r, tmp_path / 'r.blt', flag='r') as eb:
@@ -152,13 +152,13 @@ def test_empty_grouped_value_survives_repack(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ke] = b''
         eb[ka] = b'aaa'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     ## Fresh-local writer (ke not materialized) repacks the group.
     conn_w = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn_w, tmp_path / 'w2.blt', flag='w') as eb2:
         eb2[ka] = b'aaa2'
-        assert eb2.changes().push() is True
+        assert eb2.changes().push()
 
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn_r, tmp_path / 'r.blt', flag='r') as eb:
@@ -176,7 +176,7 @@ def test_empty_grouped_value_reads_back(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ke] = b''
         eb[ka] = b'aaa'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn_r, tmp_path / 'r.blt', flag='r') as eb:
@@ -195,7 +195,7 @@ def test_full_recovery_returns_no_marker(tmp_path):
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
-        assert eb.changes().push() is True
+        assert eb.changes().push()
 
     _reorder_group(store, 'testdb', gid)      # offsets shift; both members present
 
