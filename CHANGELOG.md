@@ -4,7 +4,7 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.10.1 (2025-07-15)
+## 0.10.1 (2026-07-15)
 
 The push-pipelining round (design dual-reviewed pre-implementation:
 `planning/push-pipeline-design-brief.md` + the two `planning/push-pipeline-review-*.md`
