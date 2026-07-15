@@ -97,6 +97,27 @@ class OfflineError(Error):
     """
 
 
+class PushInProgressError(Error, RuntimeError):
+    """
+    prune() or clear() was called while a push is running on this session.
+    A compaction moves/destroys the local value bytes the push is reading
+    (the push captures physical offsets up front), so it must wait for the
+    push to finish.
+    """
+
+
+class ConcurrentCompactionError(Error, RuntimeError):
+    """
+    The push detected that a compaction (prune()/clear() on the underlying
+    local booklet) ran after the push captured its value offsets - every
+    captured offset is invalid, so the push aborts BEFORE its commit. Nothing
+    was committed, staged, or journal-cleared; any group objects already
+    uploaded are invisible orphans (fsck sweeps them). Re-run the push.
+    Should be unreachable through the session API (PushInProgressError blocks
+    prune/clear during a push); this is the belt for out-of-band compactions.
+    """
+
+
 ## Transport-level failures that mean "the remote is unreachable" - the ONLY
 ## errors offline='auto' falls back on. HTTP *status* errors (403/500 etc.
 ## surface as bare HTTPError) and ebooklet's typed errors are deliberately

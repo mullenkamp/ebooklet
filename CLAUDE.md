@@ -48,7 +48,7 @@ uv build
 2. **`main.py` — Database Layer**
    - `EVariableLengthValue(MutableMapping)` — the main database class. Maintains a local booklet file + a `.remote_index` file tracking what's on S3
    - `RemoteConnGroup(EVariableLengthValue)` — specialized variant that stores `S3Connection` references (stored with booklet's `'orjson'` value serializer — a file-format id, unrelated to the msgspec runtime serialization)
-   - `Change` — manages sync workflow: `pull()` updates remote index+manifest, `build_changelog()` creates the changelog (union of timestamp diff and the journal; renamed from `update()` in 0.10), `push()` runs the upload→commit→GC protocol and returns a `PushResult` (`updated`, `failures` as `'ClassName: message'` strings, `__bool__` = fully-successful; commit failures RAISE — HTTPError / `LockLostError`), `pending_deletes`/`discard()` expose and cancel pending changes
+   - `Change` — manages sync workflow: `pull()` updates remote index+manifest, `build_changelog()` creates the changelog (union of timestamp diff and the journal; renamed from `update()` in 0.10) and — 0.10.1 — captures `loc_map` (`{key: (ts, value_offset, value_len)}` via booklet's header-only `locations()` sweep, zero extra IO) plus the `compaction_count` snapshot the offsets are valid for, `push()` runs the upload→commit→GC protocol and returns a `PushResult` (`updated`, `failures` as `'ClassName: message'` strings, `__bool__` = fully-successful; commit failures RAISE — HTTPError / `LockLostError` / `ConcurrentCompactionError`), `pending_deletes`/`discard()` expose and cancel pending changes
    - `open_ebooklet()` — factory function for `EVariableLengthValue` databases
    - `open_rcg()` — factory function for `RemoteConnGroup` databases
    - Both factories take `offline=False|'auto'|True` (flag='r' only): True never touches the remote (stub `OfflineSession` in remote.py; unmaterialized reads raise `OfflineError`), 'auto' falls back to offline ONLY on transport-level unreachability (`errors.TRANSPORT_ERRORS`); sessions expose `.offline`
@@ -78,7 +78,8 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 - **Read path (grouped):** `db[key]` → check local file → if missing/stale, byte-range GET from group S3 object using stored offset/length → cache locally → return
 - **Bulk read (grouped):** `load_items()` → collect stale keys → group by group_id → one merged byte-range GET per group → cache locally
 - **Write path:** `db[key] = val` → write to local booklet file only
-- **Sync path:** `db.changes().push()` → lock verify → changelog (timestamp diff ∪ journal; skew-stamped edits normalized) → pull unmaterialized group members (read-your-writes gated) → upload new generations via thread pool → lock verify → ONE db-object PUT (manifest+metadata+index — the atomic commit) → apply staged index entries, clear journal per committed group, persist remote-state → GC replaced generations (failures = invisible orphans for fsck)
+- **Sync path (0.10.1 pipelined):** `db.changes().push()` → lock verify → changelog + loc_map capture (timestamp diff ∪ journal; skew-stamped edits normalized AND refreshed in the map) → pull unmaterialized group members (read-your-writes gated; pulled keys tracked in `pulled_keys`) → phase B: per-group workers read member values through a PRIVATE fd at the captured offsets in ascending order (no booklet lock in the hot path; a `BoundedSemaphore(push_packers)` — per-push, default 1 — gates concurrent disk readers while PUTs run outside it) → lock verify → ONE db-object PUT (manifest+metadata+index — the atomic commit) → apply staged index entries, clear journal per committed group, persist remote-state → GC replaced generations (failures = invisible orphans for fsck). Progress narrates on the `ebooklet.push` logger (INFO).
+- **Pipelined-push invariants (2026-07-15 round + dual-blind reviews — do not regress these):** (1) keys in `pulled_keys` or absent from `loc_map` MUST read through booklet's locked path — their captured offset (if any) predates the pull and addresses the STALE superseded bytes (append-only means the old block still exists); (2) captured offsets die on prune/clear — `PushInProgressError` guards `prune()`/`clear()` while `_push_active`, and workers re-check `compaction_count` against the capture snapshot, aborting with `ConcurrentCompactionError` BEFORE the commit; (3) phase-B/pull/per-key workers **return errors, never raise** — every `future.result()` is also wrapped so transport raises (e.g. `MaxRetryError`) become per-group `PushResult.failures`, never a whole-push crash; (4) `pack_group` builds its buffer as a **bytearray** — `bytes +=` is quadratic (~100GB memcpy per 134MB group; the pre-0.10.1 production bottleneck; a tripwire test guards this); (5) staged index timestamps come from the capture/locked read that produced the packed bytes, never a post-upload re-read; (6) large-body upload reliability lives in s3func ≥ 0.9.4 (streamed bytes bodies + idle-timeout semantics) — never bypass `put_object` with raw urllib3 bytes bodies.
 
 ### Key Files per Database
 
@@ -98,8 +99,9 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 
 ```python
 from ebooklet import (open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup,
-                      S3Connection, RemoteIntegrityError, UnsupportedFormatError,
-                      GroupTooLargeError, fsck, FsckReport)
+                      S3Connection, PushResult, RemoteIntegrityError, UnsupportedFormatError,
+                      GroupTooLargeError, PushInProgressError, ConcurrentCompactionError,
+                      fsck, FsckReport)
 ```
 
 ### Dependencies

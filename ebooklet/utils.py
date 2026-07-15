@@ -8,6 +8,8 @@ Created on Thu Jan  5 11:04:13 2023
 import logging
 import hashlib
 import struct
+import threading
+import time
 import warnings
 import uuid as _uuid
 import booklet
@@ -19,6 +21,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import msgspec
 
 logger = logging.getLogger(__name__)
+
+## Push progress records (INFO) - a dedicated logger so consumers can opt in
+## to push monitoring without enabling ebooklet's other module logs:
+##   logging.getLogger('ebooklet.push').setLevel(logging.INFO)
+push_logger = logging.getLogger('ebooklet.push')
 
 ############################################
 ### Parameters
@@ -69,6 +76,7 @@ from .errors import (  # noqa: E402
     RemoteMissingError as RemoteMissingError,
     LockLostError as LockLostError,
     OfflineError as OfflineError,
+    ConcurrentCompactionError as ConcurrentCompactionError,
 )
 
 
@@ -200,7 +208,12 @@ _MAX_GROUP_BYTES = 2**32 - 1   # the >I offset and length fields' ceiling
 
 
 def pack_group(entries: list[tuple[str, int, bytes]]) -> tuple[bytes, dict[str, tuple[int, int]]]:
-    buf = struct.pack('>I', len(entries))
+    ## buf MUST be a bytearray: appending to an immutable `bytes` re-copies the
+    ## whole buffer every time (quadratic - ~100GB of memcpy for a 134MB group,
+    ## ~60-100s of CPU per group; it was the PRIMARY cause of the one-group-
+    ## per-~105s production push cadence, hidden since 0.10.0 because tests
+    ## pack tiny groups). bytearray appends are amortized O(1).
+    buf = bytearray(struct.pack('>I', len(entries)))
     offsets = {}
     pos = 4
     for key, timestamp, value in entries:
@@ -226,7 +239,7 @@ def pack_group(entries: list[tuple[str, int, bytes]]) -> tuple[bytes, dict[str, 
         offsets[key] = (pos, len(value))
         buf += value
         pos += len(value)
-    return buf, offsets
+    return bytes(buf), offsets
 
 
 def unpack_group(data: bytes) -> list[tuple[str, int, bytes]]:
@@ -514,30 +527,132 @@ def get_remote_value(local_file, key, remote_session):
     return None
 
 
-def upload_group(group_id, gen, local_file, remote_session, keys_in_group):
+def _open_private_reader(path):
+    """
+    Open the pack workers' private read handle on the local booklet file.
+    Factored out so tests can inject an OSError to exercise the locked
+    fallback path (on Windows the write-mode booklet's mandatory byte-range
+    lock can deny these reads - see _read_group_values).
+    """
+    return open(path, 'rb')
+
+
+def _read_group_values(local_file, entries, pulled_keys, fallback_warned):
+    """
+    Resolve one group's member values for packing. Returns a list of
+    (key, ts_int, raw_value_bytes); members with no local value are skipped
+    (the lost-key drop semantics - the caller already removed their index
+    entries).
+
+    entries: [(key, ts_int_or_None, value_offset_or_None, value_len_or_None)]
+    in ascending captured-offset order. Members with a captured offset read
+    through a PRIVATE fd - no booklet lock in the hot path, and the offset
+    order means the disk head sweeps forward once per group (the whole point
+    of the pipelined push). Members pulled/materialized after the capture
+    (pulled_keys, offset None) read through booklet's locked path instead:
+    their captured offset (if any) predates the pull so it would deliver the
+    STALE superseded bytes, and phase A just wrote them so the locked read is
+    page-cache-hot. The locked read's own timestamp is authoritative for
+    those keys.
+
+    On any OSError from the private fd (short read; Windows mandatory-lock
+    denial - LockFileEx covers roughly the first 4.29GB, denied per read),
+    the WHOLE group falls back to locked reads: correct everywhere, merely
+    slower. Warned once per push, not per group.
+    """
+    out = []
+    fast_entries = []
+    locked_keys = []
+    fast_ok = getattr(local_file, '_is_file', False)
+    for key, ts_int, value_offset, value_len in entries:
+        if fast_ok and value_offset is not None and key not in pulled_keys:
+            fast_entries.append((key, ts_int, value_offset, value_len))
+        else:
+            locked_keys.append(key)
+
+    try:
+        if fast_entries:
+            with _open_private_reader(local_file._file_path) as f:
+                for key, ts_int, value_offset, value_len in fast_entries:
+                    f.seek(value_offset)
+                    valb = f.read(value_len)
+                    if len(valb) != value_len:
+                        raise OSError(
+                            f"short read for key '{key}': wanted {value_len} bytes at "
+                            f'offset {value_offset}, got {len(valb)}'
+                        )
+                    out.append((key, ts_int, valb))
+    except OSError as err:
+        if not fallback_warned.is_set():
+            fallback_warned.set()
+            push_logger.warning(
+                f'The fast (private-fd) read path is unavailable for some groups ({err}); '
+                'falling back to locked booklet reads for those groups - slower, still correct.'
+            )
+        out = []
+        locked_keys = [key for key, _ts, _off, _ln in entries]
+
+    for key in locked_keys:
+        result = local_file.get_timestamp(key, include_value=True, decode_value=False)
+        if result is None:
+            continue
+        ts_int, valb = result
+        out.append((key, ts_int, valb))
+    return out
+
+
+def upload_group(group_id, gen, local_file, remote_session, entries, pulled_keys, pack_gate, comp0, fallback_warned):
     """
     Pack and PUT one group's members to a FRESH generation object - never
     overwriting the live generation (immutability is the format-2 invariant).
     The caller skips emptied groups entirely (no PUT; the group leaves the
     manifest at commit and its old generation is GC'd after). Worker contract:
     return errors, never raise (a raise would crash future.result()).
-    """
-    entries = []
-    for key in keys_in_group:
-        result = local_file.get_timestamp(key, include_value=True, decode_value=False)
-        if result is None:
-            continue
-        time_int_us, valb = result
-        entries.append((key, time_int_us, valb))
 
+    Returns (error_or_None, offsets, ts_map, packed_len, pack_secs, put_secs):
+    offsets/ts_map cover exactly the packed members (ts_map is what the
+    caller stages into the index, so the packed ts and the staged ts are
+    identical by construction). pack_gate (a BoundedSemaphore constructed per
+    push) bounds how many workers read the local disk at once; the PUT runs
+    OUTSIDE the gate, so packing one group overlaps uploading the others.
+    comp0 is the compaction_count captured with the offsets: a mismatch after
+    the reads means a prune()/clear() invalidated every captured offset - the
+    reads may be garbage, and the caller aborts the push before its commit.
+    """
+    t0 = time.monotonic()
     try:
-        packed, offsets = pack_group(entries)
-    except GroupTooLargeError as err:
-        return err, None
-    resp = remote_session.put_object(group_obj_key(group_id, gen), packed)
+        with pack_gate:
+            values = _read_group_values(local_file, entries, pulled_keys, fallback_warned)
+            packed, offsets = pack_group(values)
+            if local_file.compaction_count != comp0:
+                return (
+                    ConcurrentCompactionError(
+                        'A compaction (prune/clear) ran on the local file during the push - '
+                        'every captured value offset is invalid. The push aborts before its '
+                        'commit; re-run it.'
+                    ),
+                    None, None, 0, 0.0, 0.0,
+                )
+        ts_map = {key: ts_int for key, ts_int, _valb in values}
+    except Exception as err:
+        ## GroupTooLargeError and everything else: the worker contract is
+        ## return-not-raise; unexpected bugs surface as per-group failures.
+        return err, None, None, 0, 0.0, 0.0
+    pack_secs = time.monotonic() - t0
+
+    t1 = time.monotonic()
+    try:
+        resp = remote_session.put_object(group_obj_key(group_id, gen), packed)
+    except Exception as err:
+        ## Transport-level failures (e.g. MaxRetryError after repeated
+        ## timeouts on a congested uplink) raise out of the session instead
+        ## of returning a status - they are per-group retryable failures,
+        ## never a whole-push crash.
+        return err, None, None, len(packed), time.monotonic() - t0, time.monotonic() - t1
+    put_secs = time.monotonic() - t1
     if resp.status // 100 != 2:
-        return resp.error, None
-    return None, offsets
+        return resp.error, None, None, len(packed), pack_secs, put_secs
+    return None, offsets, ts_map, len(packed), pack_secs, put_secs
 
 
 ## Per-entry header layout inside a packed group object (see pack_group):
@@ -689,6 +804,25 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
     changelog - without this the edit would push with its older stamp and
     readers that already materialized the newer remote value would never pull
     it (the 0.8.4 clock-skew case, now closed instead of warned about).
+
+    Returns (changelog_path, loc_map, compaction_count):
+
+    The sweep rides booklet's header-only locations() iterator (0.12.8), so as
+    a zero-extra-IO side product it captures loc_map = {key: (ts_int,
+    value_offset, value_len)} - the physical position of every live local
+    value. The push's pack workers later read those bytes through a private
+    fd, outside booklet's locks. loc_map is in-memory only (a retried push
+    rebuilds the changelog anyway). compaction_count is snapshotted at the
+    START of the sweep: booklet value blocks are append-only, so the captured
+    offsets stay valid until a prune()/clear() bumps that counter - the push
+    re-checks it after reading (a mid-sweep compaction already raises through
+    booklet's iterator mutation guard, so a completed sweep proves the
+    snapshot spans the capture). Post-capture in-push mutations are all
+    offset-safe: the skew set_timestamp below (refreshed in the map in place),
+    phase-A pull set()s (append + chain rewire - orphans old blocks, never
+    moves other keys' bytes), journal/remote-state set_reserved persists
+    (append), the phase-C set_metadata (append), and the file-timestamp
+    header write.
     """
     changelog_path = local_file_path.parent.joinpath(local_file_path.name + '.changelog')
     if remote_index is not None:
@@ -698,9 +832,16 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
 
     journal_written = journal.written if journal is not None else ()
 
+    ## Snapshot BEFORE the sweep (see the docstring). A compaction between
+    ## this line and the sweep start only makes the push abort spuriously -
+    ## safe direction, and unreachable through the session API during a push.
+    compaction_count = local_file.compaction_count
+    loc_map = {}
+
     with booklet.FixedLengthValue(changelog_path, 'n', key_serializer='str', value_len=14, n_buckets=n_buckets) as f:
         if remote_session.uuid and remote_index is not None:
-            for key, local_int_us in local_file.timestamps():
+            for key, local_int_us, value_offset, value_len in local_file.locations():
+                loc_map[key] = (local_int_us, value_offset, value_len)
                 remote_val = remote_index.get(key)
                 if remote_val:
                     remote_ts_bytes = remote_val[:7]
@@ -719,7 +860,8 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
             for key in sorted(journal_written):
                 if key in f:
                     continue
-                local_int_us = local_file.get_timestamp(key)
+                entry = loc_map.get(key)
+                local_int_us = entry[0] if entry is not None else None
                 if local_int_us is None:
                     warnings.warn(
                         f"The journal records an unpushed write for '{key}' but the key has no "
@@ -734,6 +876,9 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
                     remote_int_us = bytes_to_int(remote_val[:7])
                     new_ts = max(now_int_us, remote_int_us + 1)
                     local_file.set_timestamp(key, new_ts)
+                    ## The in-place ts rewrite (offset-safe) must reach the
+                    ## captured map too - the packed entry carries the map ts.
+                    loc_map[key] = (new_ts, entry[1], entry[2])
                     warnings.warn(
                         f"The unpushed local edit of '{key}' carried a timestamp at or before the "
                         "remote's (clock skew or an explicit set_timestamp); its timestamp was "
@@ -747,7 +892,8 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
             ## (User metadata no longer rides the changelog: in format 2 it is
             ## embedded in the db-object payload, driven by journal.meta_pending.)
         else:
-            for key, local_int_us in local_file.timestamps():
+            for key, local_int_us, value_offset, value_len in local_file.locations():
+                loc_map[key] = (local_int_us, value_offset, value_len)
                 local_bytes_us = int_to_bytes(local_int_us, 7)
                 f[key] = local_bytes_us + int_to_bytes(0, 7)
 
@@ -763,7 +909,7 @@ def create_changelog(local_file_path, local_file, remote_index, remote_session, 
                     )
                     journal.discard_written(key)
 
-    return changelog_path
+    return changelog_path, loc_map, compaction_count
 
 
 def view_changelog(changelog_path):
@@ -844,7 +990,66 @@ def _build_meta_section_for_push(local_file, journal, remote_state, replace_pend
     return remote_state.meta_section
 
 
-def update_remote(local_file, remote_index, remote_index_path, changelog_path, remote_session, force_push, journal, remote_state, replace_pending, ebooklet_type, num_groups=None, lock=None):
+def _format_secs(secs):
+    secs = int(secs)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h}:{m:02d}:{s:02d}'
+
+
+class _PushProgress:
+    """
+    Cumulative progress for the 'ebooklet.push' INFO records. Exact upfront
+    totals come from the captured loc_map value lengths (+ the pack-format
+    per-entry overhead), so done/total are mutually consistent. Rate/ETA are
+    cumulative means - with ~100MB group quanta a windowed rate just jitters.
+    record() is only ever called from the single-threaded bookkeeping loop.
+    """
+    def __init__(self, n_groups, n_keys, total_bytes):
+        self.n_groups = n_groups
+        self.n_keys = n_keys
+        self.total_bytes = total_bytes
+        self.done = 0
+        self.done_bytes = 0
+        self.failed = 0
+        self.t0 = time.monotonic()
+
+    def start(self):
+        push_logger.info(
+            f'push upload starting: {self.n_groups} group(s), {self.n_keys} key(s), '
+            f'{self.total_bytes:,} bytes'
+        )
+
+    def record(self, gid, gen, error, packed_len, pack_secs, put_secs):
+        if error is None:
+            self.done += 1
+            self.done_bytes += packed_len
+            elapsed = max(time.monotonic() - self.t0, 1e-9)
+            rate = self.done_bytes / elapsed
+            remaining = max(self.total_bytes - self.done_bytes, 0)
+            eta = _format_secs(remaining / rate) if rate > 0 else '?'
+            push_logger.info(
+                f'group {self.done + self.failed}/{self.n_groups} ({gid}.{gen}): {packed_len:,} B '
+                f'(pack {pack_secs:.1f}s, put {put_secs:.1f}s) - '
+                f'{self.done_bytes / 1e6:.1f}/{self.total_bytes / 1e6:.1f} MB, '
+                f'{rate / 1e6:.2f} MB/s, ETA {eta}'
+            )
+        else:
+            self.failed += 1
+            push_logger.warning(
+                f'group {self.done + self.failed}/{self.n_groups} ({gid}) FAILED: {error}'
+            )
+
+    def finish(self):
+        elapsed = max(time.monotonic() - self.t0, 1e-9)
+        push_logger.info(
+            f'push upload finished: {self.done}/{self.n_groups} group(s), '
+            f'{self.done_bytes / 1e6:.1f} MB in {_format_secs(elapsed)}, '
+            f'mean {self.done_bytes / elapsed / 1e6:.2f} MB/s, {self.failed} failure(s)'
+        )
+
+
+def update_remote(local_file, remote_index, remote_index_path, changelog_path, remote_session, force_push, journal, remote_state, replace_pending, ebooklet_type, num_groups=None, lock=None, loc_map=None, comp0=None, packers=1):
     """
     Push the changelog to the remote - the format-2 protocol:
 
@@ -868,7 +1073,26 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     A crash or failure before C leaves readers on the old, fully-consistent
     state and this session fully retryable; between C and D leaves only
     invisible orphans.
+
+    Phase B is pipelined (0.10.1): loc_map ({key: (ts, value_offset,
+    value_len)}, captured by create_changelog's header-only sweep) lets each
+    pack worker read its members through a PRIVATE fd in ascending offset
+    order - no booklet lock in the hot path, one forward disk sweep per
+    group. `packers` (a per-push BoundedSemaphore width, default 1) bounds
+    how many workers read the disk at once; PUTs run outside the gate, so up
+    to `remote_session.threads` uploads overlap the packing. comp0 is the
+    compaction_count snapshotted with the capture: a mismatch detected after
+    a worker's reads aborts the push with ConcurrentCompactionError BEFORE
+    the commit (captured offsets die on prune/clear - the session-level
+    _push_active guard makes this unreachable through the API; this is the
+    belt). Progress records go to the 'ebooklet.push' logger.
     """
+    if loc_map is None:
+        ## Direct callers (tests) without a capture: build one now. The
+        ## snapshot-before-sweep ordering matches create_changelog.
+        comp0 = local_file.compaction_count
+        loc_map = {key: (ts, off, ln) for key, ts, off, ln in local_file.locations()}
+
     pre_push_manifest = dict(remote_state.manifest)
     deletes = journal.deletes   # read here; journal mutated only post-commit
 
@@ -894,16 +1118,26 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 affected_group_ids.add(key_to_group_id(key, num_groups))
 
             ## Build FULL key lists per affected group: the union of locally-present
-            ## keys and remote-index keys. A group object is completely replaced on
-            ## upload, so every current member must be packed - not just the keys
-            ## that happen to be materialized in the local file.
+            ## keys (the captured loc_map - same live-key enumeration as
+            ## local_file.keys(), for free) and remote-index keys. A group object
+            ## is completely replaced on upload, so every current member must be
+            ## packed - not just the keys that happen to be materialized locally.
             group_key_sets = {gid: set() for gid in affected_group_ids}
-            for key in local_file.keys():
+            for key in loc_map:
                 if key == metadata_key_str:
                     continue
                 gid = key_to_group_id(key, num_groups)
                 if gid in group_key_sets:
                     group_key_sets[gid].add(key)
+
+            ## Keys whose value bytes were (or will be) materialized AFTER the
+            ## capture: their loc_map offset - if any - predates the write and
+            ## would deliver the STALE superseded bytes, so the pack workers
+            ## read these through booklet's locked path instead (page-cache
+            ## hot). pulled_len_map carries their index-known lengths for the
+            ## exact progress totals.
+            pulled_keys = set()
+            pulled_len_map = {}
 
             ## Members whose local value is missing or older than the remote must be
             ## pulled down before their group can be repacked (one ranged read per group).
@@ -929,8 +1163,12 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 ## normalized by create_changelog, so this gate is belt.
                 if key in journal.written:
                     continue
-                if remote_val and check_local_vs_remote(local_file, remote_val[:7], key):
-                    if local_file.get_timestamp(key) is not None:
+                entry = loc_map.get(key)
+                local_time_int = entry[0] if entry is not None else None
+                ## Mirrors check_local_vs_remote's exact truthiness (a stored
+                ## ts of 0 counts as absent there), driven by the capture.
+                if remote_val and not (local_time_int and bytes_to_int(remote_val[:7]) <= local_time_int):
+                    if local_time_int is not None:
                         logger.warning(f"Push is replacing the locally-stored value of '{key}' with the newer remote value before repacking its group - any unpushed local modification to it is discarded (its local timestamp is older than the remote's).")
                     offset = bytes_to_int(remote_val[7:11])
                     length = bytes_to_int(remote_val[11:15])
@@ -947,9 +1185,11 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                         ## would fall into the lost-keys drop below and be
                         ## silently deleted by the repack.
                         local_file.set(key, b'', timestamp_int, encode_value=False)
+                        pulled_keys.add(key)
+                        pulled_len_map[key] = 0
 
             if groups_to_download:
-                logger.info(f"Pulling {pull_count} group member value(s) (~{pull_bytes} bytes) from {len(groups_to_download)} group(s) so the groups can be repacked in full.")
+                push_logger.info(f"Pulling {pull_count} group member value(s) (~{pull_bytes} bytes) from {len(groups_to_download)} group(s) so the groups can be repacked in full.")
                 with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
                     ## report_missing_members=False: on the push path an absent
                     ## member is deliberately self-healed by the lost-keys drop
@@ -969,37 +1209,84 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                         pull_futures[executor.submit(get_remote_group_values, gid, old_gen, key_infos, local_file, remote_session, False)] = gid
                     for future in as_completed(pull_futures):
                         gid = pull_futures[future]
-                        error = future.result()
+                        try:
+                            error = future.result()
+                        except Exception as err:
+                            ## Transport-level raises (MaxRetryError etc.) are
+                            ## per-group failures, same as returned errors.
+                            error = err
                         if error is not None:
                             ## Never upload a partially-materialized group - leave the
                             ## old remote group object intact and report the failure.
                             failures[gid] = error
                             group_key_sets.pop(gid, None)
+                        else:
+                            ## Materialized after the capture -> the pack must
+                            ## read these through the locked path, never the
+                            ## (stale) captured offsets.
+                            for key, _offset, length, _ts in groups_to_download[gid]:
+                                pulled_keys.add(key)
+                                pulled_len_map[key] = length
 
             ## Any member that still has no local value lost its remote bytes at some
             ## earlier point (e.g. a partial push from a version < 0.8.4). Repack the
-            ## group without it and remove the dangling index entry.
+            ## group without it and remove the dangling index entry. Presence is
+            ## decided by the capture (loc_map) plus the pulled set; pulled keys are
+            ## re-verified with a (page-cache-hot) point read because a group
+            ## recovery may have materialized only some of its scheduled members.
             group_keys = {}
+            group_entries = {}
             for gid, keys_set in group_key_sets.items():
                 keys_in_group = []
+                entries = []
                 lost_keys = []
                 for key in keys_set:
-                    if local_file.get_timestamp(key) is None:
-                        lost_keys.append(key)
-                    else:
+                    entry = loc_map.get(key)
+                    if key in pulled_keys:
+                        if local_file.get_timestamp(key) is None:
+                            lost_keys.append(key)
+                        else:
+                            ln = pulled_len_map.get(key)
+                            if ln is None:
+                                ln = entry[2] if entry is not None else 0
+                            entries.append((key, None, None, ln))
+                            keys_in_group.append(key)
+                    elif entry is not None:
+                        entries.append((key, entry[0], entry[1], entry[2]))
                         keys_in_group.append(key)
+                    else:
+                        lost_keys.append(key)
                 if lost_keys:
                     logger.warning(f"Group {gid}: dropping {len(lost_keys)} key(s) whose remote bytes no longer exist (likely a partial push from a version < 0.8.4): {sorted(lost_keys)}")
                     for key in lost_keys:
                         if key in remote_index:
                             del remote_index[key]
                     updated = True
+                ## Ascending captured offset = the elevator order the workers
+                ## read in (locked-path members, offset None, go last).
+                entries.sort(key=lambda e: (e[2] is None, e[2] if e[2] is not None else 0))
                 group_keys[gid] = keys_in_group
+                group_entries[gid] = entries
 
             ## Phase B: PUT each repacked group to a FRESH generation. Emptied
             ## groups PUT nothing - they leave the manifest at commit and
             ## their old generation is GC'd in phase D. New index entries are
             ## STAGED (applied to the live sidecar only after the commit).
+            ## The pack gate and the fallback-warning latch are PER PUSH -
+            ## concurrent pushes of different databases in one process must
+            ## not share a gate (or each other's push_packers choice).
+            pack_gate = threading.BoundedSemaphore(max(1, packers))
+            fallback_warned = threading.Event()
+            n_submit = sum(1 for gid, kig in group_keys.items() if kig)
+            total_keys = sum(len(kig) for kig in group_keys.values())
+            total_bytes = sum(
+                4 + sum(2 + len(key.encode()) + 7 + 4 + ln for key, _ts, _off, ln in entries)
+                for entries in group_entries.values() if entries
+            )
+            progress = _PushProgress(n_submit, total_keys, total_bytes)
+            if n_submit:
+                progress.start()
+
             with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
                 futures = {}
                 for gid, keys_in_group in group_keys.items():
@@ -1009,23 +1296,46 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                         continue
                     gen = new_generation(pre_push_manifest.get(gid))
                     new_gens[gid] = gen
-                    f = executor.submit(upload_group, gid, gen, local_file, remote_session, keys_in_group)
+                    f = executor.submit(upload_group, gid, gen, local_file, remote_session, group_entries[gid], pulled_keys, pack_gate, comp0, fallback_warned)
                     futures[f] = gid
 
                 for future in as_completed(futures):
                     gid = futures[future]
-                    error, offsets = future.result()
+                    try:
+                        error, offsets, ts_map, packed_len, pack_secs, put_secs = future.result()
+                    except Exception as err:
+                        ## upload_group's contract is return-not-raise (its whole
+                        ## body is guarded), so this is symmetry armor with the
+                        ## pull/per-key loops: a future edit to its prologue must
+                        ## degrade to a per-group failure, never a push crash.
+                        error, offsets, ts_map, packed_len, pack_secs, put_secs = err, None, None, 0, 0.0, 0.0
+                    progress.record(gid, new_gens.get(gid, '?'), error, packed_len, pack_secs, put_secs)
                     if error is None:
-                        for key in group_keys[gid]:
-                            if key in offsets:
-                                ts = local_file.get_timestamp(key)
-                                if ts:
-                                    offset, length = offsets[key]
-                                    staged_entries[key] = int_to_bytes(ts, 7) + int_to_bytes(offset, 4) + int_to_bytes(length, 4)
+                        ## The staged ts is the ts that was PACKED (identical by
+                        ## construction) - not a post-upload re-read that a
+                        ## concurrent overwrite could have moved past the
+                        ## packed bytes.
+                        for key, (offset, length) in offsets.items():
+                            ts = ts_map[key]
+                            if ts:
+                                staged_entries[key] = int_to_bytes(ts, 7) + int_to_bytes(offset, 4) + int_to_bytes(length, 4)
                         updated = True
                     else:
                         failures[gid] = error
                         new_gens.pop(gid, None)   # abandoned PUT (if any) = invisible orphan
+
+            if n_submit:
+                progress.finish()
+
+            ## A detected compaction means EVERY captured offset is invalid -
+            ## per-group retry semantics would be false comfort (each unpacked
+            ## group is equally suspect), so abort the whole push BEFORE
+            ## anything is staged or committed. The executor block above has
+            ## already drained; generations already PUT are invisible orphans
+            ## (the standard crash-before-C story; fsck sweeps them).
+            comp_error = next((e for e in failures.values() if isinstance(e, ConcurrentCompactionError)), None)
+            if comp_error is not None:
+                raise comp_error
 
             failed_gids = {gid for gid in failures if isinstance(gid, int)}
 
@@ -1041,7 +1351,12 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
 
                 for future in as_completed(futures):
                     key = futures[future]
-                    run_result = future.result()
+                    try:
+                        run_result = future.result()
+                    except Exception as err:
+                        ## Transport-level raises (MaxRetryError etc.) are
+                        ## per-key failures, same as returned errors.
+                        run_result = err
                     if run_result is None:
                         remote_index[key] = cl[key][:7] + b'\x00' * 8
                         updated = True
@@ -1169,6 +1484,8 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
 
         if resp.status // 100 != 2:
             raise urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
+
+        push_logger.info(f'commit succeeded ({len(payload):,} B db object)')
 
         ## remove deletes in remote (only for legacy per-key mode). A raised
         ## delete failure propagates BEFORE the journal clearing below, so the
