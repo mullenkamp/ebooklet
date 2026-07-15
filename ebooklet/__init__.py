@@ -11,6 +11,8 @@ from ebooklet.errors import (
     RemoteIntegrityError,
     LockLostError,
     OfflineError,
+    PushInProgressError,
+    ConcurrentCompactionError,
 )
 from ebooklet.main import open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup, PushResult
 from ebooklet.remote import S3Connection
@@ -21,8 +23,8 @@ __all__ = [
     'PushResult',
     'Error', 'ReadOnlyError', 'UUIDMismatchError', 'RemoteMissingError',
     'UnsupportedFormatError', 'GroupTooLargeError', 'RemoteIntegrityError',
-    'LockLostError', 'OfflineError',
+    'LockLostError', 'OfflineError', 'PushInProgressError', 'ConcurrentCompactionError',
     'fsck', 'FsckReport',
 ]
 
-__version__ = '0.10.0'
+__version__ = '0.10.1'

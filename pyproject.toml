@@ -23,9 +23,9 @@ keywords = [
 
 requires-python = ">=3.10"
 dependencies = [
-  "s3func>=0.9.3",
+  "s3func>=0.9.4",
   'urllib3>=2',
-  "booklet>=0.12.7",
+  "booklet>=0.12.8",
   "msgspec>=0.18",
   "portalocker",
 ]
@@ -49,6 +49,17 @@ dev = [
 
 # [tool.pytest.ini_options]
 # addopts = "--cov=ebooklet/ --cov-report=term-missing"
+
+[tool.pytest.ini_options]
+## The scale tier (real-network, large-body, release-cadence) is deselected
+## by default and NEVER runs in CI: opt in with `uv run pytest -m scale`.
+addopts = "-m 'not scale'"
+markers = [
+    "scale: real-network large-body tests; run at release cadence with `pytest -m scale` (never CI)",
+]
+## planning/ holds round artifacts (incl. *_test.py evidence scripts) that
+## must never be collected.
+testpaths = ["ebooklet/tests"]
 
 
 [tool.hatch]

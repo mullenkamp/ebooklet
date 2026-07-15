@@ -45,6 +45,62 @@ re-uploads the db object unconditionally. Do this promptly: the new-generation
 objects the failed commit referenced are protected from `fsck` sweeps only by
 the age gate.
 
+## Monitoring a push
+
+`push()` narrates its progress on the **`ebooklet.push`** logger (all INFO;
+failures at WARNING). Nothing is emitted unless you opt in:
+
+```python
+import logging
+logging.basicConfig()   # or your own handler setup
+logging.getLogger('ebooklet.push').setLevel(logging.INFO)
+```
+
+Sample records from a grouped push:
+
+```
+Pulling 3 group member value(s) (~5241 bytes) from 2 group(s) so the groups can be repacked in full.
+push upload starting: 149 group(s), 128,441 key(s), 20,017,332,205 bytes
+group 1/149 (23.5ac516ef3b3f4): 134,297,102 B (pack 8.2s, put 41.9s) - 134.3/20017.3 MB, 2.67 MB/s, ETA 2:04:11
+...
+push upload finished: 149/149 group(s), 20017.3 MB in 2:01:40, mean 2.74 MB/s, 0 failure(s)
+commit succeeded (13,271,081 B db object)
+```
+
+Notes:
+
+- The start record's byte total is exact (computed from the captured value
+  lengths plus the pack-format overhead), so the per-group cumulative MB, the
+  rate, and the ETA are mutually consistent. Rates are cumulative means.
+- The per-group `pack`/`put` seconds are the tuning evidence for
+  `push_packers` (below): if `pack` dominates, the disk is the bottleneck; if
+  `put` dominates, the uplink is.
+
+### The `push_packers` read gate
+
+Packing a group means reading its member values from the local file; the
+`push_packers` kwarg on `open_ebooklet`/`open_rcg` (default **1**) bounds how
+many pack workers read the disk at once. Packing always overlaps uploading
+(PUTs run outside the gate, up to `S3Connection(threads=...)`, default 10),
+so the default costs nothing while giving a spinning disk the optimal
+single-sweep read pattern. On storage where parallel readers scale (SSD,
+RAID), raise it — `push_packers=threads` removes the gate entirely.
+
+RAM: each in-flight group holds its full packed payload in memory (SigV4
+needs the payload hash before the first byte), so peak usage is up to
+`threads` × the largest group size — size `num_groups` so groups stay in the
+10–100 MB range.
+
+### Never prune mid-push
+
+`prune()`/`clear()` raise `PushInProgressError` while a push is running: the
+push reads value bytes at physical offsets captured up front, and a
+compaction moves/destroys them. If an out-of-band compaction happens anyway
+(e.g. a direct booklet-level `prune()`), the push detects it and aborts with
+`ConcurrentCompactionError` **before its commit** — nothing is committed or
+journal-cleared, any uploaded group objects are invisible orphans (`fsck`
+sweeps them), and re-running the push converges.
+
 ## Lost or stuck write locks
 
 - A crashed writer leaves its lock tickets behind. Opening with

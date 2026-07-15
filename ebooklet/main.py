@@ -29,6 +29,7 @@ from .errors import (
     RemoteIntegrityError,
     LockLostError,
     OfflineError,
+    PushInProgressError,
     TRANSPORT_ERRORS,
 )
 
@@ -112,6 +113,10 @@ class Change:
         self._ebooklet = ebooklet
 
         self._changelog_path = None
+        ## Captured by build_changelog's sweep (0.10.1): {key: (ts, value_offset,
+        ## value_len)} + the compaction_count snapshot the offsets are valid for.
+        self._loc_map = None
+        self._comp0 = None
 
 
     def pull(self):
@@ -132,9 +137,11 @@ class Change:
         confused with the MutableMapping update() on the ebooklet itself).
         """
         self._ebooklet.sync()
-        changelog_path = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session, self._ebooklet._journal)
+        changelog_path, loc_map, comp0 = utils.create_changelog(self._ebooklet._local_file_path, self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_session, self._ebooklet._journal)
 
         self._changelog_path = changelog_path
+        self._loc_map = loc_map
+        self._comp0 = comp0
 
 
     def iter_changes(self):
@@ -244,63 +251,71 @@ class Change:
 
         journal = self._ebooklet._journal
 
-        ## A pending replacement replaces the database with this local file's
-        ## written content only: purge everything else (transparently-read/
-        ## materialized old keys and old index entries) so reads can't
-        ## resurrect old data into the new database and the pushed index
-        ## carries no dangling references to wiped objects.
-        if journal.replace_pending:
-            written = journal.written
-            stale_local = [k for k in self._ebooklet._local_file.keys()
-                           if k not in written]
-            for k in stale_local:
-                del self._ebooklet._local_file[k]
-            ## The index purge includes any stale metadata entry (metadata has
-            ## no index entry in format 2).
-            stale_index = [k for k in self._ebooklet._remote_index.keys()
-                           if k not in written]
-            for k in stale_index:
-                del self._ebooklet._remote_index[k]
+        ## The push holds captured value offsets from the changelog sweep until
+        ## its commit - a compaction (prune/clear) would invalidate them all,
+        ## so both raise PushInProgressError while this flag is set. Spans the
+        ## WHOLE push body (capture through phase D), not just update_remote.
+        self._ebooklet._push_active = True
+        try:
+            ## A pending replacement replaces the database with this local file's
+            ## written content only: purge everything else (transparently-read/
+            ## materialized old keys and old index entries) so reads can't
+            ## resurrect old data into the new database and the pushed index
+            ## carries no dangling references to wiped objects.
+            if journal.replace_pending:
+                written = journal.written
+                stale_local = [k for k in self._ebooklet._local_file.keys()
+                               if k not in written]
+                for k in stale_local:
+                    del self._ebooklet._local_file[k]
+                ## The index purge includes any stale metadata entry (metadata has
+                ## no index entry in format 2).
+                stale_index = [k for k in self._ebooklet._remote_index.keys()
+                               if k not in written]
+                for k in stale_index:
+                    del self._ebooklet._remote_index[k]
 
-        self.build_changelog()
+            self.build_changelog()
 
-        result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock)
+            result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock, loc_map=self._loc_map, comp0=self._comp0, packers=self._ebooklet._push_packers)
 
-        if isinstance(result, dict):
-            # Partial failure — don't clean up changelog so push can be retried.
-            # replace_pending is also kept so a retry redoes the full
-            # wipe-and-replace (the remote must never end up half old, half new).
-            # updated: a partial REPLACEMENT commits nothing (the old remote is
-            # untouched); a partial ordinary push has already committed its
-            # successful groups/keys (a failed commit PUT raises, never returns).
-            failures = {key: _failure_str(value) for key, value in result.items()}
-            return PushResult(updated=not journal.replace_pending, failures=failures)
+            if isinstance(result, dict):
+                # Partial failure — don't clean up changelog so push can be retried.
+                # replace_pending is also kept so a retry redoes the full
+                # wipe-and-replace (the remote must never end up half old, half new).
+                # updated: a partial REPLACEMENT commits nothing (the old remote is
+                # untouched); a partial ordinary push has already committed its
+                # successful groups/keys (a failed commit PUT raises, never returns).
+                failures = {key: _failure_str(value) for key, value in result.items()}
+                return PushResult(updated=not journal.replace_pending, failures=failures)
 
-        ## A replacement session is a REPLACEMENT only until the replacement
-        ## push completes - after that the remote IS this session's database,
-        ## and the session must behave like a plain writer. Without this,
-        ## every subsequent push re-ran update_remote's wipe and re-uploaded
-        ## only the new changelog, silently destroying everything pushed
-        ## earlier in the session (0.9.4's data-loss fix, now journal-backed
-        ## so the intent also survives sessions instead of dying with _flag).
-        if journal.replace_pending:
-            journal.set_replace_pending(False)
-            journal.persist(self._ebooklet._local_file)
+            ## A replacement session is a REPLACEMENT only until the replacement
+            ## push completes - after that the remote IS this session's database,
+            ## and the session must behave like a plain writer. Without this,
+            ## every subsequent push re-ran update_remote's wipe and re-uploaded
+            ## only the new changelog, silently destroying everything pushed
+            ## earlier in the session (0.9.4's data-loss fix, now journal-backed
+            ## so the intent also survives sessions instead of dying with _flag).
+            if journal.replace_pending:
+                journal.set_replace_pending(False)
+                journal.persist(self._ebooklet._local_file)
 
-        ## After this session's own v2 commit, a formerly format-1 remote is
-        ## format 2 - index fetches are allowed again.
-        if self._ebooklet._index_fetch_suppressed:
-            self._ebooklet._index_fetch_suppressed = False
-            self._ebooklet._remote_session._load_db_metadata()
-
-        if result:
-            self._changelog_path.unlink()
-            self._changelog_path = None
-
-            if not self._ebooklet._remote_session.initialized:
+            ## After this session's own v2 commit, a formerly format-1 remote is
+            ## format 2 - index fetches are allowed again.
+            if self._ebooklet._index_fetch_suppressed:
+                self._ebooklet._index_fetch_suppressed = False
                 self._ebooklet._remote_session._load_db_metadata()
 
-        return PushResult(updated=bool(result), failures={})
+            if result:
+                self._changelog_path.unlink()
+                self._changelog_path = None
+
+                if not self._ebooklet._remote_session.initialized:
+                    self._ebooklet._remote_session._load_db_metadata()
+
+            return PushResult(updated=bool(result), failures={})
+        finally:
+            self._ebooklet._push_active = False
 
 
 class EVariableLengthValue(MutableMapping):
@@ -318,16 +333,19 @@ class EVariableLengthValue(MutableMapping):
             num_groups: int = None,
             lock_timeout: int = 300,
             force_lock: bool = False,
+            push_packers: int = 1,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups, lock_timeout, force_lock)
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups, lock_timeout, force_lock, push_packers)
 
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None, lock_timeout=300, force_lock=False):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None, lock_timeout=300, force_lock=False, push_packers=1):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
+        if not isinstance(push_packers, int) or push_packers < 1:
+            raise ValueError('push_packers must be an integer >= 1.')
         ## Lock the remote if file is opened for write
         if flag != 'r':
             lock = remote_session.create_lock()
@@ -567,6 +585,12 @@ class EVariableLengthValue(MutableMapping):
         self._n_buckets = local_file._n_buckets
         self._buffer_size = buffer_size
         self.type = ebooklet_type
+        ## Push read-gate width: how many pack workers may read the local disk
+        ## at once during push() (PUT concurrency is remote_session.threads).
+        self._push_packers = push_packers
+        ## True while a push is running - prune()/clear() raise during it
+        ## (they would invalidate the push's captured value offsets).
+        self._push_active = False
         self._num_groups = resolved_num_groups
 
 
@@ -762,6 +786,11 @@ class EVariableLengthValue(MutableMapping):
         groups from the remote's full membership. Remote deletion is exclusively
         the job of `del`/`__delitem__` (+ push).
         """
+        if self._push_active:
+            raise PushInProgressError(
+                'prune() is not allowed while a push is running - it would move the '
+                'value bytes the push is reading. Wait for the push to finish.'
+            )
         if self.writable:
             ## Normalize to int microseconds here: booklet's prune documents
             ## int/str/datetime but its prune_file compares raw against int
@@ -1216,6 +1245,11 @@ class EVariableLengthValue(MutableMapping):
         of the clear. For local cache eviction (keys stay, evicted values
         re-pull on demand) use prune(timestamp=<now>) instead.
         """
+        if self._push_active:
+            raise PushInProgressError(
+                'clear() is not allowed while a push is running - it would destroy the '
+                'value bytes the push is reading. Wait for the push to finish.'
+            )
         if not self.writable:
             raise ReadOnlyError('File is open for read only.')
 
@@ -1344,11 +1378,12 @@ class RemoteConnGroup(EVariableLengthValue):
             num_groups: int = None,
             lock_timeout: int = 300,
             force_lock: bool = False,
+            push_packers: int = 1,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups, lock_timeout, force_lock)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups, lock_timeout, force_lock, push_packers)
 
 
     def add(self, remote_conn: remote.S3Connection, key: str = None, user_meta=None):
@@ -1458,6 +1493,7 @@ def open_ebooklet(
     lock_timeout: int = 300,
     force_lock: bool = False,
     offline: Union[bool, str] = False,
+    push_packers: int = 1,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -1507,6 +1543,15 @@ def open_ebooklet(
         the remote type guard is skipped - use the factory matching the
         database type.
 
+    push_packers : int
+        How many of push()'s workers may READ the local file at once while
+        packing groups (the read gate). Upload concurrency is separate
+        (``S3Connection(threads=...)``, default 10) and pack/upload overlap
+        regardless, so the default of 1 costs nothing when threads >= 2 - it
+        gives a spinning disk the optimal single-sweep read pattern. Raise it
+        (up to ``threads``) for storage where parallel readers scale (SSD,
+        RAID). With threads=1 pack and PUT strictly alternate (no overlap).
+
     Returns
     -------
     EVariableLengthValue
@@ -1541,13 +1586,13 @@ def open_ebooklet(
     if offline is True:
         if not local_file_path.exists():
             raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
-        return EVariableLengthValue(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+        return EVariableLengthValue(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, push_packers=push_packers)
 
     if offline == 'auto':
         ## Wrap the WHOLE online open (both remote touches: the metadata HEAD
         ## and the index fetch) - a transport failure from either falls back.
         try:
-            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False)
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             ## Typed ebooklet errors never fall back (TRANSPORT_ERRORS lists
             ## transport classes only; this is the belt to the design rule).
@@ -1558,7 +1603,7 @@ def open_ebooklet(
                 f'serving the local data at {local_file_path} as-is (it may be stale).',
                 UserWarning, stacklevel=2,
             )
-            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True)
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True, push_packers=push_packers)
 
     local_file_exists = local_file_path.exists()
 
@@ -1569,7 +1614,7 @@ def open_ebooklet(
     if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
 
-    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
 
 
 def open_rcg(
@@ -1582,6 +1627,7 @@ def open_rcg(
     lock_timeout: int = 300,
     force_lock: bool = False,
     offline: Union[bool, str] = False,
+    push_packers: int = 1,
     ):
     """
     Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
@@ -1620,6 +1666,9 @@ def open_rcg(
         semantics. Note offline covers THIS catalogue only: opening a member
         remote still requires connectivity.
 
+    push_packers : int
+        The push read-gate width - see open_ebooklet for the full semantics.
+
     Returns
     -------
     RemoteConnGroup
@@ -1654,12 +1703,12 @@ def open_rcg(
     if offline is True:
         if not local_file_path.exists():
             raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
-        return RemoteConnGroup(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups)
+        return RemoteConnGroup(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, push_packers=push_packers)
 
     if offline == 'auto':
         ## Wrap the WHOLE online open (both remote touches) - see open_ebooklet.
         try:
-            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False)
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             if isinstance(err, Error):
                 raise
@@ -1668,7 +1717,7 @@ def open_rcg(
                 f'serving the local data at {local_file_path} as-is (it may be stale).',
                 UserWarning, stacklevel=2,
             )
-            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True)
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True, push_packers=push_packers)
 
     local_file_exists = local_file_path.exists()
 
@@ -1679,6 +1728,6 @@ def open_rcg(
     if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
 
-    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock)
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
 
 

@@ -6,6 +6,7 @@ EBooklet is a Python key-value database that syncs with S3 (AWS or any S3-compat
 - **Dict-like API** — standard `MutableMapping` plus `dbm`-style methods
 - **Grouped storage** — hash keys into N groups stored as single S3 objects, with automatic byte-range reads
 - **Concurrency** — thread-safe writes (thread locks), multiprocessing-safe (file locks), and S3 object locking for remote writes
+- **Push progress** (0.10.1) — opt into per-group progress records (exact totals, rate, ETA) via `logging.getLogger('ebooklet.push').setLevel(logging.INFO)`; see the ops guide's "Monitoring a push"
 
 Keys must be strings (S3 object name requirement). Values can use any serializer supported by Booklet.
 

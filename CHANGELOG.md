@@ -4,7 +4,77 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.10.0 (2026-07-13)
+## 0.10.1 (2026-07-15)
+
+The push-pipelining round (design dual-reviewed pre-implementation:
+`planning/push-pipeline-design-brief.md` + the two `planning/push-pipeline-review-*.md`
+reports). Motivated by the first production-scale push (20 GB, 149 groups), which
+uploaded one group per ~105 s despite 10 upload threads: the pack step's random
+per-key reads under booklet's lock thrashed the disk to ~9 reads/s while the
+uplink idled. Requires booklet >= 0.12.8 (`locations()` + `compaction_count`)
+and s3func >= 0.9.4 (the read-timeout fix — without it, the concurrent PUTs
+this release enables are spuriously killed by s3func's total-request deadline
+on slow uplinks, and large-body transfers retry from byte 0 into their own
+congestion).
+
+### Changed — pipelined push packing
+- **Pack workers no longer read member values through booklet's locked point
+  reads.** The changelog sweep (which already walks every block header) now
+  also captures each live key's physical `(offset, length)` via booklet's new
+  header-only `locations()` iterator — zero extra IO — and each pack worker
+  reads its group's values through a PRIVATE file handle in ascending-offset
+  order (one forward disk sweep per group, no booklet lock in the hot path).
+  Members materialized after the capture (phase-A pulls, empty-value members)
+  read through the locked path instead — it is page-cache-hot and guarantees a
+  pulled newer value always beats a stale captured offset.
+- **`push_packers` kwarg on `open_ebooklet`/`open_rcg` (default 1)**: how many
+  pack workers may read the local disk at once (the read gate). Upload
+  concurrency is unchanged (`S3Connection(threads=...)`, default 10) and packing
+  overlaps uploading regardless, so the default costs nothing while giving
+  spinning disks the optimal single-sweep pattern; raise it for SSD/RAID.
+  Flows through cfdb's `open_edataset(**kwargs)` and envlib's `publish(**open_kwargs)`
+  unchanged.
+- **Staged index timestamps now equal the packed timestamps by construction**
+  (the entry's ts is taken from the capture/locked read that produced the
+  packed bytes, not re-read after the upload). Closes a benign-but-ugly race:
+  a concurrent overwrite between pack and bookkeeping could stage a ts newer
+  than the packed bytes, leaving the remote internally inconsistent until the
+  next push repaired it.
+- On Windows, the write-mode booklet's mandatory byte-range lock can deny the
+  private-handle reads — those groups fall back to the locked path
+  automatically (one warning per push; slower, still correct).
+
+### Added — push progress records
+- **The `ebooklet.push` logger** (INFO) narrates every push: a start record
+  with exact totals (groups, keys, bytes — computed upfront from the captured
+  lengths), one record per group completion (done/total, bytes, per-group pack
+  and PUT seconds, cumulative MB/s, ETA), a summary, and a commit record. The
+  phase-A pull line moved from `ebooklet.utils` onto this logger. Opt in with
+  e.g. `logging.getLogger('ebooklet.push').setLevel(logging.INFO)` plus a
+  handler; see docs/ops.md "Monitoring a push".
+
+### Fixed — quadratic group packing (the PRIMARY production bottleneck)
+- **`pack_group` built its payload by appending to an immutable `bytes` object** —
+  every append re-copied the whole buffer, so packing a 134 MB group did
+  ~100 GB of memcpy (~60–100 s of single-core CPU). Present since format 2
+  shipped in 0.10.0 and invisible to every test (tiny groups) and to the
+  disk-focused benchmark; found by a pre-release end-to-end push of a real
+  2 GB cfdb subset, whose progress records showed 60 s packs with the disk
+  fully idle. Re-running the production arithmetic (857 members, 134 MB) puts
+  this — not disk seeks — as the dominant term of the observed one-group-per-
+  ~105 s cadence. Now a `bytearray` (amortized O(1) appends): a 90 MB group
+  packs in ~0.1 s. A tripwire test guards the complexity.
+
+### Added — compaction guards
+- **`prune()`/`clear()` now raise `PushInProgressError` while a push is
+  running** — a compaction would move/destroy the value bytes the push is
+  reading (captured offsets die on prune/clear).
+- **`ConcurrentCompactionError`** (new, raised by `push()` BEFORE its commit):
+  the belt for out-of-band compactions the session guard cannot see (e.g. a
+  direct booklet `prune()`). Nothing is committed, staged, or journal-cleared;
+  any group objects already uploaded are invisible orphans (fsck sweeps them);
+  the retry re-captures and converges. Both errors are `Error` subclasses and
+  exported.
 
 Phases 1 and 2 of the architecture-assessment roadmap, shipped as one release
 (each phase's design dual-reviewed pre-implementation: `planning/phase{1,2}-design-brief.md`

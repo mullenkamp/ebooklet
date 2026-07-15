@@ -166,12 +166,23 @@ def test_create_changelog(tmp_path):
 
     with booklet.open(local_path, "w") as db:
         with booklet.FixedLengthValue(ri_path, "r") as ri:
-            cl_path = utils.create_changelog(local_path, db, ri, MockRemoteSession())
-            
+            cl_path, loc_map, comp0 = utils.create_changelog(local_path, db, ri, MockRemoteSession())
+
             assert cl_path.exists()
             with booklet.FixedLengthValue(cl_path, "r") as cl:
                 assert "new_key" in cl
                 assert "updated_key" in cl
                 assert "same_key" not in cl
-            
+
+            ## The capture side product: every live local key with its
+            ## physical (ts, offset, len), valid for compaction_count comp0.
+            assert set(loc_map) == {"new_key", "updated_key", "same_key"}
+            assert comp0 == db.compaction_count
+            with open(local_path, 'rb') as raw:
+                for key, (ts, off, ln) in loc_map.items():
+                    assert ts == db.get_timestamp(key)
+                    _, raw_val = db.get_timestamp(key, include_value=True, decode_value=False)
+                    raw.seek(off)
+                    assert raw.read(ln) == raw_val
+
             cl_path.unlink()
