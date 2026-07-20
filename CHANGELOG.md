@@ -4,6 +4,49 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.10.2 (2026-07-20)
+
+The deletion-propagation round (design dual-reviewed pre-implementation:
+`planning/delete-reconcile-review-brief-gemini.md` + the two
+`planning/delete-reconcile-review-*.md` reports). Found live on the envlib commons'
+first dataset retraction: a warm local cache kept serving the retracted catalogue
+entry indefinitely.
+
+### Fixed
+
+- **Remote key deletions now propagate to warm local caches.** Previously a
+  locally-materialized key deleted remotely was served FOREVER: `keys()`/`in`/`len()`
+  and point reads all treat local presence as authoritative, a deleted index entry is
+  indistinguishable from "nothing newer to fetch", and the only cleanup path (the
+  fetch-404 re-check protocol) can never fire for a key whose value is already local.
+  Worse, a warm WRITER would silently RE-PUSH remotely-deleted keys on its next push
+  (`create_changelog` treats every index-absent local key as a new write). Now every
+  fresh index ingest (open-path fetch and `changes().pull()`) reconciles the local
+  file against the fresh index: keys it no longer claims are deleted locally and
+  logged (`logger.info`; escalates to `warning` when >25% of the cache goes). Guards,
+  each load-bearing: reserved/metadata keys never touched; journal-pending writes
+  never touched; local values stamped NEWER than the previously ingested index kept
+  (they may be unjournaled crash-window writes - the push changelog's timestamp-diff
+  rescue still owns those).
+- **Re-materialization race closed:** a fetch worker completing against an index
+  entry captured before a concurrent pull could re-insert a just-reconciled key;
+  fetched keys are now membership-re-checked against the current index before the
+  operation returns.
+
+### Notes
+
+- **Upgrade transition:** a PRE-0.10.2 cache that already ingested a post-deletion
+  index reads as in-sync and reconciles only at the NEXT actual remote change (the
+  freshness gate skips unchanged remotes - an explicit `pull()` against an unchanged
+  remote does not heal either). Writers upgrading with warm caches that may hold
+  remotely-deleted keys should refresh the cache (or delete the local file and
+  re-open) before their next push.
+- **Timestamp assumption (documented limitation):** reconciliation discriminates by
+  value timestamps and assumes write-time stamps (the default). Explicit
+  `set(..., timestamp=...)` stamps defeat it in both directions (a backdated unpushed
+  write can be deleted; a future-stamped deleted key survives locally) and are
+  incompatible with reconciliation.
+
 ## 0.10.1 (2026-07-15)
 
 The push-pipelining round (design dual-reviewed pre-implementation:

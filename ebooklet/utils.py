@@ -367,12 +367,14 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
 def get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag):
     """
     Ensure the local remote-index sidecar file exists (fetching + parsing the
-    db-object payload when needed). Returns (remote_index_path, manifest,
-    meta_section) - manifest/meta_section are None when nothing was fetched
-    (the caller falls back to the persisted remote-state slot).
+    db-object payload when needed). Returns (remote_index_path, fetched,
+    manifest, meta_section) - fetched says whether a fresh index body was
+    actually ingested this call; manifest/meta_section are None when it
+    wasn't (the caller falls back to the persisted remote-state slot).
     """
     remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
 
+    fetched = False
     manifest = None
     meta_section = None
     if not remote_index_path.exists() or overwrite_remote_index:
@@ -381,7 +383,7 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
             manifest = None
             meta_section = None
 
-    return remote_index_path, manifest, meta_section
+    return remote_index_path, fetched, manifest, meta_section
 
 
 def fetch_remote_index(dest_path, remote_session):
@@ -450,6 +452,91 @@ def refresh_local_metadata(local_file, journal, meta_section):
     local_ts = local_file.get_timestamp(booklet.utils.metadata_key_bytes.decode())
     if local_ts is None or (remote_ts is not None and remote_ts > local_ts):
         local_file.set_metadata(data, timestamp=remote_ts)
+
+
+def reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts):
+    """
+    After a FRESH remote-index ingest: delete locally-materialized keys the
+    fresh index no longer claims, so reads/enumeration converge to remote
+    deletions. Without this, a warm local copy of a remotely-deleted key is
+    served forever (its read path never fetches, so the fetch-404 cleanup in
+    _resolve_missing can never reach it) and a warm WRITER would re-push it
+    (create_changelog treats every index-absent local key as a new write).
+
+    Every guard is load-bearing:
+      - reserved keys are never touched (belt: booklet's iterators already
+        skip them; metadata is not an index entry in format 2 and is owned
+        by refresh_local_metadata / journal.meta_pending),
+      - journal-pending writes are never touched (the _resolve_missing
+        invariant: no remote-driven path may delete a journal-pending local
+        value),
+      - keys whose local timestamp is NEWER than prev_synced_ts - the commit
+        timestamp of the LAST index this local file ingested - are never
+        touched: they may be unjournaled crash-window writes (booklet
+        auto-flushes data blocks while the journal persists only at sync
+        boundaries); the push changelog's timestamp-diff leg owns their
+        rescue. Either timestamp None -> keep (conservative).
+
+    LIMITATION (documented, reviewed): the timestamp discriminator assumes
+    write-time timestamps (the default everywhere in the stack). Explicit
+    user-supplied timestamps (set(..., timestamp=...)) defeat it in both
+    directions - a backdated unpushed write can be deleted, a future-stamped
+    deleted key survives - and are incompatible with reconciliation.
+
+    Candidates are collected first and deleted after the scan (booklet
+    raises RuntimeError on mutation during iteration). A concurrent fetch
+    worker completing a local_file.set() mid-scan aborts the scan: retry
+    once, then skip with a log line - a skipped reconcile is the pre-fix
+    status quo and converges at the next fresh ingest.
+
+    Returns the sorted list of locally-deleted keys.
+    """
+    if prev_synced_ts is None:
+        return []
+
+    candidates = None
+    for attempt in (0, 1):
+        try:
+            candidates = [
+                key for key, ts_int in local_file.timestamps()
+                if key not in reserved_key_strs
+                and key not in remote_index
+                and key not in journal.written
+                and ts_int is not None
+                and ts_int <= prev_synced_ts
+            ]
+            break
+        except RuntimeError:
+            if attempt:
+                logger.warning(
+                    'the local-vs-index reconciliation scan was aborted twice by '
+                    'concurrent writes; skipping it this round (it re-runs at the '
+                    'next fresh index ingest)'
+                )
+                return []
+
+    n_before = len(local_file)
+    removed = []
+    for key in candidates:
+        if key in local_file:
+            del local_file[key]
+            removed.append(key)
+
+    if removed:
+        removed.sort()
+        shown = removed[:50]
+        suffix = '' if len(removed) <= 50 else f' (+{len(removed) - 50} more)'
+        msg = (
+            f'the remote no longer provides {len(removed)} locally-cached key(s); '
+            f'deleted locally so they cannot be served or re-pushed: {shown}{suffix}'
+        )
+        ## Mass-purge visibility: a legitimate remote clear() looks identical
+        ## to a wrong deletion pass - make the big ones loud.
+        if len(removed) > 0.25 * max(n_before, 1):
+            logger.warning(msg)
+        else:
+            logger.info(msg)
+    return removed
 
 
 def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
