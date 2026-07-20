@@ -123,9 +123,17 @@ class Change:
         """
         Refresh this session's view of the remote index. Values refresh lazily per
         key on the next access (the read path compares local vs index timestamps).
+        A fresh pull also DELETES locally-cached values the remote no longer
+        provides (remote deletions propagate), except pending local writes and
+        local values newer than the previously ingested index - this assumes
+        write-time timestamps; explicit set(..., timestamp=...) stamps are
+        incompatible with the reconciliation. Note a pull against an UNCHANGED
+        remote is a no-op (freshness-gated): stale residue from pre-0.10.2
+        sessions clears at the next actual remote change, not on upgrade.
         The index handle swap is serialized against point reads and load_items via
-        an internal lock, but iteration (keys()) concurrent with a pull on the same
-        instance may still observe a closed index.
+        an internal lock, but iteration (keys()/items()/timestamps()) concurrent
+        with a pull on the same instance may observe a closed index or raise
+        RuntimeError when the reconciliation deletes mid-iteration.
         """
         self._ebooklet._pull_remote_index()
 
@@ -460,10 +468,11 @@ class EVariableLengthValue(MutableMapping):
                 remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
                 if flag == 'n' and remote_index_path.exists():
                     remote_index_path.unlink()
+                index_fetched = False
                 fetched_manifest = None
                 fetched_meta = None
             else:
-                remote_index_path, fetched_manifest, fetched_meta = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
+                remote_index_path, index_fetched, fetched_manifest, fetched_meta = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
             ## Open remote index file
             remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size)
@@ -473,6 +482,11 @@ class EVariableLengthValue(MutableMapping):
             ## fetched, or - when the local stamp says in-sync but the cache
             ## disagrees (a crash window) - from a cheap ranged GET.
             remote_state = RemoteState.load(local_file)
+            ## The ingest stamp of the PREVIOUS index this local file adopted -
+            ## captured BEFORE update_committed overwrites it; it is the
+            ## reconciliation discriminator between remotely-sourced values
+            ## (ts <= it) and post-sync local writes (ts > it).
+            prev_synced_ts = remote_state.remote_ts
             if fetched_manifest is not None:
                 remote_state.update_committed(fetched_manifest, fetched_meta, remote_session.timestamp)
                 utils.refresh_local_metadata(local_file, journal, fetched_meta)
@@ -492,6 +506,14 @@ class EVariableLengthValue(MutableMapping):
             for _k in journal.deletes:
                 if _k in remote_index:
                     del remote_index[_k]
+
+            ## Reconcile the local file against the fresh index: keys it no
+            ## longer claims were deleted remotely, and without this a warm
+            ## materialized copy is served (and re-pushed) forever. Only when
+            ## this open actually INGESTED a fresh index - a reused cached
+            ## sidecar was already reconciled by the ingest that fetched it.
+            if index_fetched:
+                utils.reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts)
 
             ## Resolve num_groups: remote metadata > journal > user param.
             ## (A v1 remote's grouping is never inherited - its objects are
@@ -833,6 +855,7 @@ class EVariableLengthValue(MutableMapping):
         """
         futures = {}
         failure_dict = {}
+        dispatched = []
 
         with ThreadPoolExecutor(max_workers=self._remote_session.threads) as executor:
             ## The index-iteration phase holds _index_lock so a re-check in a
@@ -890,6 +913,7 @@ class EVariableLengthValue(MutableMapping):
                             continue
                         f = executor.submit(utils.get_remote_group_values, group_id, gen, key_infos, self._local_file, self._remote_session)
                         futures[f] = f'_group_{group_id}'
+                        dispatched.extend(k for k, _o, _l, _t in key_infos)
                 else:
                     to_fetch = []
                     for key, remote_val in items_iter:
@@ -909,12 +933,27 @@ class EVariableLengthValue(MutableMapping):
                     for key in to_fetch:
                         f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
                         futures[f] = key
+                    dispatched.extend(to_fetch)
 
             for f in as_completed(futures):
                 key = futures[f]
                 error = f.result()
                 if error is not None:
                     failure_dict[key] = error
+
+        ## Re-materialization guard: a worker may have completed against an
+        ## index entry captured before a concurrent pull swapped + reconciled
+        ## the index - drop any fetched key the CURRENT index no longer
+        ## claims, else a remotely-deleted key re-enters the local file and
+        ## serves until the next remote change (the defect reconciliation
+        ## exists to fix). Journal-pending writes are never touched.
+        if dispatched:
+            with self._index_lock:
+                for _k in dispatched:
+                    if (_k not in utils.reserved_key_strs
+                            and _k not in self._remote_index and _k not in self._journal.written
+                            and _k in self._local_file):
+                        del self._local_file[_k]
 
         ## Resolve missing-object markers ONCE per operation, after the pool has
         ## fully drained (the re-check protocol swaps the index handle - it must
@@ -990,6 +1029,14 @@ class EVariableLengthValue(MutableMapping):
             for _k in self._journal.deletes:
                 if _k in new_index:
                     del new_index[_k]
+
+            ## Reconcile the local file against the fresh index: keys it no
+            ## longer claims were deleted remotely - without this, a warm
+            ## materialized copy is served (and re-pushed) forever. remote_ts
+            ## is read BEFORE update_committed: it is the ingest stamp of the
+            ## PREVIOUS index, the discriminator between remotely-sourced
+            ## values (ts <= it) and post-sync local writes (ts > it).
+            utils.reconcile_local_with_index(self._local_file, new_index, self._journal, self._remote_state.remote_ts)
 
             ## Adopt the pulled manifest + metadata INSIDE the same critical
             ## section as the handle swap - load_items must never pair a new
@@ -1180,6 +1227,16 @@ class EVariableLengthValue(MutableMapping):
 
             if isinstance(failure, utils.MissingRemoteObject):
                 failure = self._resolve_missing({key: failure})[key]
+
+            ## Re-materialization guard (same as load_items): the fetch ran
+            ## against an index entry captured above - if a concurrent pull
+            ## swapped + reconciled the index meanwhile, drop the value the
+            ## CURRENT index no longer claims.
+            with self._index_lock:
+                if (key not in utils.reserved_key_strs
+                        and key not in self._remote_index and key not in self._journal.written
+                        and key in self._local_file):
+                    del self._local_file[key]
             return failure
         else:
             return None
