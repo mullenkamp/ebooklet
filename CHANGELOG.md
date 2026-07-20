@@ -4,7 +4,7 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.10.2 (unreleased)
+## 0.10.2 (2026-07-20)
 
 The deletion-propagation round (design dual-reviewed pre-implementation:
 `planning/delete-reconcile-review-brief-gemini.md` + the two
