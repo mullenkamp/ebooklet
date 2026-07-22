@@ -1668,16 +1668,50 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         return updated
 
 
-def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
-    """
+# Transport/system fields that s3func's add_metadata_from_urllib3 / add_metadata_from_s3_xml
+# interleave into a GET response's .metadata alongside the object's genuine USER metadata. They
+# describe the SOURCE object/transport, not the payload, and must never be re-PUT as user metadata:
+# status/content_length/upload_timestamp aren't even strings (put_object rejects non-str, s3.py),
+# and key/version_id/etag are string-valued SOURCE identifiers that would corrupt the copy's metadata.
+_TRANSPORT_META_KEYS = frozenset({'status', 'content_length', 'key', 'version_id', 'upload_timestamp', 'etag'})
 
+
+def _user_metadata(resp_metadata):
+    """Return only the genuine user metadata from a GET response's mixed .metadata dict.
+
+    Keeps non-transport, string-valued entries. ebooklet's own user metadata
+    (timestamp/uuid/type/init_bytes/format_version/num_groups) is always string, so nothing real is
+    dropped; the transport fields (which crash put_object or corrupt the copy) are.
+    """
+    if not resp_metadata:
+        return {}
+    return {k: v for k, v in resp_metadata.items() if k not in _TRANSPORT_META_KEYS and isinstance(v, str)}
+
+
+def indirect_copy_remote(source_session, target_session, source_key, target_key, source_bucket, dest_bucket):
+    """Download one object from the source remote and re-upload it to the target remote.
+
+    Used when the two remotes have different credentials (no server-side S3 copy). Two care-points:
+    - body: ebooklet builds every session with stream=False (remote.py create_s3_*_session), so a
+      2xx GET leaves .stream None and puts the bytes in .data (s3func response.py). Read .data — do
+      NOT pass .stream (None here; and a raw urllib3 stream is unseekable, which crashes put_object's
+      Content-Length probe). NOTE: .data buffers the whole object in memory (x copy concurrency) -
+      fine for small per-key objects, unsuitable for large/grouped ones; streaming is backlogged to
+      an s3func put_object(content_length=...) enhancement.
+    - metadata: the GET response's .metadata also carries transport fields (status/version_id/etag/
+      ...) that put_object would reject or that would corrupt the copy - filter to user metadata.
     """
     source_resp = source_session.get_object(source_key)
 
     if source_resp.status // 100 != 2:
         return source_resp
 
-    target_resp = target_session.put_object(target_key, source_resp.stream, source_resp.metadata)
+    body = source_resp.data  # non-streaming sessions => bytes live here; .stream is None
+    if body is None:
+        # never silently copy an empty object (a future streaming session would land here)
+        raise ValueError(f'{source_key!r}: GET returned no body to copy (status {source_resp.status})')
+
+    target_resp = target_session.put_object(target_key, body, _user_metadata(source_resp.metadata))
 
     return target_resp
 

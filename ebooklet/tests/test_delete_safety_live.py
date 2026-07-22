@@ -13,6 +13,7 @@ Live-gated via s3_config.toml / env vars like the other suites.
 import io
 import os
 import pathlib
+import tempfile
 
 import pytest
 try:
@@ -49,8 +50,14 @@ def make_conn(db_key):
     return conn
 
 
+# local ebooklet cache files go to a temp dir, NOT the tests dir: a killed live-test run
+# skips the session-scoped cleanup fixture, so writing here would leak DB files into the
+# repo (regenerable but noisy). A temp dir keeps a killed run's leak in /tmp instead.
+_local_tmp_dir = pathlib.Path(tempfile.mkdtemp(prefix='ebooklet-tests-'))
+
+
 def local_path(name):
-    p = script_path.joinpath(f'{name}-' + uuid.uuid8().hex[-10:])
+    p = _local_tmp_dir.joinpath(f'{name}-' + uuid.uuid8().hex[-10:])
     _paths.append(p)
     return p
 

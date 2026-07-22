@@ -1,7 +1,9 @@
+import datetime
 import pytest
 import pathlib
 import booklet
-from ebooklet import utils, remote
+from ebooklet import utils, remote, open_ebooklet
+from ebooklet.tests import fake_s3
 import uuid6 as uuid
 
 
@@ -186,3 +188,157 @@ def test_create_changelog(tmp_path):
                     assert raw.read(ln) == raw_val
 
             cl_path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# indirect_copy_remote (cross-credential copy): metadata filter + body + Finding-2
+# ---------------------------------------------------------------------------
+
+# A GET response's .metadata as s3func actually builds it: the object's genuine USER
+# metadata interleaved with transport fields (some non-string). See
+# s3func.utils.add_metadata_from_urllib3 / add_metadata_from_s3_xml.
+_MIXED_META = {
+    'status': 200,
+    'content_length': 7,
+    'upload_timestamp': datetime.datetime(2026, 7, 23, tzinfo=datetime.timezone.utc),
+    'key': 'srcdb/k1',
+    'version_id': 'v-abc',
+    'etag': 'e-abc',
+    # genuine ebooklet user metadata (all strings):
+    'timestamp': '1721000000000000',
+    'uuid': 'deadbeefdeadbeefdeadbeefdeadbeef',
+    'type': 'Booklet',
+    'init_bytes': 'AAAA',
+    'format_version': '2',
+}
+_USER_KEYS = {'timestamp', 'uuid', 'type', 'init_bytes', 'format_version'}
+
+
+def test_user_metadata_filters_transport():
+    out = utils._user_metadata(_MIXED_META)
+    assert set(out) == _USER_KEYS
+    assert out == {k: _MIXED_META[k] for k in _USER_KEYS}
+    # everything kept must satisfy put_object's string contract
+    assert all(isinstance(k, str) and isinstance(v, str) for k, v in out.items())
+    # empty / None -> {}
+    assert utils._user_metadata({}) == {}
+    assert utils._user_metadata(None) == {}
+
+
+class _FakeGetResp:
+    def __init__(self, data, metadata):
+        self.status = 200
+        self.data = data  # non-streaming session: the body lives in .data ...
+        self.stream = None  # ... and .stream is None (faithful to stream=False)
+        self.metadata = metadata
+
+
+class _FakeSource:
+    def __init__(self, data, metadata):
+        self._resp = _FakeGetResp(data, metadata)
+
+    def get_object(self, key):
+        return self._resp
+
+
+class _FakeTarget:
+    """Mirrors s3func.put_object's contract: every metadata key/value must be a string."""
+
+    def __init__(self):
+        self.calls = []
+
+    def put_object(self, key, body, metadata):
+        for mk, mv in metadata.items():
+            if not (isinstance(mk, str) and isinstance(mv, str)):
+                raise TypeError('metadata keys and values must be strings.')
+        self.calls.append((key, body, metadata))
+
+        class _R:
+            status = 200
+
+        return _R()
+
+
+def test_indirect_copy_remote_copies_body_and_user_metadata():
+    """Regression on BOTH defects: the transport-contaminated metadata is filtered
+    (no TypeError, transport keys stripped) AND the body is non-empty (read from .data,
+    not the always-None .stream). Fails two ways on the pre-fix function."""
+    src = _FakeSource(b'payload', dict(_MIXED_META))
+    tgt = _FakeTarget()
+    resp = utils.indirect_copy_remote(src, tgt, 'srcdb/k1', 'tgtdb/k1', 'srcbucket', 'tgtbucket')
+    assert resp.status == 200
+    assert len(tgt.calls) == 1
+    key, body, metadata = tgt.calls[0]
+    assert key == 'tgtdb/k1'
+    assert body == b'payload'  # non-empty -> Defect B pinned
+    assert set(metadata) == _USER_KEYS  # transport fields stripped -> Defect A pinned
+
+
+def test_indirect_copy_remote_empty_metadata_roundtrips():
+    """Grouped-mode child: only transport fields present -> filtered to {}, put_object
+    receives an empty dict without raising, body still copied."""
+    src = _FakeSource(b'abc', {'status': 200, 'content_length': 3})
+    tgt = _FakeTarget()
+    utils.indirect_copy_remote(src, tgt, 'a', 'b', 'sb', 'db')
+    key, body, metadata = tgt.calls[0]
+    assert body == b'abc'
+    assert metadata == {}
+
+
+def test_indirect_copy_remote_refuses_empty_body():
+    """A None body (e.g. a future streaming session) must raise, never silently copy empty."""
+    src = _FakeSource(None, {'timestamp': '1'})
+    tgt = _FakeTarget()
+    with pytest.raises(ValueError):
+        utils.indirect_copy_remote(src, tgt, 'a', 'b', 'sb', 'db')
+    assert tgt.calls == []
+
+
+# --- end-to-end: the real copy_remote indirect path (different credentials) ---
+
+
+class _CredS3Session(fake_s3.FakeS3Session):
+    """FakeS3Session with configurable credentials, so a copy between two of them
+    (different creds) routes copy_remote to the INDIRECT (download->upload) path
+    instead of the same-creds server-side copy_object."""
+
+    def __init__(self, store, access_key_id, access_key, **kw):
+        super().__init__(store, **kw)
+        self._access_key_id = access_key_id
+        self._access_key = access_key
+
+
+class _CredS3Connection(fake_s3.FakeS3Connection):
+    def __init__(self, store, db_key, access_key_id, access_key, **kw):
+        super().__init__(store, db_key, **kw)
+        self._akid = access_key_id
+        self._ak = access_key
+
+    def open(self, flag: str = 'r'):
+        sess = _CredS3Session(self.store, self._akid, self._ak, bucket=self.bucket)
+        if flag == 'r':
+            return remote.S3SessionReader(sess, self.db_key, self.threads)
+        return remote.S3SessionWriter(sess, sess, self.db_key, self.db_key, self.threads)
+
+
+def test_copy_remote_indirect_path_different_creds(tmp_path):
+    """The one test that exercises the REAL indirect path end-to-end (fake-vs-fake
+    same-creds copies never reach it). Different credentials force copy_remote to
+    download+upload, then the target db must reopen (db-object metadata preserved
+    through the filter) and the per-key child bodies round-trip (read from .data)."""
+    store = {}
+    src_conn = _CredS3Connection(store, 'srcdb', 'akid-A', 'ak-A')
+    with open_ebooklet(src_conn, tmp_path / 'src.blt', flag='n') as eb:
+        eb['k1'] = b'v1'
+        eb['k2'] = b'v2'
+        assert eb.changes().push()
+
+    tgt_conn = _CredS3Connection(store, 'tgtdb', 'akid-B', 'ak-B')  # different creds -> indirect
+    with src_conn.open('w') as src:
+        result = src.copy_remote(tgt_conn)
+    assert not result, f'copy_remote reported failures: {result}'
+
+    fresh = _CredS3Connection(store, 'tgtdb', 'akid-B', 'ak-B')
+    with open_ebooklet(fresh, tmp_path / 'tgt.blt', flag='r') as r:
+        assert r['k1'] == b'v1'
+        assert r['k2'] == b'v2'
