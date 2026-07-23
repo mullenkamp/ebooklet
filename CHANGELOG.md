@@ -4,6 +4,38 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.10.3 (2026-07-23)
+
+Cross-credential `copy_remote` repair (the download→upload path used when source and target
+remotes have different S3 credentials). Found while migrating a live dataset between two buckets
+owned by different accounts; design + fix dual-reviewed pre-implementation (Fable 5 + Gemini).
+
+### Fixed
+
+- **`copy_remote` between remotes with different credentials no longer crashes and no longer
+  risks silent 0-byte copies.** The `indirect_copy_remote` path had two defects that had to be
+  fixed together:
+  - *Metadata:* it re-`put_object`'d the source GET response's `.metadata` verbatim, but s3func
+    interleaves transport fields (`status`/`content_length`/`upload_timestamp`/`key`/`version_id`/
+    `etag`) into that dict alongside the object's user metadata. `put_object` requires every
+    key/value to be a string, so the first non-string field raised
+    `TypeError: metadata keys and values must be strings.`. Now filtered to the genuine
+    (non-transport, string-valued) user metadata before upload.
+  - *Body:* it read `source_resp.stream`, which is always `None` for ebooklet's sessions (all
+    built `stream=False`; the body is in `.data`). The metadata crash had been masking this;
+    fixing only the metadata would have uploaded a valid, signed, **0-byte** object per key —
+    a silent corruption. Now reads `.data`, and refuses a `None` body rather than copying empty.
+- **`copy_remote` with a public-`db_url` source no longer crashes on the indirect path.** The
+  source GET now uses the (already-required) writable, key-addressed session instead of the read
+  session, which for a public-`db_url` connection is an `HttpSession` that rejects a bare key.
+
+### Known limitation
+
+- The indirect copy buffers each object fully in memory (× copy concurrency) because sessions are
+  `stream=False` and `put_object` cannot consume an unseekable streaming GET. Fine for small
+  per-key objects; unsuitable for large/grouped-mode objects. A streaming path (an s3func
+  `put_object(content_length=...)` enhancement) is planned separately.
+
 ## 0.10.2 (2026-07-20)
 
 The deletion-propagation round (design dual-reviewed pre-implementation:

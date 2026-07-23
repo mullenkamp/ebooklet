@@ -520,7 +520,11 @@ class S3SessionWriter(S3SessionReader):
                         source_key = self.write_db_key + '/' + child
                         target_key = writer.write_db_key + '/' + child
                         if target_key not in target_exist_keys:
-                            f = executor.submit(utils.indirect_copy_remote, self._read_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
+                            # source GET via the (already-required) writable, key-addressed session:
+                            # a source connection with a public db_url makes _read_session an
+                            # HttpSession that crashes on a bare key - _write_session is always a
+                            # keyed S3Session (copy_remote reads it unconditionally above).
+                            f = executor.submit(utils.indirect_copy_remote, self._write_session, writer._write_session, source_key, target_key, source_bucket=source_bucket, dest_bucket=target_bucket)
                             futures[f] = target_key
 
                     for f in concurrent.futures.as_completed(futures):
@@ -533,7 +537,7 @@ class S3SessionWriter(S3SessionReader):
                     logger.warning('Copy failures have occurred. Rerun copy_remote or delete_remote.')
                     return failures
                 else:
-                    resp = utils.indirect_copy_remote(self._read_session, writer._write_session, self.write_db_key, writer.write_db_key, source_bucket, target_bucket)
+                    resp = utils.indirect_copy_remote(self._write_session, writer._write_session, self.write_db_key, writer.write_db_key, source_bucket, target_bucket)
                     if resp.status // 100 != 2:
                         raise urllib3.exceptions.HTTPError(resp.error)
 
