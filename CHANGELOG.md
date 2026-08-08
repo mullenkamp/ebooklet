@@ -4,6 +4,29 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.10.4 (2026-08-09)
+
+Dependency floor only — **no ebooklet code changed in this release.**
+
+### Changed
+
+- **Requires `s3func>=0.9.6`** (was `>=0.9.4`). 0.9.6 rewrites the version resolution behind
+  `delete_objects(keys=..., purge=True)`, which is how every ebooklet remote delete runs. Two
+  reasons the floor has to move rather than being left to resolve upward on its own:
+  - *Performance:* resolution used to cost one HTTP round trip per key. A push deleting 3,789
+    objects spent **~17.6 minutes** in that loop against a remote endpoint; it is now one bulk
+    listing. Pairing this ebooklet with 0.9.5 silently reinstates that.
+  - *Correctness:* 0.9.5 had three paths on which a failed version lookup quietly degraded a
+    purge into a versionless delete — leaving every version stored and billed on a versioned
+    bucket while reporting success. One of them, the `'501' in str(e)` capability test,
+    false-positives on any transport error whose URL contains `501`, and `db/501.<generation>`
+    is a routine group-object key here. 0.9.6 makes all three raise.
+
+  Note that resolution failures now *raise* where they used to degrade. ebooklet already
+  depends on that ordering: `update_remote`'s per-key delete pass is deliberately uncaught so
+  a failure propagates before `journal.clear_committed`, leaving the deletes journaled and the
+  push resumable.
+
 ## 0.10.3 (2026-07-23)
 
 Cross-credential `copy_remote` repair (the download→upload path used when source and target
