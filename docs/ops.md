@@ -23,6 +23,15 @@ collected from the changelogs into one place. Everything here assumes 0.10+
    (verified at push start and again immediately before the commit PUT).
    Everything stays journaled in both cases.
 
+   Since **s3func 0.9.6** (required from ebooklet 0.10.4) there is a third
+   raise site on this channel: in per-key storage mode, the post-commit pass
+   that removes deleted keys from the remote raises `HTTPError` if it cannot
+   resolve or delete them. It previously degraded silently instead — on a
+   versioned bucket that left every version stored and billed while reporting
+   success. The raise lands *before* the journal is cleared, so the pending
+   deletes are retained and re-running `push()` completes them; the data
+   already committed by that push is live and correct either way.
+
 ### Retrying a partial upload failure
 
 ```python
