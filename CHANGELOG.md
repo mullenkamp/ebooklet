@@ -4,6 +4,60 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.10.5 (2026-09-08)
+
+Stale-incarnation round. Found live on 2026-09-07: an ingest writer re-opened a local file whose
+remote-index sidecar and remote-state slot described a remote that `delete_remote()` had since
+removed and that was then rebuilt in the same working directory. The first push committed an
+index still claiming a key of the dead incarnation, and eight days later, when the dataset grew
+to that key, every reader of it raised `RemoteIntegrityError`. Design reviewed dual-blind:
+`planning/stale-incarnation-design-brief.md`, `-review-claude.md`, `-review-gemini.md`,
+`-synthesis.md`.
+
+### Fixed
+
+- **Opening a writer over a deleted remote no longer resurrects the dead incarnation's index.**
+  Every open-time freshness check is keyed off the remote's uuid, and a deleted remote has none,
+  so `'w'`/`'c'` reopens, `'n'` recreations and a fresh local path with a leftover sidecar all
+  reused the `.remote_index` sidecar and the slot-2 manifest verbatim, and the next push committed
+  them as the new remote's index: ghost claims with no backing object. A writer open against an
+  uninitialised remote with no journaled replacement intent now forgets the cached incarnation:
+  the sidecar is removed (a fresh empty one is created), the remote-state slot is reset, and the
+  local file's freshness stamp is reset. `'r'` sessions are untouched (readers heal per key
+  through the missing-object protocol, and offline sessions must keep their cache). A `'w'`
+  reopen that recovers a crashed `'n'` session keeps its sidecar - the replacement purge at push
+  already drops everything not written.
+- **The forgetting is reversible by construction.** "Uninitialised" is a guess from one HEAD 404
+  (a wrong bucket, a typo'd `db_key`, an endpoint on the wrong account all answer 404 for a
+  remote that is alive), so only state the remote can re-derive is dropped, and two guards
+  cover a wrong 404. At open, the file's freshness stamp is reset, so a later open against a
+  remote that turns out to exist re-fetches its index; the file's reconciliation watermark
+  (`remote_ts`) is kept, so that re-fetch also drops values the live remote no longer holds
+  instead of re-pushing them. Before a push, a session that believed the remote absent re-HEADs
+  it once and, if it exists after all, adopts its index and merges rather than replacing it -
+  without this a transient 404 followed by a push replaced a live remote's index with the
+  session's own keys, silently. Journaled deletes are kept (the only record of the user's
+  intent; self-cancelling on a genuinely-gone remote). Metadata reaches a rebuilt remote through
+  a push-time decision - when the remote is absent and nothing is cached, the push embeds the
+  local metadata slot - rather than a persisted flag, so a wrong 404 cannot make a file
+  republish stale metadata over another writer's newer version. Each of these was a reviewer
+  finding against an earlier draft (design review, then code review), with a test that fails on it.
+- **`delete_remote()` on a live session forgets its own cached index/manifest too**, so a
+  delete-then-write-then-push in one session cannot commit ghost claims either. The sidecar is
+  bulk-cleared (its layout is kept); the call is refused with `PushInProgressError` while a push
+  is running, like `prune()`/`clear()`. The session's remote metadata
+  (timestamp/type/num_groups/format_version) is reset alongside uuid/init_bytes.
+
+### Notes
+
+- The local file remains the authority for a re-push after `delete_remote()`: every
+  locally-materialized value (including ones transparently read from the old incarnation) is
+  uploaded into the recreated remote, and nothing else is. A cold cache re-creates a near-empty
+  database. Delete the local file first if that is not what you want.
+- Readers' VALUES heal after a remote deletion, but `keys()`/`in`/`len` on a warm reader keep
+  listing the dead claims for the life of that local file (they disagree with `items()`). Unchanged
+  in this round - a reader must not unlink a cache on an unconfirmed 404.
+
 ## 0.10.4 (2026-08-09)
 
 Dependency floor only — **no ebooklet code changed in this release.**

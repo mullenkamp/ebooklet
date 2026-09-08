@@ -167,7 +167,41 @@ the remote's entire content with this session's writes.
 - An unpushed `'n'` session's intent survives closing (journaled): reopening
   the local file warns loudly that the next push will replace the remote. To
   cancel a pending replacement, delete the local file and re-open from the
-  remote.
+  remote. That recovery still works if the remote was deleted in between: the
+  reopened session keeps its sidecar and the push replaces.
+
+## `delete_remote()` — what survives locally
+
+`delete_remote()` removes the remote database and its objects but keeps the
+local file, and **the local file becomes the source of the next push**: every
+value it holds — including ones it transparently read from the old remote — is
+uploaded, and nothing else is. A cold cache re-creates a near-empty database
+(this bites `RemoteConnGroup` catalogues hardest, where the entries *are* the
+database). Delete the local file first if that is not what you want.
+
+Since 0.10.5 the local caches that described the deleted remote — the
+`.remote_index` sidecar and the remote-state slot — are forgotten automatically:
+on the live session that called `delete_remote()`, and on the next writer open
+(`'w'`/`'c'`/`'n'`) of a local file whose remote turns out to be gone (a `'w'`
+recovering an unpushed `'n'` replacement is the one exception: it keeps its
+sidecar, and the replacement push discards everything not written anyway).
+"Gone" is judged from one HEAD 404, so only state the remote can re-derive is
+dropped, and two guards cover a *wrong* 404: the open resets the file's
+freshness stamp, so the next open against the live remote re-fetches its index
+and reconciles against the file's watermark; and a push from a session that
+believed the remote absent re-checks it first and, if it exists after all,
+adopts it and merges rather than replacing its index. Pending local writes and
+the local metadata are kept and pushed; pending deletes are kept (against a
+genuinely-gone remote there is nothing left to delete). Readers (`'r'`,
+including offline) keep their cache: their values heal per key, but
+`keys()`/`in`/`len` on a warm reader keep listing the dead claims until that
+local file is replaced.
+
+Changing `num_groups` needs `delete_remote()` followed by a `flag='n'` session:
+a `'w'`/`'c'` reopen keeps the journal's grouping. If you rebuild a remote from a
+*different* local file, other caches of the old incarnation raise
+`UUIDMismatchError` on their next online open — delete those local files and
+re-open from the remote.
 
 ## Offline read mode
 

@@ -364,6 +364,50 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
     return local_file, overwrite_remote_index
 
 
+def remote_index_sidecar_path(local_file_path):
+    """The remote-index sidecar that lives next to a local ebooklet file."""
+    return local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
+
+
+def forget_remote_incarnation(local_file, journal, remote_state, reason):
+    """
+    The remote this local file was last in sync with no longer exists (its db
+    object answers 404). Drop the local caches that described it - the
+    remote-state slot (manifest, remote timestamp, metadata section) - and
+    reset the local file's freshness stamp. The remote-index sidecar is the
+    caller's job (unlinked before it is opened at open time; cleared in place on
+    a live session).
+
+    THE INVARIANT: everything this forgets must be re-derivable from the
+    remote, because "uninitialised" is a guess made from one HEAD 404, not a
+    fact (a wrong bucket, a typo'd db_key, an endpoint on the wrong account all
+    answer 404 for a remote that is alive). The stamp reset is what makes the
+    sidecar/manifest reset reversible: a later open against a remote that turns
+    out to exist sees `remote.timestamp > 0` and re-fetches the index
+    (check_local_remote_sync). State that could NOT be rebuilt from the remote
+    is deliberately left alone: journaled deletes (the only record of the
+    user's intent; self-cancelling on a genuinely-gone remote because the empty
+    sidecar pulls nothing and per-key deletes target keys the new incarnation
+    cannot hold), the metadata slot (a recreated remote receives it through
+    the push-time fallback in _build_meta_section_for_push, without a persistent
+    latch that would outlive a misfire and clobber another writer's newer
+    metadata), and `remote_state.remote_ts` - this file's reconciliation
+    watermark, which the healing re-fetch needs to drop values the live remote
+    no longer holds (see RemoteState.reset). Idempotent.
+
+    The second half of the guarantee lives in Change.push: a session that
+    opened against an absent remote re-HEADs it once before pushing and, if it
+    exists after all, adopts it (fresh index + reconciliation) instead of
+    replacing its index with this file's keys.
+    """
+    remote_state.reset()
+    remote_state.persist(local_file)
+    ## Same private booklet API _pull_remote_index uses to adopt the remote's stamp.
+    local_file._set_file_timestamp(0)
+    logger.info(f'forgot the cached state of a remote that no longer exists ({reason}); '
+                'the next open against a live remote will re-fetch its index')
+
+
 def get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag):
     """
     Ensure the local remote-index sidecar file exists (fetching + parsing the
@@ -372,7 +416,7 @@ def get_remote_index_file(local_file_path, overwrite_remote_index, remote_sessio
     actually ingested this call; manifest/meta_section are None when it
     wasn't (the caller falls back to the persisted remote-state slot).
     """
-    remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
+    remote_index_path = remote_index_sidecar_path(local_file_path)
 
     fetched = False
     manifest = None
@@ -1040,7 +1084,7 @@ def upload_value(key, local_file, remote_session):
         return None
 
 
-def _build_meta_section_for_push(local_file, journal, remote_state, replace_pending, time_int_us):
+def _build_meta_section_for_push(local_file, journal, remote_state, replace_pending, time_int_us, remote_absent=False):
     """
     Decision 9 (review-amended): the metadata section a push embeds.
     - meta_pending: the user edited metadata locally - embed the local slot,
@@ -1051,6 +1095,13 @@ def _build_meta_section_for_push(local_file, journal, remote_state, replace_pend
     - otherwise: carry the cached remote section forward verbatim (embedding
       the local slot unconditionally would wipe remote metadata on the first
       push from a fresh local file - init_bytes carries no metadata block).
+    - remote_absent (0.10.5): the remote does not exist and nothing is cached
+      for it - this push CREATES (or re-creates) the remote. Embed the local
+      slot's metadata, with its own timestamp, so a remote rebuilt from a local
+      file after delete_remote() is not born without metadata (cfdb decides
+      create-vs-attach from get_metadata()). Deliberately a push-time decision
+      and not a persisted flag: nothing outlives the push, so a wrong 404 at
+      open cannot make this file republish stale metadata over a newer remote.
     """
     if journal.meta_pending:
         out = local_file.get_metadata(include_timestamp=True)
@@ -1074,6 +1125,11 @@ def _build_meta_section_for_push(local_file, journal, remote_state, replace_pend
         ## via the local slot (the open transparently pulls it there for
         ## pre-push reads; only a user edit, i.e. meta_pending above, counts).
         return None
+    if remote_absent and remote_state.meta_section is None:
+        out = local_file.get_metadata(include_timestamp=True)
+        if out is not None:
+            data, local_ts = out
+            return build_meta_section(local_ts if local_ts is not None else time_int_us, data)
     return remote_state.meta_section
 
 
@@ -1543,7 +1599,8 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 index_bytes_for_commit = remote_index._file.read()
 
         embedded_local_meta = journal.meta_pending
-        meta_section = _build_meta_section_for_push(local_file, journal, remote_state, replace_pending, time_int_us)
+        meta_section = _build_meta_section_for_push(local_file, journal, remote_state, replace_pending, time_int_us,
+                                                    remote_absent=not remote_session.initialized)
         payload = build_db_payload(new_manifest, meta_section, index_bytes_for_commit)
 
         metadata = {

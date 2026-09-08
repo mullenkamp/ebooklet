@@ -233,3 +233,19 @@ class RemoteState:
         self.meta_section = meta_section
         self.remote_ts = remote_ts
         self._dirty = True
+
+    def reset(self):
+        """Forget the cached REMOTE state (manifest, metadata section) of a remote
+        that no longer exists. `remote_ts` is deliberately KEPT: it is not a
+        cache of the remote but this local file's reconciliation watermark -
+        the discriminator between values sourced from a remote (ts <= it) and
+        local writes since (ts > it). Dropping it made the next fresh ingest
+        skip reconciliation, so a key deleted remotely in the meantime was
+        served locally and re-pushed (code review, 2026-09-08). Marks dirty
+        only when something actually changes, so a writer opening a local file
+        whose remote has simply not been created yet does not rewrite slot 2.
+        """
+        if self.manifest or self.meta_section is not None:
+            self.manifest = {}
+            self.meta_section = None
+            self._dirty = True

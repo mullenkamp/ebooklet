@@ -111,7 +111,7 @@ Use `changes.discard()` to remove local changes without pushing, or pass specifi
 
 | Method | Description |
 |--------|-------------|
-| `delete_remote()` | Delete the entire remote database |
+| `delete_remote()` | Delete the entire remote database. The local file is kept and becomes the content of the next push; its cached index/manifest of the deleted remote are forgotten |
 | `copy_remote(remote_conn)` | Copy the remote to another S3 location. Efficient S3-to-S3 copy when credentials match, otherwise downloads then uploads |
 | `load_items(keys=None)` | Download keys/values to the local file without returning them. Pass `None` to load everything |
 | `get_items(keys)` | Load then return an iterator of `(key, value)` pairs |

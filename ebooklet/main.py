@@ -259,6 +259,25 @@ class Change:
 
         journal = self._ebooklet._journal
 
+        ## THE PRE-PUSH RE-CHECK (0.10.5). A session that opened against a remote
+        ## reported ABSENT forgot its cached index and manifest (a dead
+        ## incarnation must not be re-committed). But "absent" was one HEAD 404,
+        ## and if it was wrong - a transient answer, a routing hiccup - this
+        ## push would replace a LIVE remote's index with this file's keys only,
+        ## silently (fsck would call the result healthy and the lost values
+        ## orphans). Re-HEAD once here, under the write lock: if the remote
+        ## exists after all, adopt it - fresh index plus reconciliation against
+        ## this file's watermark - and carry on as an ordinary merge push.
+        ## One extra HEAD, only on the absent path. Found by code review,
+        ## 2026-09-08.
+        if not self._ebooklet._remote_session.initialized:
+            self._ebooklet._remote_session._load_db_metadata()
+            if self._ebooklet._remote_session.initialized:
+                logger.warning('the remote was reported absent when this session opened but exists '
+                               'now; adopting its index before pushing so this push merges into it '
+                               'instead of replacing it')
+                self._ebooklet._pull_remote_index(force=True)
+
         ## The push holds captured value offsets from the changelog sweep until
         ## its commit - a compaction (prune/clear) would invalidate them all,
         ## so both raise PushInProgressError while this flag is set. Spans the
@@ -430,6 +449,11 @@ class EVariableLengthValue(MutableMapping):
             ## which destroys any previous journal slot - exactly right, a
             ## replacement starts with no pending history.
             journal = JournalState.load(local_file)
+            ## Loaded HERE, next to the journal, so the forget block below can
+            ## reset it before the index fetch. (The helper persists the reset
+            ## at once, so a later reload would read the reset slot - the early
+            ## load is for a single obvious ordering, not a correctness gate.)
+            remote_state = RemoteState.load(local_file)
             if flag == 'n':
                 journal.set_replace_pending(True)
             elif journal.replace_pending:
@@ -441,6 +465,44 @@ class EVariableLengthValue(MutableMapping):
                     UserWarning,
                     stacklevel=4,
                 )
+
+            ## A remote that no longer exists (delete_remote(), or torn down out of
+            ## band) leaves this local file's caches describing a DEAD incarnation:
+            ## the sidecar's index entries and the slot-2 manifest name objects
+            ## that are gone, and the next push would commit them verbatim - a
+            ## ghost claim every reader then trips over as RemoteIntegrityError
+            ## (found live, 2026-09-07). No uuid check can catch it: an
+            ## uninitialised remote has no uuid, so check_local_remote_sync never
+            ## runs. Forget the dead incarnation for WRITERS only:
+            ##   * 'r' is left alone - readers heal per key through
+            ##     _resolve_missing's remote_gone path, and offline sessions
+            ##     ('r'-only) also report initialized=False and must keep their
+            ##     cache;
+            ##   * a journaled replacement ('w' recovering a crashed 'n') keeps
+            ##     its sidecar: the replacement purge at push drops everything
+            ##     not written anyway, and that path is tested as-is;
+            ##   * 'n' has fresh slots already (init_local_file recreated the
+            ##     booklet) but the sidecar FILE survived, so pre-push keys()
+            ##     listed ghosts.
+            ## Only re-derivable state is dropped - see forget_remote_incarnation.
+            if (flag != 'r' and not remote_session.initialized
+                    and (flag == 'n' or not journal.replace_pending)):
+                stale_sidecar = utils.remote_index_sidecar_path(local_file_path)
+                if stale_sidecar.exists():
+                    ## Unconditional: open_remote_index recreates it empty below. This
+                    ## also covers the incident's literal shape - a FRESH local file
+                    ## beside an orphaned sidecar - where there is nothing else to forget.
+                    stale_sidecar.unlink()
+                ## The rest only when this file was once IN SYNC with a remote (a
+                ## dead incarnation to forget). A database that has simply never
+                ## been pushed has nothing cached and must not rewrite its header
+                ## or log "no longer exists" on every open.
+                if (remote_state.remote_ts is not None or remote_state.manifest
+                        or remote_state.meta_section is not None):
+                    logger.info(f"removed the remote-index sidecar '{stale_sidecar}': the remote it "
+                                'described no longer exists')
+                    utils.forget_remote_incarnation(local_file, journal, remote_state,
+                                                    reason=f"open flag='{flag}'")
 
             ## Format gate (no-compat ruling): 0.10 reads ONLY format-2
             ## remotes. A format-1 remote is refused for r/w/c; the two
@@ -465,7 +527,7 @@ class EVariableLengthValue(MutableMapping):
                 ## EMPTY index (old keys read as absent - the documented
                 ## semantic narrowing of a replacement over v1); 'w'-recovery
                 ## keeps the crashed session's sidecar (the replacement image).
-                remote_index_path = local_file_path.parent.joinpath(local_file_path.name + '.remote_index')
+                remote_index_path = utils.remote_index_sidecar_path(local_file_path)
                 if flag == 'n' and remote_index_path.exists():
                     remote_index_path.unlink()
                 index_fetched = False
@@ -481,7 +543,6 @@ class EVariableLengthValue(MutableMapping):
             ## of the last in-sync db object). Refresh it from what the open
             ## fetched, or - when the local stamp says in-sync but the cache
             ## disagrees (a crash window) - from a cheap ranged GET.
-            remote_state = RemoteState.load(local_file)
             ## The ingest stamp of the PREVIOUS index this local file adopted -
             ## captured BEFORE update_committed overwrites it; it is the
             ## reconciliation discriminator between remotely-sourced values
@@ -1373,10 +1434,33 @@ class EVariableLengthValue(MutableMapping):
 
     def delete_remote(self):
         """
-        Completely delete the remote file, but keep the local file.
+        Completely delete the remote database, but keep the local file.
+
+        The local file's VALUES are kept and become the content of the next
+        push; its caches of the deleted remote - the remote-index sidecar and
+        the remote-state slot - are forgotten here, so a delete-then-write-
+        then-push in one session cannot commit claims for objects that no
+        longer exist (the same forgetting an open performs when it finds the
+        remote gone; see utils.forget_remote_incarnation for what is and is not
+        dropped). ⚠️ Iteration concurrent with this call (keys()/__iter__ do
+        not take the index lock) may raise RuntimeError - the same caveat as
+        Change.pull. Refused while a push is running (PushInProgressError),
+        like prune()/clear(): the push is reading the state this mutates.
         """
         if self.writable:
-            self._remote_session.delete_remote()
+            if self._push_active:
+                raise PushInProgressError(
+                    'delete_remote() was called while a push is running on this session; '
+                    'wait for the push to finish.')
+            with self._index_lock:
+                self._remote_session.delete_remote()
+                ## Bulk clear: O(1), keeps the sidecar's layout (value_len, buckets,
+                ## key serializer), and bumps the sidecar's own mutation counter so a
+                ## concurrent iterator raises rather than reading a half-cleared index.
+                self._remote_index.clear()
+                self._remote_index.sync()
+                utils.forget_remote_incarnation(self._local_file, self._journal, self._remote_state,
+                                                reason='delete_remote()')
         else:
             raise ReadOnlyError('File is open for read only.')
 

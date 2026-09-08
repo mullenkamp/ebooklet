@@ -423,8 +423,14 @@ class S3SessionWriter(S3SessionReader):
             ## listing - acceptable for a rare teardown operation.
             self._write_session.delete_objects(keys=[self.write_db_key], purge=True)
             self._write_session.delete_objects(prefix=self.write_db_key + '/', purge=True)
+            ## Every field _load_db_metadata's 404 branch resets - the session now
+            ## describes an uninitialised remote, not a half-remembered one.
             self._init_bytes = None
             self.uuid = None
+            self.timestamp = None
+            self.type = None
+            self.num_groups = None
+            self.format_version = None
         else:
             raise ReadOnlyError('Session is not writable.')
 
