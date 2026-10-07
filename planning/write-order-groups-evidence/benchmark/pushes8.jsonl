@@ -1,0 +1,2 @@
+{"cmd": "push", "size": 8, "phase": "initial", "push_s": 46.86, "write_s": 0.0, "group_puts": 75, "group_put_bytes": 604543441, "db_object_bytes": 967755, "changed_keys": 1614, "changed_bytes": 604485897, "n_groups": 75, "index_keys": 1614, "peak_rss_mb": 399}
+{"cmd": "push", "size": 8, "phase": "append", "push_s": 19.66, "write_s": 6.67, "group_puts": 10, "group_put_bytes": 185435238, "db_object_bytes": 1010107, "puts_by_gid": [69, 70, 71, 72, 73, 74, 75, 76, 77, 78], "changed_keys": 645, "changed_bytes": 180795888, "n_groups": 79, "index_keys": 1936, "peak_rss_mb": 933}

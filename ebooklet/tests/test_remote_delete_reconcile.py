@@ -21,12 +21,13 @@ import pytest
 import ebooklet.utils as eb_utils
 from ebooklet import open_ebooklet, open_rcg
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB
 
 
-def _seed(store, db_key, tmp_path, name='writer.blt', items=None, num_groups=None):
+def _seed(store, db_key, tmp_path, name='writer.blt', items=None, group_bytes=None):
     """Create + push a small db; returns nothing (connections are cheap)."""
     conn = fake_s3.FakeS3Connection(store, db_key)
-    with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2', 'k3': b'v3'}).items():
             eb[k] = v
         assert eb.changes().push()
@@ -51,10 +52,10 @@ def _delete_and_push(store, db_key, tmp_path, keys, name='writer.blt'):
 ### Convergence through pull() and re-open
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_pull_reconciles_warm_deleted_key(tmp_path, num_groups, caplog):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_pull_reconciles_warm_deleted_key(tmp_path, group_bytes, caplog):
     store = {}
-    _seed(store, 'db1', tmp_path, num_groups=num_groups)
+    _seed(store, 'db1', tmp_path, group_bytes=group_bytes)
 
     with _reader(store, 'db1', tmp_path) as eb:
         assert eb['k1'] == b'v1'  # materialize the warm copy
@@ -76,11 +77,11 @@ def test_pull_reconciles_warm_deleted_key(tmp_path, num_groups, caplog):
         assert any('no longer provides' in r.message for r in caplog.records)
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
 @pytest.mark.parametrize('flag', ['r', 'w'])
-def test_reopen_reconciles_warm_deleted_key(tmp_path, num_groups, flag):
+def test_reopen_reconciles_warm_deleted_key(tmp_path, group_bytes, flag):
     store = {}
-    _seed(store, 'db2', tmp_path, num_groups=num_groups)
+    _seed(store, 'db2', tmp_path, group_bytes=group_bytes)
 
     local = tmp_path / ('second.blt' if flag == 'r' else 'writer.blt')
     if flag == 'r':
@@ -464,10 +465,11 @@ def test_helper_retry_then_skip(caplog):
     f = _StubFile({'gone': 50}, fail_times=1)
     assert eb_utils.reconcile_local_with_index(f, {}, _StubJournal(), 100) == ['gone']
 
-    ## two aborts -> skipped with a warning, nothing deleted
+    ## two aborts -> skipped with a warning, nothing deleted, reported as None
+    ## (the callers then leave the freshness stamp old)
     f = _StubFile({'gone': 50}, fail_times=2)
     with caplog.at_level(logging.WARNING, logger='ebooklet.utils'):
-        assert eb_utils.reconcile_local_with_index(f, {}, _StubJournal(), 100) == []
+        assert eb_utils.reconcile_local_with_index(f, {}, _StubJournal(), 100) is None
     assert sorted(f.d) == ['gone']
     assert any('aborted twice' in r.message for r in caplog.records)
 

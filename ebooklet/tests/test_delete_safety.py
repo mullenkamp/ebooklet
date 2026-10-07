@@ -15,18 +15,9 @@ push's delete pass removed the index entry the upload pass had just written.
 import base64
 import uuid as _uuid
 
-from ebooklet import open_ebooklet, utils
+from ebooklet import open_ebooklet
 from ebooklet.tests import fake_s3
-
-
-def _key_for_group(gid, num_groups, taken=()):
-    """Find a short key that hashes into the wanted group id."""
-    i = 0
-    while True:
-        k = f'k{i}'
-        if utils.key_to_group_id(k, num_groups) == gid and k not in taken:
-            return k
-        i += 1
+from ebooklet.tests.groups import TEST_GB, gid_of, members_by_gid
 
 
 def _seed_db_object(store, db_key):
@@ -41,19 +32,19 @@ def _seed_db_object(store, db_key):
 
 
 def test_emptied_group_delete_spares_sibling_groups(tmp_path):
-    """F1 group variant: with num_groups=13, emptying group 1 must not touch 10/12."""
+    """F1 group variant: emptying group 1 must not touch groups 10/12 (whose
+    object names share the '1' prefix)."""
     store = {}
-    num_groups = 13
-    k1 = _key_for_group(1, num_groups)
-    k10 = _key_for_group(10, num_groups)
-    k12 = _key_for_group(12, num_groups)
+    ## group_bytes=1: one key per group, gids follow write order.
+    keys = [f'k{i}' for i in range(13)]
+    k1, k10, k12 = 'k1', 'k10', 'k12'
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=num_groups) as eb:
-        eb[k1] = b'one'
-        eb[k10] = b'ten'
-        eb[k12] = b'twelve'
+    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', group_bytes=1) as eb:
+        for k in keys:
+            eb[k] = k.encode()
         assert eb.changes().push()
+        assert (gid_of(eb, k1), gid_of(eb, k10), gid_of(eb, k12)) == (1, 10, 12), 'precondition'
 
     def _has_group(gid):
         return any(k.startswith(f'testdb/{gid}.') for k in store)
@@ -71,8 +62,8 @@ def test_emptied_group_delete_spares_sibling_groups(tmp_path):
     ## The surviving members must still be readable by a fresh reader.
     conn2 = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn2, tmp_path / 'fresh.blt', flag='r') as eb:
-        assert eb[k10] == b'ten'
-        assert eb[k12] == b'twelve'
+        assert eb[k10] == b'k10'
+        assert eb[k12] == b'k12'
         assert k1 not in eb
 
 
@@ -108,7 +99,7 @@ def test_flag_n_push_spares_siblings_and_locks(tmp_path):
     store = {}
 
     conn2 = fake_s3.FakeS3Connection(store, 'mydb2')
-    with open_ebooklet(conn2, tmp_path / 'db2.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn2, tmp_path / 'db2.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['other'] = b'precious'
         assert eb.changes().push()
 
@@ -116,7 +107,7 @@ def test_flag_n_push_spares_siblings_and_locks(tmp_path):
     store['mydb.lock.zzz999-0'] = (b'', {})
 
     conn = fake_s3.FakeS3Connection(store, 'mydb')
-    with open_ebooklet(conn, tmp_path / 'db1.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'db1.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['mine'] = b'value'
         assert eb.changes().push()
 
@@ -148,12 +139,14 @@ def test_delete_then_set_survives_push(tmp_path):
     value, not silently lose the key (set() now discards it from the pending
     deletes; previously the delete pass removed the fresh index entry)."""
     store = {}
-    num_groups = 5
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', group_bytes=TEST_GB) as eb:
         for i in range(6):
             eb[f'key{i}'] = b'v%d' % i
         assert eb.changes().push()
+        old_gid = gid_of(eb, 'key2')
+        siblings = [k for k in members_by_gid(eb)[old_gid] if k != 'key2']
+        assert siblings, 'precondition: key2 shares its group'
 
     with open_ebooklet(conn, tmp_path / 'local.blt', flag='w') as eb:
         del eb['key2']
@@ -164,12 +157,9 @@ def test_delete_then_set_survives_push(tmp_path):
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as eb:
         assert 'key2' in eb, 'delete-then-set lost the key on push'
         assert eb['key2'] == b'NEWVAL'
-        ## Same-group siblings must be unaffected by the repack.
-        gid = utils.key_to_group_id('key2', num_groups)
-        for i in (0, 1, 3, 4, 5):
-            k = f'key{i}'
-            if utils.key_to_group_id(k, num_groups) == gid:
-                assert eb[k] == b'v%d' % i
+        ## Its old group's siblings must be unaffected.
+        for k in siblings:
+            assert eb[k] == b'v%d' % int(k[3:])
 
 
 def test_delete_then_set_timestamp_survives_push(tmp_path):
@@ -177,7 +167,7 @@ def test_delete_then_set_timestamp_survives_push(tmp_path):
     same key must also leave it out of the pending deletes."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['key1'] = b'v1'
         assert eb.changes().push()
 
@@ -199,7 +189,7 @@ def test_set_then_delete_still_deletes(tmp_path):
     same session must still delete the key remotely."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['keep'] = b'keep'
         eb['gone'] = b'v1'
         assert eb.changes().push()
@@ -220,7 +210,7 @@ def test_delete_then_set_of_never_pushed_key(tmp_path):
     followed by a re-set behaves as a plain set."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'local.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['newkey'] = b'v1'
         del eb['newkey']
         eb['newkey'] = b'v2'

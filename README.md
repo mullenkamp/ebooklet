@@ -4,7 +4,7 @@ EBooklet is a Python key-value database that syncs with S3 (AWS or any S3-compat
 
 - **S3 sync** — push/pull changes between a local database and an S3 bucket
 - **Dict-like API** — standard `MutableMapping` plus `dbm`-style methods
-- **Grouped storage** — hash keys into N groups stored as single S3 objects, with automatic byte-range reads
+- **Grouped storage** (0.11: write-order groups) — values packed into group objects in the order they were written, so appending to a growing database uploads only the new data; byte-range reads
 - **Concurrency** — thread-safe writes (thread locks), multiprocessing-safe (file locks), and S3 object locking for remote writes
 - **Push progress** (0.10.1) — opt into per-group progress records (exact totals, rate, ETA) via `logging.getLogger('ebooklet.push').setLevel(logging.INFO)`; see the ops guide's "Monitoring a push"
 
@@ -67,22 +67,27 @@ Be careful with flags — using `'n'` will delete the remote database in additio
 
 ## Grouped Storage
 
-By default, each key/value pair is stored as a separate S3 object. When `num_groups` is set, keys are hashed into N groups, each stored as a single S3 object containing all key/value pairs for that bucket. If the provided `num_groups` is not prime, it is automatically rounded up to the nearest prime for optimal hash distribution.
+A new database stores its values in **group objects** (storage format 3, since 0.11). At each push, keys that are new to the remote are packed in the order they were written to the local file: first into the remote's last group until it reaches `group_bytes` (default `ebooklet.DEFAULT_GROUP_BYTES`, 32 MiB), then into fresh groups. Each key's group id is recorded in its remote-index entry.
 
 ```python
 db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
-                            value_serializer='pickle', num_groups=64)
-# num_groups is adjusted to 67 (nearest prime >= 64)
+                            value_serializer='pickle')                       # grouped, 32 MiB groups
+db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
+                            value_serializer='pickle', group_bytes=8 * 2**20)  # grouped, 8 MiB groups
+db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
+                            value_serializer='pickle', group_bytes=None)       # per-key: one object per key
 ```
 
-- Keys are assigned to groups via `blake2b` hash mod `num_groups`
-- Single-key reads use S3 byte-range GET requests to fetch only the needed bytes
-- Multi-key reads from the same group use a single merged byte-range GET
-- On push, entire affected groups are re-packed and uploaded
-- For databases already pushed to the remote, `num_groups` is read from S3 metadata (user-provided value is ignored)
-- For a database created locally but not yet pushed, the creation-time choice is not recorded anywhere — re-pass the same `num_groups` when reopening before the first push (reopening without it emits a `UserWarning`, and the first push would fall back to per-key storage)
+- **Appends upload only new data** (plus at most the partly filled last group, which is topped up and re-uploaded). Keys written together share groups, so a growing dataset appended in time order keeps each new slice in new groups.
+- **An update repacks only its key's group** (a key keeps its group for life).
+- **Deletes are lazy**: they remove the key's index entry only. The deleted value's bytes stay in its group object until that group is repacked for another reason, and stay downloadable until then; a group left with no live member is dropped. `fsck` reports each group's dead fraction.
+- Reads use S3 byte-range GETs: multi-key reads from the same group use one merged range (from the first to the last wanted member).
+- A grouped remote records the `group_bytes` its last push packed with. Omitted, an existing remote keeps its storage mode and its recorded `group_bytes`; a new database is grouped at 32 MiB. Passing another value changes the target from that push on: new data packs to it, existing groups keep their size, and the remote records the new value (no history is kept). `db.group_bytes` reports the value in effect. An explicit value for the other mode is ignored with a warning (with `flag='n'` it raises — call `delete_remote()` first to change the mode).
+- A value larger than `group_bytes` gets a group of its own. A group can still exceed the 4 GiB packing ceiling if its members grow in place (`GroupTooLargeError`).
 
-Use grouped storage when you have many small values — it reduces the number of S3 objects and can improve read performance through byte-range requests.
+**Per-key storage** (`group_bytes=None`, format 2) puts each value in its own S3 object. It suits databases pushed very often in small increments (each push uploads exactly the changed values, with no group to top up).
+
+**Hash-grouped remotes (pre-0.11, `num_groups`) are not readable by 0.11.** To move one to the current format: with `ebooklet<0.11`, open it `'w'` and call `load_items()` so the local file holds every value; `delete_remote()`; then push the local file again with 0.11. The `num_groups` argument is gone: for one release an explicit `num_groups=None` still means per-key (as it always did); an int raises.
 
 ## Syncing with S3
 
@@ -142,13 +147,13 @@ with ebooklet.open_rcg(remote_conn_rcg, '/tmp/rcg.blt', 'n') as rcg:
 
 ## Data Formats and Stability
 
-What EBooklet stores in a remote (storage **format 2**, since 0.10). For a database at S3 key `D`:
+What EBooklet stores in a remote: storage **format 3** (grouped, since 0.11) or **format 2** (per-key; also the 0.10 hash-grouped layout, which 0.11 refuses). For a database at S3 key `D`:
 
 | Object | Key | Contents |
 |--------|-----|----------|
-| db object | `D` | Body: the format-2 payload (below). S3 metadata: `timestamp`, `uuid`, `type`, `init_bytes`, `format_version`, and `num_groups` (grouped mode) |
-| group generations | `D/<gid>.<gen13>` | Immutable group objects: `gid` is the decimal group id, `gen13` a 13-hex generation token minted per push. Never overwritten — a repack creates a NEW generation and the commit un-references the old one before it is deleted |
-| per-key values | `D/<key>` | Per-key mode only (overwritten in place; each PUT is object-atomic, but there is no cross-key snapshot isolation — grouped mode is the recommended layout) |
+| db object | `D` | Body: the db-object payload (below). S3 metadata: `timestamp`, `uuid`, `type`, `init_bytes`, `format_version` (3 grouped, 2 per-key; a format-2 remote that also carries `num_groups` is a legacy hash-grouped one) |
+| group generations | `D/<gid>.<gen13>` | Immutable group objects: `gid` is the decimal group id, `gen13` a 13-hex generation token minted per push. Never overwritten — a repack creates a NEW generation and the commit un-references the old one before it is deleted. A gid freed by an emptied group may be reused later, always with a fresh generation |
+| per-key values | `D/<key>` | Per-key mode only (overwritten in place; each PUT is object-atomic, but there is no cross-key snapshot isolation) |
 | lock tickets | `D.lock.<id>-<seq>` | Transient S3 lock objects for the active writer |
 
 **db-object payload** — everything that must change together rides ONE object, whose single PUT is the push's atomic commit point:
@@ -161,10 +166,10 @@ magic b'ebooklet-db\x00' (12) | payload_version >H (2) | reserved (2)
 | index:    the serialized remote-index booklet
 ```
 
-- **`format_version`** stamps the remote storage format; the current version is 2. Opening a remote with a NEWER stamp refuses with `UnsupportedFormatError` (upgrade ebooklet). Opening a **format-1** remote also refuses — 0.10 has no legacy read path. Upgrade recipe: push pending changes with 0.9.x, upgrade, then re-push each remote once with `flag='n'` (re-pass `num_groups`; it is not inherited), and re-`add` RemoteConnGroup members after the member remotes are upgraded.
+- **`format_version`** stamps the remote storage format: 3 for grouped, 2 for per-key (a per-key remote stays readable by 0.10 clients). The stamp follows the storage mode; `SUPPORTED_FORMAT_VERSION` is only the highest format this client reads. Opening a remote with a NEWER stamp refuses with `UnsupportedFormatError` (upgrade ebooklet). Legacy remotes — format 1, and hash-grouped format 2 (with `num_groups`) — refuse too; see "Hash-grouped remotes" above for the move to the current format.
 - **User metadata** is embedded in the payload's `meta` section (no separate `_metadata` object): it commits atomically with the data.
-- **Remote-index entry** (15 bytes per key): `timestamp` (7 bytes) + `offset` (4) + `length` (4). In per-key mode, `offset` and `length` are always 0. In grouped mode they locate the member's value inside its group's live generation (via the manifest) — `length` is the value's byte length and **may be 0 for an empty value**.
-- **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index. A group's packed size is capped at 4 GiB (`GroupTooLargeError` at pack time — use a larger `num_groups` for bigger databases).
+- **Remote-index entry**: per-key, 15 bytes: `timestamp` (7) + `offset` (4) + `length` (4), with `offset` and `length` always 0. Grouped, 19 bytes: `timestamp` (7) + `gid` (4) + `offset` (4) + `length` (4) — the gid names the member's group (its live generation via the manifest), offset/length locate the value inside it, and `length` **may be 0 for an empty value**. The index's fixed value length is the layout discriminator.
+- **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index. A group's packed size is capped at 4 GiB (`GroupTooLargeError` at pack time — reachable only by in-place growth; a `flag='n'` re-creation re-allocates every group).
 - **RCG entry schema v1**: frozen (see Remote Connection Groups above).
 
 **Integrity checking** — `ebooklet.fsck(remote_conn)` reports orphans (objects nothing references: abandoned generations from crashed pushes, failed GC leftovers), referenced-but-missing objects, and torn teardowns; `fsck(conn, delete_orphans=True)` sweeps aged orphans under the write lock (orphans are invisible to readers, so this is housekeeping, not repair).

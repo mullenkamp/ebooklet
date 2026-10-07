@@ -4,6 +4,99 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.11.0 (unreleased)
+
+**Write-order groups (storage format 3) replace hash grouping.** Under hash grouping
+(`blake2b(key) % num_groups`) an append scattered its new keys over nearly every group, and each
+touched group was repacked and re-uploaded whole: appending a year to a 35-year WRF dataset
+re-uploaded 10-28x the new data. Now the writer assigns groups at push time.
+
+- **`group_bytes` replaces `num_groups`.** Keys new to the remote are packed in local-file write
+  order into the last group (topped up, pulled first if not local) and then fresh groups, each up
+  to `group_bytes` (default `ebooklet.DEFAULT_GROUP_BYTES`, 32 MiB). Each key's group id is stored
+  in its remote-index entry (19 bytes; per-key entries stay 15). An append uploads the new data
+  plus at most the partly filled last group; an update repacks only its key's group.
+- **New databases are grouped by default.** Omitted, `group_bytes` inherits an existing remote's
+  mode (an explicit value for the other mode warns; under `flag='n'` it raises). Per-key storage is
+  `group_bytes=None`.
+- **A grouped remote records its `group_bytes`** (db-object metadata) as the value its last push
+  packed with. Writers that pass none inherit it, including a second machine or a fresh local file,
+  and `db.group_bytes` reports it to readers too. Passing another value packs new data to it from then
+  on, and the remote records the new value (no history). Existing groups keep their size. Per-key
+  metadata is unchanged.
+- **Lazy deletes.** A grouped delete only removes the key's index entry; no group is re-uploaded.
+  Dead bytes leave when their group is next repacked and stay downloadable until then; a group
+  with no live member is dropped. A reader holding an older index can still read a deleted key
+  until it pulls (it reads the snapshot its index describes).
+- **Formats.** Grouped remotes are stamped format 3; per-key remotes stay format 2, byte-identical,
+  readable by 0.10. Hash-grouped format-2 remotes (with `num_groups`) and format-1 remotes are
+  refused for r/w/c; flag 'n' may still replace them. The commit stamp follows the storage mode
+  (`SUPPORTED_FORMAT_VERSION`, now 3, is the reader cap only). Journals are written as v2 only for
+  grouped local files.
+- **`num_groups`**: for one release an explicit `num_groups=None` keeps its old meaning (per-key, as
+  cfdb-ingest's and ifs-download's archive writers pass it); an int raises `ValueError`.
+- **Keyword-only arguments.** `group_bytes` and every argument after it are keyword-only in
+  `open_ebooklet`, `open_rcg` and both classes. `group_bytes` sits where `num_groups` was, so a
+  positional 0.10 call (a group count) now raises `TypeError` instead of becoming a byte target.
+- **fsck** understands both formats; new report fields `empty_groups`, `dead_fraction` and
+  `bad_entry_layout`. `copy_remote` branches on the storage kind.
+
+**Commit-path fix (pre-existing).** The local file was stamped with the commit timestamp BEFORE the
+commit PUT, and an open whose stamp matched refreshed only the manifest. So a crash right after the
+commit left an old index beside a new manifest, and a writer whose lock was broken mid-push
+(another writer committed meanwhile) reopened believing it was in sync - its retry published an
+index WITHOUT the other writer's keys (reproduced on 0.10.5). Now the stamp is written last, after
+the committed state is applied locally, and an open or pull re-fetches the whole index whenever
+the cached remote state does not describe the remote's current commit. A grouped push also refuses
+to run over a stale index (an internal-error belt).
+
+**Republish fix (pre-existing).** A push that creates its remote (for example the republish of a
+hydrated local file after `delete_remote()`) could lose the values of groups that failed to upload,
+locally and remotely: those values were the only copy and unjournaled, and the next fresh index
+ingest reconciled them away as remotely deleted. Two routes reached it, both reproduced on 0.10.5:
+- a retry in the same session, because the session did not know its own commit had created the
+  remote and force-pulled it;
+- a crash after the commit, followed by a reopen.
+
+Now the session reloads the remote's metadata after every commit, and a push that creates the
+remote journals every key it carries before uploading. The commit clears exactly the committed ones.
+
+**Smaller fixes (pre-existing).**
+- `PushResult.updated` is now whether the commit happened. A push whose every upload failed, with
+  nothing else pending, reported `updated=True` although the remote was unchanged.
+- An open that downloads a newer commit's index now stamps the local file with it, as `pull()`
+  always did. Before, every later open saw the remote as newer and downloaded the whole db object
+  again, until a pull or a push caught the stamp up.
+- A reader with no remote to ask (offline, or the remote is gone) takes its mode from the index it
+  holds: `db.group_bytes` was the grouped default for a per-key cache. An explicit `group_bytes` for
+  the other mode warns and is ignored, as it is against a live remote.
+- **A push refuses a remote made from a different local file** (`UUIDMismatchError`), as the open
+  always has. A session that opened against an absent remote used to adopt one another local file
+  created meanwhile: it reconciled itself against that foreign index, possibly deleting values it
+  held the only copy of, and re-stamped the remote with its own uuid, locking out the writer that
+  created it. A replacement (`flag='n'`) still replaces whatever is there.
+- A pull or open whose reconciliation scan was skipped (aborted twice by concurrent writes) no longer
+  stamps the local file fresh, so the next one reconciles again.
+- A no-op push removes its changelog file.
+- An invalid recorded `group_bytes` is ignored with a warning (the default applies) instead of
+  failing every open.
+
+**Discard fix (pre-existing).** `del k; db[k] = v; changes().discard()` left the local index copy
+without `k` and nothing journaled, so the next unrelated push deleted `k` remotely (both modes).
+`discard()` now restores the index entry.
+
+**Tests.** The suite uses write-order constructions with explicit precondition asserts; a fixture
+made by ebooklet 0.10.5 (`tests/fixtures/make_legacy_0105.py`) covers the move of a hash-grouped
+remote. `test_generational.py`'s GC-failure test patched a method the GC never calls and passed
+vacuously; it now fails GC for real.
+
+### Upgrade recipe (hash-grouped remotes)
+
+Per remote, once: with `ebooklet<0.11` open it `'w'` and `load_items()` (the local file must hold
+every value - check the counts); `delete_remote()`; then push the local file again with 0.11 (same
+key, same uuid, metadata kept; or push to a new key). Per-key remotes need nothing. See
+`docs/ops.md`, "Moving a hash-grouped remote (0.10) to 0.11".
+
 ## 0.10.5 (2026-09-08)
 
 Stale-incarnation round. Found live on 2026-09-07: an ingest writer re-opened a local file whose

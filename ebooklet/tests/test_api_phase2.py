@@ -35,12 +35,13 @@ from ebooklet import (
 )
 from ebooklet.remote import S3Connection
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB
 
 
-def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=5):
+def _seed(store, db_key, tmp_path, name='seed.blt', items=None, group_bytes=TEST_GB):
     """Create + push a small db; returns the connection."""
     conn = fake_s3.FakeS3Connection(store, db_key)
-    with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
         assert eb.changes().push()
@@ -244,7 +245,7 @@ def test_pushresult_mapping(tmp_path):
     failure. Now: PushResult with explicit fields and safe truthiness."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb['k1'] = b'v1'
         result = eb.changes().push()
         assert isinstance(result, PushResult)

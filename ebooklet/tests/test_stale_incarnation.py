@@ -30,6 +30,7 @@ import ebooklet.utils as eb_utils
 from ebooklet import fsck, open_ebooklet, open_rcg
 from ebooklet.journal import JournalState, RemoteState
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB
 
 ITEMS = {'k1': b'v1', 'k2': b'v2', 'k3': b'v3'}
 
@@ -38,9 +39,9 @@ def _conn(store, db_key):
     return fake_s3.FakeS3Connection(store, db_key)
 
 
-def _seed(store, db_key, tmp_path, name='w.blt', items=None, num_groups=None, metadata=None):
+def _seed(store, db_key, tmp_path, name='w.blt', items=None, group_bytes=None, metadata=None):
     """Create + push a small db from `name`."""
-    with open_ebooklet(_conn(store, db_key), tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(_conn(store, db_key), tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or ITEMS).items():
             eb[k] = v
         if metadata is not None:
@@ -68,16 +69,6 @@ def _partial_cache(store, db_key, tmp_path, name='b.blt'):
         assert eb['k1'] == b'v1'
         assert sorted(eb._remote_index.keys()) == ['k1', 'k2', 'k3']
         assert eb._remote_state.remote_ts is not None
-
-
-def _key_for_group(gid, num_groups, taken=()):
-    """Find a short key that hashes into the wanted group id (test_delete_safety idiom)."""
-    i = 0
-    while True:
-        k = f'g{i}'
-        if eb_utils.key_to_group_id(k, num_groups) == gid and k not in taken:
-            return k
-        i += 1
 
 
 def _manifest(store, db_key):
@@ -141,27 +132,28 @@ def test_incident_partial_cache_reopen_pushes_no_ghosts(tmp_path, flag, caplog):
 def test_incident_grouped_manifest_carries_no_old_generation(tmp_path):
     """FAILS ON 0.10.4 through the OTHER cache: the slot-2 manifest still named the
     dead incarnation's generations and pre_push_manifest carried them into the commit."""
-    store, ng = {}, 5
-    a = _key_for_group(0, ng)
-    b = _key_for_group(1, ng)
-    c = _key_for_group(2, ng)
-    _seed(store, 'db2', tmp_path, items={a: b'a', b: b'b', c: b'c'}, num_groups=ng)
+    ## group_bytes=1: every key gets a group of its own (a fresh group always
+    ## takes one key), so a, b, c land in three groups.
+    store = {}
+    a, b, c, d = 'ga', 'gb', 'gc', 'gd'
+    _seed(store, 'db2', tmp_path, items={a: b'a', b: b'b', c: b'c'}, group_bytes=1)
     old_manifest = _manifest(store, 'db2')
-    assert len(old_manifest) == 3
+    assert len(old_manifest) == 3, 'precondition: one group per key'
 
     with _writer(store, 'db2', tmp_path, 'b.blt') as eb:
         assert eb[a] == b'a'                           # materialize ONE group's member
     _delete_remote(store, 'db2')
 
-    d = _key_for_group(0, ng, taken=(a, b, c))          # new key in a's group only
-    with _writer(store, 'db2', tmp_path, 'b.blt', num_groups=ng) as eb:
+    with _writer(store, 'db2', tmp_path, 'b.blt', group_bytes=1) as eb:
         assert eb._remote_state.manifest == {}
         eb[d] = b'd'
         assert eb.changes().push()
 
     new_manifest = _manifest(store, 'db2')
     assert not (set(new_manifest.items()) & set(old_manifest.items())), 'old generation carried forward'
-    assert set(new_manifest) == {0}, 'groups 1 and 2 have no local members and must not be manifested'
+    ## Only the two local keys (a materialized, d new) are re-pushed: two
+    ## groups. b's and c's groups have no local member and must not be manifested.
+    assert len(new_manifest) == 2
     for gid, gen in new_manifest.items():
         assert f'db2/{eb_utils.group_obj_key(gid, gen)}' in store
     with _reader(store, 'db2', tmp_path) as eb:
@@ -254,18 +246,18 @@ def test_rcg_flavor_after_delete(tmp_path):
 ### Guards that must NOT fire (these pass on 0.10.4 too - over-firing guards)
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_crashed_replacement_still_recovers_when_remote_deleted(tmp_path, num_groups):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_crashed_replacement_still_recovers_when_remote_deleted(tmp_path, group_bytes):
     """OVER-FIRING GUARD (passes on 0.10.4): a 'w' recovering an unpushed 'n' keeps its
     sidecar even when the remote was deleted in between - the replacement purge drops
     everything not written. test_journal.py::test_unpushed_replacement_survives_reopen
     is the non-deleted baseline; the grouped case is where a stale pre_push_manifest
     actually exists and must not reach the commit."""
     store = {}
-    _seed(store, 'db6', tmp_path, items={'old1': b'o1', 'old2': b'o2'}, num_groups=num_groups)
+    _seed(store, 'db6', tmp_path, items={'old1': b'o1', 'old2': b'o2'}, group_bytes=group_bytes)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(_conn(store, 'db6'), tmp_path / 'w.blt', flag='n', num_groups=num_groups) as eb:
+        with open_ebooklet(_conn(store, 'db6'), tmp_path / 'w.blt', flag='n', group_bytes=group_bytes) as eb:
             eb['new1'] = b'n1'                          # closes WITHOUT pushing
     _delete_remote(store, 'db6')
 
@@ -306,17 +298,17 @@ def test_reader_against_deleted_remote_unchanged(tmp_path):
 ### Misfire: a 404 while the remote is alive must cost one fetch, never data
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_spurious_404_round_trip(tmp_path, num_groups):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_spurious_404_round_trip(tmp_path, group_bytes):
     """FAILS ON THE FIX AS FIRST DRAFTED (no freshness-stamp reset): the file stayed
     stranded believing the remote's index was empty, and the next push silently
     truncated the remote to the locally-held keys."""
     store = {}
-    _seed(store, 'db8', tmp_path, num_groups=num_groups)
+    _seed(store, 'db8', tmp_path, group_bytes=group_bytes)
     _partial_cache(store, 'db8', tmp_path)
 
     with _spurious_404('db8'):
-        with _writer(store, 'db8', tmp_path, 'b.blt', num_groups=num_groups) as eb:
+        with _writer(store, 'db8', tmp_path, 'b.blt', group_bytes=group_bytes) as eb:
             assert list(eb._remote_index.keys()) == []      # it did forget...
     assert 'db8' in store                                    # ...but nothing was gone
 
@@ -332,19 +324,19 @@ def test_spurious_404_round_trip(tmp_path, num_groups):
     assert rep.orphans == [], rep.orphans
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_deletion_intent_survives_a_misfire(tmp_path, num_groups):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_deletion_intent_survives_a_misfire(tmp_path, group_bytes):
     """FAILS ON THE FIX AS FIRST DRAFTED (journaled deletes cleared): the pending
     deletion was cancelled and the key came back on the next open."""
     store = {}
-    _seed(store, 'db9', tmp_path, num_groups=num_groups)
+    _seed(store, 'db9', tmp_path, group_bytes=group_bytes)
     with _writer(store, 'db9', tmp_path, 'b.blt') as eb:
         assert eb['k1'] == b'v1'
         del eb['k2']                                         # journaled, not pushed
         assert eb._journal.deletes == {'k2'}
 
     with _spurious_404('db9'):
-        with _writer(store, 'db9', tmp_path, 'b.blt', num_groups=num_groups) as eb:
+        with _writer(store, 'db9', tmp_path, 'b.blt', group_bytes=group_bytes) as eb:
             assert eb._journal.deletes == {'k2'}
 
     with _writer(store, 'db9', tmp_path, 'b.blt') as eb:
@@ -456,17 +448,17 @@ def test_remote_index_sidecar_path():
 ### Code-review round: the watermark, the pre-push re-check, quietness
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_remote_deletion_during_misfire_window_is_reconciled(tmp_path, num_groups):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_remote_deletion_during_misfire_window_is_reconciled(tmp_path, group_bytes):
     """FAILS if forget drops remote_ts: the healing re-fetch then skips reconciliation
     (prev_synced_ts None), a key deleted remotely during the window is served locally
     and RE-PUSHED (resurrection). Both code-review arms found this."""
     store = {}
-    _seed(store, 'db13', tmp_path, num_groups=num_groups)
+    _seed(store, 'db13', tmp_path, group_bytes=group_bytes)
     with _writer(store, 'db13', tmp_path, 'b.blt') as eb:
         assert eb['k1'] == b'v1' and eb['k2'] == b'v2'          # both materialized
     with _spurious_404('db13'):
-        with _writer(store, 'db13', tmp_path, 'b.blt', num_groups=num_groups) as eb:
+        with _writer(store, 'db13', tmp_path, 'b.blt', group_bytes=group_bytes) as eb:
             assert list(eb._remote_index.keys()) == []
     with _writer(store, 'db13', tmp_path, 'w.blt') as owner:      # another client deletes k1
         del owner['k1']
@@ -483,20 +475,20 @@ def test_remote_deletion_during_misfire_window_is_reconciled(tmp_path, num_group
     _fsck_clean(store, 'db13')
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_second_writer_in_deletion_window_does_not_resurrect(tmp_path, num_groups):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_second_writer_in_deletion_window_does_not_resurrect(tmp_path, group_bytes):
     """The same resurrection through the change's OWN headline scenario, no 404 anomaly:
     delete_remote(); a second writer opens in the window (forgets); the OWNER rebuilds
     from its own local file WITHOUT k2 (same uuid - a rebuild from a different local file
     is refused by UUIDMismatchError, by design); the second writer opens again and pushes."""
     store = {}
-    _seed(store, 'db14', tmp_path, num_groups=num_groups)
+    _seed(store, 'db14', tmp_path, group_bytes=group_bytes)
     with _writer(store, 'db14', tmp_path, 'b.blt') as eb:
         assert eb['k1'] == b'v1' and eb['k2'] == b'v2' and eb['k3'] == b'v3'
     _delete_remote(store, 'db14')
-    with _writer(store, 'db14', tmp_path, 'b.blt', num_groups=num_groups) as eb:   # in the window
+    with _writer(store, 'db14', tmp_path, 'b.blt', group_bytes=group_bytes) as eb:   # in the window
         assert list(eb._remote_index.keys()) == []
-    with _writer(store, 'db14', tmp_path, 'w.blt', num_groups=num_groups) as owner:  # the seed file
+    with _writer(store, 'db14', tmp_path, 'w.blt', group_bytes=group_bytes) as owner:  # the seed file
         del owner['k2']                                                # k2 deliberately dropped
         assert owner.changes().push()
     with _writer(store, 'db14', tmp_path, 'b.blt') as eb:
@@ -509,13 +501,13 @@ def test_second_writer_in_deletion_window_does_not_resurrect(tmp_path, num_group
     _fsck_clean(store, 'db14')
 
 
-@pytest.mark.parametrize('num_groups', [None, 5])
-def test_misfired_session_push_adopts_the_live_remote(tmp_path, num_groups, caplog):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_misfired_session_push_adopts_the_live_remote(tmp_path, group_bytes, caplog):
     """FAILS without the pre-push re-check: a session whose open saw a TRANSIENT 404 and
     which then pushes replaced the live remote's index with its own keys only (k1 + k9),
     orphaning everything else while fsck called the result healthy (Opus, code review)."""
     store = {}
-    _seed(store, 'db15', tmp_path, items={f'k{i}': f'v{i}'.encode() for i in range(1, 6)}, num_groups=num_groups)
+    _seed(store, 'db15', tmp_path, items={f'k{i}': f'v{i}'.encode() for i in range(1, 6)}, group_bytes=group_bytes)
     with _writer(store, 'db15', tmp_path, 'b.blt') as eb:
         assert eb['k1'] == b'v1'
     orig = fake_s3.FakeS3Session.head_object
@@ -525,7 +517,7 @@ def test_misfired_session_push_adopts_the_live_remote(tmp_path, num_groups, capl
     patch = mock.patch.object(fake_s3.FakeS3Session, 'head_object', new=fake)
     patch.start()
     try:
-        eb = _writer(store, 'db15', tmp_path, 'b.blt', num_groups=num_groups)
+        eb = _writer(store, 'db15', tmp_path, 'b.blt', group_bytes=group_bytes)
         assert list(eb._remote_index.keys()) == []                 # it forgot
     finally:
         patch.stop()                                                # the 404 was transient
@@ -567,8 +559,9 @@ def test_session_delete_remote_resets_every_metadata_field(tmp_path):
     s = fake_s3.FakeS3Connection(store, 'db17').open('w')
     assert s.initialized and s.timestamp is not None and s.format_version is not None
     s.delete_remote()
-    assert (s._init_bytes, s.uuid, s.timestamp, s.type, s.num_groups, s.format_version) == (None,) * 6
+    assert (s._init_bytes, s.uuid, s.timestamp, s.type, s.legacy_num_groups, s.format_version) == (None,) * 6
     assert s.initialized is False
+    assert s.storage_kind is None
 
 
 def test_delete_remote_is_refused_while_a_push_is_running(tmp_path):

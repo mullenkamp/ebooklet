@@ -4,7 +4,7 @@
 Persistent pending-change journal (Seam 2 of the architecture assessment).
 
 The journal records this local file's unpushed state - written keys, pending
-deletes, the num_groups choice, a pending remote replacement, and pending
+deletes, the storage-mode choice, a pending remote replacement, and pending
 metadata - in booklet reserved slot 1, so it survives session close (and most
 crashes) instead of dying with the process. Before the journal, deletes were
 memory-only (silently lost at close) and clock-skewed local edits never
@@ -25,7 +25,16 @@ import msgspec
 JOURNAL_SLOT = 1
 REMOTE_STATE_SLOT = 2   # manifest + remote user-metadata cache (storage format 2)
 
-JOURNAL_VERSION = 1
+## The highest journal version this ebooklet reads. Version 2 (0.11) is written
+## ONLY for grouped files - a per-key file's journal stays version 1, so an
+## older ebooklet (0.10.x, e.g. another venv sharing a cache directory) can
+## still open it. A grouped local file is useless to 0.10 anyway (its remote is
+## format 3), and the version-2 stamp makes 0.10 refuse it loudly.
+JOURNAL_VERSION = 2
+_V1 = 1
+
+STORAGE_PER_KEY = 'per_key'
+STORAGE_GROUPED = 'grouped'
 
 
 class JournalRecord(msgspec.Struct):
@@ -35,15 +44,19 @@ class JournalRecord(msgspec.Struct):
     ebooklet version); a `v` beyond JOURNAL_VERSION refuses loudly instead of
     default-parsing state it cannot understand.
     """
-    v: int = JOURNAL_VERSION
+    v: int = _V1
     written: list = []
     deletes: list = []
+    ## Pre-0.11 storage record, kept with its old types so 0.10 can still
+    ## decode a v1 blob. Tri-state via the bool: num_groups=None +
+    ## num_groups_set=True means per-key was CHOSEN; num_groups_set=False means
+    ## never recorded; an int was a hash grouping (legacy).
     num_groups: int | None = None
-    ## Tri-state via the bool: num_groups=None + num_groups_set=True means
-    ## per-key storage was CHOSEN; num_groups_set=False means never recorded.
     num_groups_set: bool = False
     replace_pending: bool = False
     meta_pending: bool = False
+    ## 0.11: 'per_key' | 'grouped' | None (unrecorded).
+    storage: str | None = None
 
 
 class JournalState:
@@ -60,7 +73,7 @@ class JournalState:
     persistence from invalidating live iterators when nothing changed).
     """
 
-    __slots__ = ('written', 'deletes', 'num_groups', 'num_groups_set',
+    __slots__ = ('written', 'deletes', 'storage',
                  'replace_pending', 'meta_pending', '_dirty')
 
     def __init__(self, record: JournalRecord = None):
@@ -68,8 +81,14 @@ class JournalState:
             record = JournalRecord()
         self.written = set(record.written)
         self.deletes = set(record.deletes)
-        self.num_groups = record.num_groups
-        self.num_groups_set = record.num_groups_set
+        if record.storage is not None:
+            self.storage = record.storage
+        elif record.num_groups_set:
+            ## A pre-0.11 hash num_groups was a grouped choice: it republishes
+            ## as write-order groups.
+            self.storage = STORAGE_PER_KEY if record.num_groups is None else STORAGE_GROUPED
+        else:
+            self.storage = None
         self.replace_pending = record.replace_pending
         self.meta_pending = record.meta_pending
         ## Belt for the invariant on load - the mutation methods keep the sets
@@ -105,14 +124,19 @@ class JournalState:
         """
         if not (self._dirty or force):
             return
+        grouped = self.storage == STORAGE_GROUPED
         record = JournalRecord(
-            v=JOURNAL_VERSION,
+            v=JOURNAL_VERSION if grouped else _V1,
             written=sorted(self.written),
             deletes=sorted(self.deletes),
-            num_groups=self.num_groups,
-            num_groups_set=self.num_groups_set,
+            ## The v1 fields a 0.10 reader understands: per-key is
+            ## num_groups=None + num_groups_set=True. (An unrecorded mode is
+            ## written as unrecorded.)
+            num_groups=None,
+            num_groups_set=self.storage == STORAGE_PER_KEY,
             replace_pending=self.replace_pending,
             meta_pending=self.meta_pending,
+            storage=self.storage,
             )
         local_file.set_reserved(JOURNAL_SLOT, msgspec.json.encode(record))
         self._dirty = False
@@ -154,10 +178,9 @@ class JournalState:
             self.written.clear()
             self._dirty = True
 
-    def set_num_groups(self, num_groups):
-        if not self.num_groups_set or self.num_groups != num_groups:
-            self.num_groups = num_groups
-            self.num_groups_set = True
+    def set_storage(self, storage):
+        if self.storage != storage:
+            self.storage = storage
             self._dirty = True
 
     def set_replace_pending(self, value: bool):

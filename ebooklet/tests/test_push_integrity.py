@@ -5,7 +5,7 @@ Regression tests for the two push-integrity fixes (v0.8.4):
    members not materialized in the writer's local file must be pulled down first,
    never silently dropped (which corrupted group-mates: wrong-value reads,
    InvalidRange errors, dangling index entries).
-2. Remote session metadata (uuid/timestamp/init_bytes/num_groups) must be re-read
+2. Remote session metadata (uuid/timestamp/init_bytes/format) must be re-read
    after the write lock is acquired, so a writer whose session was created before
    the remote existed does not skip the index pull and clobber another writer
    (bootstrap race). Relatedly, pushing a brand-new EMPTY database must still
@@ -30,7 +30,8 @@ except ImportError:
     import tomli as toml
 
 from ebooklet import open_ebooklet, open_rcg, remote, RemoteConnGroup
-from ebooklet.utils import key_to_group_id, pack_group
+from ebooklet.utils import pack_group
+from ebooklet.tests.groups import gid_of
 
 #################################################
 ### Parameters
@@ -50,7 +51,12 @@ except:
     access_key = os.environ['access_key']
 
 bucket = 'achelous'
-num_groups = 5  # prime, so no rounding; small enough to force group collisions
+## The seed packing target. With colliding_keys' names and the tests' ~8-byte
+## values a 'key00N' entry packs to 27 bytes and the long control key's to 58:
+## seeded in the order c1, k1, k2 the control fills group 0 alone (4+58+27 > 85)
+## and k1, k2 share the TAIL group, which a later k3 tops up exactly (4+3*27 = 85).
+## Tests assert the layout they rely on (gids) - placement is allocation, not hashing.
+group_bytes = 85
 
 _conns = []
 _paths = []
@@ -76,23 +82,21 @@ def local_path(name):
 
 
 def colliding_keys(n_same=3):
-    """Return n_same keys hashing to one group plus one control key in another group."""
-    same, control = [], None
-    i = 0
-    while len(same) < n_same or control is None:
-        k = f'key{i:03d}'
-        gid = key_to_group_id(k, num_groups)
-        if len(same) < n_same and (not same or gid == key_to_group_id(same[0], num_groups)):
-            same.append(k)
-        elif control is None and same and gid != key_to_group_id(same[0], num_groups):
-            control = k
-        i += 1
-    return same, control
+    """n_same short keys plus one long control key. Seeded control-first at
+    group_bytes, the short keys share the tail group and the control sits in an
+    earlier one (see group_bytes); each test asserts the layout via remote_gids."""
+    return [f'key{i:03d}' for i in range(n_same)], 'ctl-' + 'x' * 33
+
+
+def remote_gids(conn):
+    """{key: gid} from a fresh reader of the committed index."""
+    with open_ebooklet(conn, local_path('gids'), flag='r') as eb:
+        return {k: gid_of(eb, k) for k in eb.keys()}
 
 
 def seed_remote(conn, keys_values):
     p = local_path('seed')
-    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, p, flag='n', group_bytes=group_bytes) as eb:
         for k, v in keys_values.items():
             eb[k] = v
         assert eb.changes().push()
@@ -149,7 +153,9 @@ def cleanup(request):
 def test_grouped_push_preserves_unmaterialized_members():
     (k1, k2, k3), c1 = colliding_keys()
     conn = make_conn('clobber')
-    seed_remote(conn, {k1: b'value-K1', k2: b'value-K2', c1: b'value-C1'})
+    seed_remote(conn, {c1: b'value-C1', k1: b'value-K1', k2: b'value-K2'})
+    g = remote_gids(conn)
+    assert g[k1] == g[k2] != g[c1] and g[k1] == max(g.values()), 'precondition: k1/k2 are the tail'
 
     ## Fresh local file: only k3 is materialized locally; its group-mates k1/k2 must
     ## be pulled and repacked, not dropped.
@@ -160,6 +166,7 @@ def test_grouped_push_preserves_unmaterialized_members():
     values, stored_keys = read_all(conn, [k1, k2, k3, c1])
     assert values == {k1: b'value-K1', k2: b'value-K2', k3: b'value-K3', c1: b'value-C1'}
     assert stored_keys == sorted([k1, k2, k3, c1])
+    assert remote_gids(conn)[k3] == g[k1], 'k3 did not top up the tail group'
 
 
 def test_grouped_delete_from_fresh_copy():
@@ -179,7 +186,10 @@ def test_grouped_delete_from_fresh_copy():
 def test_grouped_delete_all_members():
     (k1, k2, _), c1 = colliding_keys()
     conn = make_conn('delete-all')
-    seed_remote(conn, {k1: b'value-K1', k2: b'value-K2', c1: b'value-C1'})
+    seed_remote(conn, {c1: b'value-C1', k1: b'value-K1', k2: b'value-K2'})
+    g = remote_gids(conn)
+    assert g[k1] == g[k2] != g[c1], 'precondition'
+    gid = g[k1]
 
     with open_ebooklet(conn, local_path('deleter2'), flag='w') as eb:
         del eb[k1]
@@ -191,7 +201,6 @@ def test_grouped_delete_all_members():
     assert stored_keys == [c1]
 
     ## The emptied group's object must be gone from the remote.
-    gid = key_to_group_id(k1, num_groups)
     with conn.open('w') as s:
         object_keys = [o['key'] for o in s.list_objects().iter_objects()]
     assert not any(k.startswith(f'{conn.db_key}/{gid}.') for k in object_keys)
@@ -241,7 +250,7 @@ def test_bootstrap_race_second_writer_preserves_first():
 
 def test_empty_push_materializes_remote():
     conn = make_conn('empty-eb')
-    with open_ebooklet(conn, local_path('empty-writer'), flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, local_path('empty-writer'), flag='n', group_bytes=group_bytes) as eb:
         assert eb.changes().push()
 
     ## Pre-fix this raised: 'No file was found in the remote...'
@@ -270,8 +279,10 @@ def test_corrupted_group_object_recovery():
     ## lost and dropped from the index, k3 written.
     (k1, k2, k3), c1 = colliding_keys()
     conn = make_conn('corrupt')
-    seed_remote(conn, {k1: b'value-K1', k2: b'value-K2', c1: b'value-C1'})
-    gid = key_to_group_id(k1, num_groups)
+    seed_remote(conn, {c1: b'value-C1', k1: b'value-K1', k2: b'value-K2'})
+    g = remote_gids(conn)
+    assert g[k1] == g[k2] != g[c1] and g[k1] == max(g.values()), 'precondition: k1/k2 are the tail'
+    gid = g[k1]
 
     with open_ebooklet(conn, local_path('corrupt-ts'), flag='r') as eb:
         k2_ts = eb.get_timestamp(k2)
@@ -299,17 +310,20 @@ def test_corrupted_group_object_recovery():
 
 
 def test_deletes_retained_when_group_pull_fails():
-    ## Fault-injection regression for the deletes-retention fix (adapted from a
-    ## Gemini review-round experiment): if repacking a group fails because its
+    ## Fault-injection regression for the retention fix (adapted from a Gemini
+    ## review-round experiment): if repacking a group fails because its
     ## unmaterialized members cannot be pulled, the push must (a) report the
     ## failure, (b) leave the remote group object untouched, and (c) KEEP the
-    ## group's deletes in _deletes so a retry push repacks the group.
+    ## pending change journaled so a retry push repacks the group. (0.11: the
+    ## change is an UPDATE - deletes are lazy and repack nothing.)
     (k1, k2, _), _ = colliding_keys()
     conn = make_conn('delete-fail')
     seed_remote(conn, {k1: b'v1', k2: b'v2'})
+    g = remote_gids(conn)
+    assert g[k1] == g[k2], 'precondition: one group'
 
     with open_ebooklet(conn, local_path('deleter'), flag='w') as eb:
-        del eb[k1]  # k2 is not materialized locally -> push must pull it to repack
+        eb[k1] = b'v1-new'  # k2 is not materialized locally -> push must pull it to repack
 
         original_get = eb._remote_session.get_object
 
@@ -324,29 +338,29 @@ def test_deletes_retained_when_group_pull_fails():
         eb._remote_session.get_object = original_get
 
         assert result.failures                       # push reported the failure
-        assert k1 in eb._journal.deletes             # retry signal retained
+        assert k1 in eb._journal.written             # retry signal retained
 
-        assert eb.changes().push()           # retry completes the delete
+        assert eb.changes().push()           # retry completes the update
 
     values, stored_keys = read_all(conn, [k1, k2])
-    assert values == {k1: None, k2: b'v2'}
-    assert stored_keys == [k2]
+    assert values == {k1: b'v1-new', k2: b'v2'}
+    assert stored_keys == [k1, k2]
 
 
 #################################################
 ### 0.9.0 items: 'n' guard + writes-only, pull() repair, prune contract
 
 
-def test_flag_n_num_groups_guard_and_lock_release():
+def test_flag_n_storage_mode_guard_and_lock_release():
     conn = make_conn('nguard')
-    seed_remote(conn, {'k': b'v'})  # grouped remote, num_groups=5
+    seed_remote(conn, {'k': b'v'})  # grouped remote
 
-    with pytest.raises(ValueError, match='conflicts with the existing'):
-        open_ebooklet(conn, local_path('nguard-a'), flag='n', num_groups=7)
+    with pytest.raises(ValueError, match='storage mode'):
+        open_ebooklet(conn, local_path('nguard-a'), flag='n', group_bytes=None)
 
     ## The rejected open must have released the lock: an immediate open succeeds.
-    with open_ebooklet(conn, local_path('nguard-b'), flag='n', num_groups=num_groups, lock_timeout=15) as eb:
-        assert eb._num_groups == num_groups
+    with open_ebooklet(conn, local_path('nguard-b'), flag='n', group_bytes=group_bytes, lock_timeout=15) as eb:
+        assert eb.group_bytes == group_bytes
 
 
 def test_lock_released_on_uuid_mismatch():
@@ -375,7 +389,7 @@ def test_flag_n_writes_only_push():
     conn = make_conn('nwrites')
     seed_remote(conn, {'old1': b'old-1', 'old2': b'old-2'})
 
-    with open_ebooklet(conn, local_path('nwrites-w'), flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, local_path('nwrites-w'), flag='n', group_bytes=group_bytes) as eb:
         assert eb.get('old1') == b'old-1'  # transparent read still works pre-push
         eb['new1'] = b'new-1'
         assert eb.changes().push()
@@ -391,7 +405,7 @@ def test_pull_stranded_reader():
     ## caches uuid=None; pull() must reload full metadata and refresh the index.
     conn = make_conn('stranded')
     producer_path = local_path('stranded-producer')
-    with open_ebooklet(conn, producer_path, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, producer_path, flag='n', group_bytes=group_bytes) as eb:
         eb['k1'] = b'v1'
 
     reader_path = local_path('stranded-reader')
@@ -400,7 +414,7 @@ def test_pull_stranded_reader():
     reader = open_ebooklet(conn, reader_path, flag='r')
     assert reader._remote_session.uuid is None
 
-    with open_ebooklet(conn, producer_path, flag='w', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, producer_path, flag='w', group_bytes=group_bytes) as eb:
         eb['k2'] = b'v2'
         assert eb.changes().push()
 
@@ -481,12 +495,10 @@ def test_prune_local_eviction_contract():
 
 
 #################################################
-### num_groups on unpushed reopens (0.9.1)
-# Nothing local records the creation-time num_groups choice (deliberate: no extra
-# sidecar files). Reopening a created-but-not-yet-pushed database without
-# re-passing num_groups warns loudly - the first push would go per-key.
-
-WARN_MATCH = 'has not been pushed to the remote yet and num_groups was not provided'
+### Storage mode on unpushed reopens (journal-recorded since 0.10)
+# The journal records the storage mode chosen at creation, so a bare reopen of a
+# created-but-not-yet-pushed database keeps it (0.11: the target byte size is a
+# writer setting - omitted, a grouped database reopens at DEFAULT_GROUP_BYTES).
 
 
 def _remote_basenames(conn):
@@ -494,51 +506,47 @@ def _remote_basenames(conn):
         return sorted(obj['key'].split('/')[-1] for obj in s3open.list_objects().iter_objects())
 
 
-def test_num_groups_unpushed_reopen_reads_journal():
-    """0.10: the journal records the creation grouping, so a bare 'w' reopen
-    before the first push resolves it WITHOUT the kwarg and without the old
-    per-key-fallback warning. (The reopen warns about the pending REPLACEMENT
-    instead - the 'n' session never pushed.)"""
+def test_storage_mode_unpushed_reopen_reads_journal():
+    """A bare 'w' reopen before the first push resolves the grouped mode from
+    the journal. (The reopen warns about the pending REPLACEMENT - the 'n'
+    session never pushed.)"""
     conn = make_conn('ngwarn')
     p = local_path('ng-warn-writer')
 
     with warnings.catch_warnings():
         warnings.simplefilter('error')  # fresh create: no warning expected
-        with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+        with open_ebooklet(conn, p, flag='n', group_bytes=group_bytes) as eb:
             eb['key000'] = b'v0'
             # close WITHOUT pushing
 
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter('always')
         with open_ebooklet(conn, p, flag='w') as eb:
-            assert eb._num_groups == num_groups  # journaled choice, not per-key fallback
-    assert not [w for w in records if WARN_MATCH in str(w.message)], \
-        'journaled num_groups should silence the per-key-fallback warning'
+            assert eb.group_bytes is not None  # journaled grouped mode
     assert [w for w in records if 'REPLACEMENT' in str(w.message)], \
         'unpushed replacement reopen should warn'
 
-    # re-passing the SAME num_groups also works - still only the REPLACEMENT warning
-    with warnings.catch_warnings(record=True) as records:
-        warnings.simplefilter('always')
-        with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
-            assert eb._num_groups == num_groups
-    assert not [w for w in records if WARN_MATCH in str(w.message)]
+    # re-passing a byte target also works
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with open_ebooklet(conn, p, flag='w', group_bytes=group_bytes) as eb:
+            assert eb.group_bytes == group_bytes
 
 
-def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
+def test_storage_mode_kept_and_pushed_remote_reopens_silently():
     """The first-push reopen keeps the grouped layout (journal-recorded);
-    once pushed, bare reopens read num_groups from remote metadata, silently."""
+    once pushed, bare reopens read the mode from the remote, silently."""
     conn = make_conn('ngrepass')
     p = local_path('ng-repass-writer')
 
-    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, p, flag='n', group_bytes=group_bytes) as eb:
         eb['key000'] = b'v0'
         eb['key001'] = b'v1'
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')  # pending-REPLACEMENT warning expected here
-        with open_ebooklet(conn, p, flag='w', num_groups=num_groups) as eb:
-            assert eb._num_groups == num_groups
+        with open_ebooklet(conn, p, flag='w', group_bytes=group_bytes) as eb:
+            assert eb.group_bytes == group_bytes
             assert eb.changes().push()
 
     names = _remote_basenames(conn)
@@ -552,22 +560,21 @@ def test_num_groups_repass_keeps_grouping_and_pushed_remote_never_warns():
     with warnings.catch_warnings():
         warnings.simplefilter('error')
         with open_ebooklet(conn, p, flag='w') as eb:
-            assert eb._num_groups == num_groups
+            assert eb.group_bytes is not None
 
 
-def test_num_groups_unpushed_reopen_journal_rcg():
+def test_storage_mode_unpushed_reopen_journal_rcg():
     """RemoteConnGroup flows through the same _init_common - same journal
-    resolution (no per-key-fallback warning; REPLACEMENT warning instead)."""
+    resolution (REPLACEMENT warning on the unpushed reopen)."""
     conn = make_conn('ngwarnrcg')
     p = local_path('ng-warn-rcg')
-    with open_rcg(conn, p, flag='n', num_groups=num_groups) as rcg:
+    with open_rcg(conn, p, flag='n', group_bytes=group_bytes) as rcg:
         pass
 
     with warnings.catch_warnings(record=True) as records:
         warnings.simplefilter('always')
         with open_rcg(conn, p, flag='w') as rcg:
-            assert rcg._num_groups == num_groups
-    assert not [w for w in records if WARN_MATCH in str(w.message)]
+            assert rcg.group_bytes is not None
     assert [w for w in records if 'REPLACEMENT' in str(w.message)]
 
 
@@ -582,11 +589,11 @@ def test_flag_n_second_push_preserves_remote():
     ## loudly after). The replacement intent must clear after the replacement
     ## push so the wipe happens exactly once (journal-backed since 0.10; _flag
     ## itself stays frozen).
-    (k1, k2, k3), c1 = colliding_keys()   # k* share one group; c1 in another
+    (k1, k2, k3), c1 = colliding_keys()
     conn = make_conn('nwipe')
 
     p = local_path('nwipe-writer')
-    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, p, flag='n', group_bytes=group_bytes) as eb:
         eb[k1] = b'v1'
         eb[c1] = b'vc'
         eb.set_metadata({'m': 1})
@@ -594,7 +601,7 @@ def test_flag_n_second_push_preserves_remote():
         assert eb._flag == 'n'                              # frozen - no longer mutated
         assert eb._journal.replace_pending is False         # intent cleared: no further wipes
 
-        eb[k2] = b'v2'                         # touches only k1's group
+        eb[k2] = b'v2'                         # a second push in the same session
         assert eb.changes().push()     # second push must NOT wipe c1's group
 
     values, stored_keys = read_all(conn, [k1, k2, c1])

@@ -16,15 +16,16 @@ import pytest
 
 import msgspec
 
-from ebooklet import open_ebooklet, utils
+from ebooklet import open_ebooklet, open_rcg, utils, DEFAULT_GROUP_BYTES
 from ebooklet.journal import JournalRecord, JOURNAL_SLOT
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB, gid_of
 
 
-def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=5):
+def _seed(store, db_key, tmp_path, name='seed.blt', items=None, group_bytes=TEST_GB):
     """Create + push a small db; returns the connection."""
     conn = fake_s3.FakeS3Connection(store, db_key)
-    with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
         assert eb.changes().push()
@@ -99,7 +100,7 @@ def test_unpushed_replacement_survives_reopen(tmp_path):
     ## Replacement session: writes one key, closes WITHOUT pushing.
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
             eb['new1'] = b'n1'
 
     ## 'w' reopen must carry the replacement intent...
@@ -182,33 +183,25 @@ def test_partial_failure_retains_failed_groups_only(tmp_path):
     """A failed group PUT retains that group's journal entries; committed
     groups clear. The retry converges."""
     store = {}
-    num_groups = 13
-    ## Find keys in two different groups.
-    def key_for_group(gid, taken=()):
-        i = 0
-        while True:
-            k = f'k{i}'
-            if utils.key_to_group_id(k, num_groups) == gid and k not in taken:
-                return k
-            i += 1
-    k_a = key_for_group(1)
-    k_b = key_for_group(2)
+    k_a, k_b = 'ka', 'kb'
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=num_groups) as eb:
+    ## group_bytes=1: one key per group.
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=1) as eb:
         eb[k_a] = b'a1'
         eb[k_b] = b'b1'
         assert eb.changes().push()
 
-    eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
+    eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w', group_bytes=1)
     try:
+        gid_a = gid_of(eb, k_a)
+        assert gid_a is not None and gid_a != gid_of(eb, k_b), 'precondition: separate groups'
         eb[k_a] = b'a2'
         eb[k_b] = b'b2'
 
-        ## Fail the PUT of group 1's object exactly once.
+        ## Fail the PUT of group A's object exactly once.
         session = eb._remote_session._write_session
         orig_put = session.put_object
-        gid_a = utils.key_to_group_id(k_a, num_groups)
         def failing_put(key, data, metadata=None):
             if key.startswith(f'testdb/{gid_a}.'):   # any generation of group A
                 return fake_s3.FakeResp(status=500, error={'message': 'induced failure'})
@@ -348,43 +341,179 @@ def test_dropped_journal_entry_warns(tmp_path):
         eb.close()
 
 
-def test_num_groups_tristate_reopen(tmp_path):
-    """The journal records the num_groups choice: a created-but-unpushed db
-    reopens WITHOUT the kwarg, warning-free, and the first push is grouped."""
+def test_storage_mode_recorded_for_an_unpushed_db(tmp_path):
+    """The journal records the storage mode: a created-but-unpushed PER-KEY
+    db reopens WITHOUT the kwarg and its first push is still per-key (the
+    recorded choice beats the 0.11 grouped default)."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=None) as eb:
             eb['k1'] = b'v1'
             # close without pushing
 
-    with warnings.catch_warnings(record=True) as records:
-        warnings.simplefilter('always')
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')   # the pending-REPLACEMENT reopen warning
         eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
-    assert not [w for w in records if 'per-key storage' in str(w.message)], \
-        'journaled num_groups did not silence the reopen warning'
     try:
+        assert eb.group_bytes is None
         assert eb.changes().push()
     finally:
         eb.close()
+    assert 'testdb/k1' in store, 'first push was not per-key'
+    assert store['testdb'][1]['format_version'] == '2'
 
-    assert any(k.startswith('testdb/') and k.split('/')[1].split('.')[0].isdigit() for k in store), \
-        'first push was not grouped'
+
+def test_new_db_defaults_to_grouped(tmp_path):
+    """0.11: omitting group_bytes for a NEW database means grouped storage at
+    DEFAULT_GROUP_BYTES (per-key needs an explicit None)."""
+    store = {}
+    conn = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n') as eb:
+        assert eb.group_bytes == DEFAULT_GROUP_BYTES
+        eb['k1'] = b'v1'
+        assert eb.changes().push()
+    assert store['testdb'][1]['format_version'] == '3'
+    assert 'testdb/k1' not in store
 
 
-def test_num_groups_kwarg_conflict_raises(tmp_path):
+def test_explicit_mode_wins_for_an_absent_remote(tmp_path):
+    """With no remote to decide, an explicit group_bytes overrides the
+    journal's recorded mode (and is recorded in its place)."""
     store = {}
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
             eb['k1'] = b'v1'
 
     with warnings.catch_warnings():
-        warnings.simplefilter('ignore')   # the pending-REPLACEMENT reopen warning
-        with pytest.raises(ValueError, match='conflicts with this local file'):
-            open_ebooklet(conn, tmp_path / 'w.blt', flag='w', num_groups=11)
+        warnings.simplefilter('ignore')
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='w', group_bytes=None) as eb:
+            assert eb.group_bytes is None
+            assert eb._journal.storage == 'per_key'
+            assert eb.changes().push()
+    assert 'testdb/k1' in store
+
+
+def test_remote_mode_wins_over_an_explicit_kwarg(tmp_path):
+    """An existing remote decides the mode; a conflicting explicit kwarg is
+    ignored with a warning (flag 'w'), or refused (flag 'n')."""
+    store = {}
+    conn = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
+        eb['k1'] = b'v1'
+        assert eb.changes().push()
+
+    with pytest.warns(UserWarning, match='the remote wins'):
+        eb = open_ebooklet(conn, tmp_path / 'w2.blt', flag='w', group_bytes=None)
+    try:
+        assert eb.group_bytes == TEST_GB, 'the remote wins with the value it records'
+    finally:
+        eb.close()
+    ## A different byte target in the same (grouped) mode is not a conflict.
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        with open_ebooklet(conn, tmp_path / 'w3.blt', flag='w', group_bytes=1000) as eb:
+            assert eb.group_bytes == 1000
+    with pytest.raises(ValueError, match='storage mode'):
+        open_ebooklet(conn, tmp_path / 'n.blt', flag='n', group_bytes=None)
+
+
+def test_num_groups_shim(tmp_path):
+    """An explicit num_groups=None keeps its pre-0.11 meaning - per-key - so
+    callers that pass it (cfdb-ingest's and ifs-download's archive writers)
+    keep their layout instead of silently becoming grouped; an int is refused,
+    naming group_bytes; passing both is refused."""
+    store = {}
+    conn = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=None) as eb:
+        assert eb.group_bytes is None
+        eb['k'] = b'v'
+        assert eb.changes().push()
+    assert store['testdb'][1]['format_version'] == '2' and 'testdb/k' in store
+    with pytest.raises(ValueError, match='group_bytes'):
+        open_ebooklet(conn, tmp_path / 'x.blt', flag='n', num_groups=5)
+    with pytest.raises(ValueError, match='group_bytes'):
+        open_rcg(conn, tmp_path / 'y.blt', flag='n', num_groups=5)
+    with pytest.raises(ValueError, match='group_bytes only'):
+        open_ebooklet(conn, tmp_path / 'z.blt', flag='n', num_groups=None, group_bytes=TEST_GB)
+
+
+def test_group_bytes_is_keyword_only(tmp_path):
+    """group_bytes sits where 0.10's num_groups was: a positional 0.10 call
+    (a group COUNT) must fail loudly, not become a byte target."""
+    conn = fake_s3.FakeS3Connection({}, 'testdb')
+    with pytest.raises(TypeError):
+        open_ebooklet(conn, tmp_path / 'p.blt', 'n', None, 12007, 2**22, 101)
+    with pytest.raises(TypeError):
+        open_rcg(conn, tmp_path / 'q.blt', 'n', 12007, 2**22, 101)
+    assert not (tmp_path / 'p.blt').exists() and not (tmp_path / 'q.blt').exists()
+
+
+@pytest.mark.parametrize('bad', [0, -1, utils._MAX_GROUP_BYTES + 1])
+def test_group_bytes_validation(tmp_path, bad):
+    with pytest.raises(ValueError, match='group_bytes'):
+        open_ebooklet(fake_s3.FakeS3Connection({}, 'testdb'), tmp_path / 'w.blt', flag='n', group_bytes=bad)
+
+
+def test_group_bytes_type_validation(tmp_path):
+    for bad in (True, 1.5, '32'):
+        with pytest.raises(TypeError, match='group_bytes'):
+            open_ebooklet(fake_s3.FakeS3Connection({}, 'testdb'), tmp_path / 'w.blt', flag='n', group_bytes=bad)
+
+
+class _V1Record(msgspec.Struct):
+    """The journal record as ebooklet 0.10.x decodes it (non-strict)."""
+    v: int = 1
+    written: list = []
+    deletes: list = []
+    num_groups: int | None = None
+    num_groups_set: bool = False
+    replace_pending: bool = False
+    meta_pending: bool = False
+
+
+def _raw_journal(eb):
+    return msgspec.json.decode(eb._local_file.get_reserved(JOURNAL_SLOT))
+
+
+@pytest.mark.parametrize('group_bytes, version', [(None, 1), (TEST_GB, 2)])
+def test_journal_version_follows_the_mode(tmp_path, group_bytes, version):
+    """Version 2 is written only for grouped files: a per-key file's journal
+    stays version 1 and decodes with 0.10's struct (shared cache dirs across
+    venvs), recording per-key the way 0.10 understands it."""
+    store = {}
+    conn = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=group_bytes) as eb:
+        eb['k1'] = b'v1'
+        eb.sync()
+        raw = _raw_journal(eb)
+        rec = msgspec.json.decode(eb._local_file.get_reserved(JOURNAL_SLOT), type=_V1Record)
+    assert raw['v'] == version
+    assert rec.v == version
+    if version == 1:
+        assert rec.num_groups is None and rec.num_groups_set is True
+
+
+def test_legacy_journal_maps_to_grouped(tmp_path):
+    """A pre-0.11 journal that recorded a hash num_groups resolves to grouped
+    against an absent remote - the republish path for a hydrated local file."""
+    store = {}
+    conn = fake_s3.FakeS3Connection(store, 'testdb')
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=None) as eb:
+        eb['k1'] = b'v1'
+        ## Overwrite the slot with a 0.10-style record: hash-grouped, 13 groups.
+        legacy = _V1Record(v=1, written=['k1'], num_groups=13, num_groups_set=True, replace_pending=True)
+        eb._local_file.set_reserved(JOURNAL_SLOT, msgspec.json.encode(legacy))
+        eb._journal._dirty = False
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
+            assert eb.group_bytes == DEFAULT_GROUP_BYTES
+            assert eb.changes().push()
+    assert store['testdb'][1]['format_version'] == '3'
 
 
 def test_iterate_while_sync_clean_journal(tmp_path):

@@ -54,7 +54,7 @@ uv build
    - Both factories take `offline=False|'auto'|True` (flag='r' only): True never touches the remote (stub `OfflineSession` in remote.py; unmaterialized reads raise `OfflineError`), 'auto' falls back to offline ONLY on transport-level unreachability (`errors.TRANSPORT_ERRORS`); sessions expose `.offline`
    - `errors.py` — the typed taxonomy (0.10): everything derives from `ebooklet.Error`; pre-taxonomy parentage kept via dual inheritance (`ReadOnlyError`/`UUIDMismatchError`/`RemoteMissingError`/`UnsupportedFormatError`/`GroupTooLargeError` are ValueErrors; `RemoteIntegrityError` stays an HTTPError; `LockLostError` deliberately is NOT). `clear()` is a TRUE clear (journaled deletes, push-applied, discard-cancellable); cache eviction = `prune(timestamp=now)`; `del` of a missing key raises KeyError; `update()` has dict.update semantics
 
-   Also `journal.py` — the persistent session state in booklet reserved slots: `JournalState` (slot 1: pending writes/deletes, num_groups tri-state, replace_pending, meta_pending — the source of read-your-writes and cross-session durability) and `RemoteState` (slot 2: the manifest + remote metadata section of the last in-sync db object). And `fsck.py` — `ebooklet.fsck()` orphan/integrity reporting + age-gated sweep.
+   Also `journal.py` — the persistent session state in booklet reserved slots: `JournalState` (slot 1: pending writes/deletes, the storage mode ('per_key'|'grouped'; a pre-0.11 hash `num_groups` reads as legacy → grouped on an absent remote), replace_pending, meta_pending — the source of read-your-writes and cross-session durability; written as journal v2 ONLY for grouped files so per-key files stay readable by 0.10) and `RemoteState` (slot 2: the manifest + remote metadata section of the last in-sync db object). And `fsck.py` — `ebooklet.fsck()` orphan/integrity reporting + age-gated sweep.
 
 3. **`utils.py` — Sync Engine**
    - Handles local file initialization, remote index download, changelog creation, and multi-threaded upload/download via `ThreadPoolExecutor`
@@ -62,15 +62,21 @@ uv build
    - `upload_group()` — packs and uploads a group to a FRESH generation object, returns `(error, offsets_dict)`
    - `get_remote_group_value(s)()` — byte-range S3 GETs against a group's live generation (resolved via the manifest)
    - `check_local_vs_remote()` — compares timestamps to decide if data needs downloading (journaled pending writes are gated before this ever runs)
-   - `build_db_payload()` / `parse_db_payload()` — the format-2 db-object payload (manifest + metadata section + index bytes)
+   - `build_db_payload()` / `parse_db_payload()` — the db-object payload (manifest + metadata section + index bytes)
+   - `plan_groups()` — pure allocation of gids to keys new to the remote (write order, tail top-up, fresh gids `max(manifest)+1`)
 
-### Grouped S3 Storage
+### Grouped S3 Storage (format 3, 0.11: write-order groups)
 
-When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_groups`). Each group is a single S3 object containing all key/value pairs for that bucket, packed via `pack_group()` / `unpack_group()` in `utils.py`.
+The WRITER assigns groups at push time and records each key's gid in its 19-byte remote-index entry (`encode_group_entry` / `decode_index_entry`; per-key entries are 15 bytes — the sidecar's fixed value_len is the layout discriminator). Readers take the gid from the index, so ebooklet never interprets keys.
 
-- **Byte-range reads:** The `remote_index` stores byte offset and length for each key within its group. Single-key reads use S3 byte-range GET requests to fetch only the needed bytes. Multi-key reads from the same group use a single merged byte-range GET (min offset → max offset+length).
-- **Grouped writes:** `push()` re-packs entire affected groups and uploads each to a NEW immutable generation object (`{gid}.{gen13}`); offsets are STAGED and applied to `remote_index` only after the commit. Old generations are deleted (exact keys) after the commit; readers on the old manifest are never affected mid-push.
-- Per-key storage (no grouping) is used when `num_groups` is `None`.
+- **Allocation:** keys NEW to the remote are taken in `loc_map` order (the local file's physical order = write order) and packed into the tail group (highest gid; pulled if not local) while `size + entry <= group_bytes`, then into fresh gids. A fresh group always takes one key (oversized values get their own group). Keys already on the remote keep their gid — an update repacks only its group. **A repack's member list is the index members of that gid plus this push's allocations — local keys never join a group by themselves.**
+- **Lazy deletes:** a delete only removes the index entry (already done locally before the push); no group is repacked. A manifest gid with no live index member is dropped (and GC'd). The commit gate fires for pending deletes in both modes. Dead bytes leave on the group's next repack; `fsck` reports `dead_fraction`.
+- **Byte-range reads:** single-key reads GET only the value's bytes; multi-key reads from one group use a single merged range (min offset → max offset+length).
+- **Grouped writes:** each repacked group goes to a NEW immutable generation object (`{gid}.{gen13}`); offsets are STAGED and applied to `remote_index` only after the commit; old generations are deleted (exact keys) after it. A freed gid number may be reused (always with a fresh generation; readers pair index + manifest from one commit).
+- **Modes:** `group_bytes` (precedence: the explicit argument, then the value the grouped remote records in its db-object metadata, written by every grouped commit, then `DEFAULT_GROUP_BYTES`, 32 MiB; resolved in `main._grouped_target`, at open and on every index pull) — `None` = per-key (format 2, stamped '2', readable by 0.10). The commit stamp follows the mode; `SUPPORTED_FORMAT_VERSION` (3) is the reader cap only. `remote_session.storage_kind` classifies remotes ('per_key' | 'grouped' | 'legacy'); legacy = format 1 or hash-grouped format 2 (`num_groups` in metadata) and is refused for r/w/c.
+- **Commit-path invariant (0.11, review F1):** the local file's stamp is written LAST (after the commit PUT, the sidecar apply and the remote-state persist), and an open/pull re-fetches the whole index whenever `remote_state.remote_ts != remote.timestamp`. An open or pull that ingests a fetched index also stamps the local file LAST, after the index and the remote-state cache are durable. Never refresh the manifest without the index. The grouped push's internal-error belt (a `RuntimeError`) refuses to run over a stale index (it would mistake live groups for emptied ones). After every commit the session reloads the remote's db metadata (`_load_db_metadata()`), so a later push in the same session continues from its own commit instead of force-pulling it. A replacement's `replace_pending` is cleared in the SAME journal write that clears the committed keys (code review `ebooklet-wog-code-2`, F1): `replace_pending` with no written keys makes the next push purge every local key, so no raise may sit between the two. A pull or open stamps freshness only when its reconciliation actually ran (`reconcile_local_with_index` returns None for a skipped scan).
+- **Uuid rule on every push:** `Change.push` refuses a remote whose uuid differs from the local file's (except a replacement), as the open does. The pre-push adoption's forced pull would otherwise skip the check.
+- **A push that creates its remote journals every key it carries** before uploading (code review `ebooklet-wog-code-1`, F1). A hydrated local file's values are otherwise unjournaled, and after a partly failed push the next fresh-index reconciliation would delete the failed groups' keys, which are the only copy.
 
 ### Data Flow
 
@@ -84,9 +90,9 @@ When `num_groups` is set, keys are hashed into N groups (`blake2b` → `mod num_
 ### Key Files per Database
 
 - `{file_path}` — local booklet database
-- `{file_path}.remote_index` — tracks what's stored remotely (FixedLengthValue, 15 bytes per key: 7-byte timestamp + 4-byte offset + 4-byte length). For per-key mode, offset/length are zero-filled.
+- `{file_path}.remote_index` — tracks what's stored remotely (FixedLengthValue). Grouped: 19 bytes per key (7-byte timestamp + 4-byte gid + 4-byte offset + 4-byte length). Per-key: 15 bytes (timestamp + zero-filled offset/length). A sidecar whose layout does not match the remote is discarded and re-fetched online, kept offline.
 - `{file_path}.changelog` — temporary diff file created during sync (14 bytes per key: 7-byte local timestamp + 7-byte remote timestamp)
-- S3: `{db_key}` (the db object: format-2 payload = manifest + metadata section + index; its single PUT is the push's commit point) and `{db_key}/{gid}.{gen13}` (immutable group generations) or `{db_key}/{key}` (per-key mode values)
+- S3: `{db_key}` (the db object: payload = manifest + metadata section + index; its single PUT is the push's commit point) and `{db_key}/{gid}.{gen13}` (immutable group generations) or `{db_key}/{key}` (per-key mode values)
 
 ### Concurrency Model
 

@@ -30,6 +30,7 @@ except ImportError:
     import tomli as toml
 
 from ebooklet import open_ebooklet, S3Connection
+from ebooklet.tests.groups import TEST_GB
 
 pytestmark = pytest.mark.scale
 
@@ -52,7 +53,7 @@ except Exception:
 bucket = 'achelous'
 _DB_KEY = 'scale-push-test'
 _N_VALUES = 12
-_VALUE_SIZE = 40 * 2**20     # ~40MiB/group at num_groups=11 - the failing shape
+_VALUE_SIZE = 40 * 2**20     # one ~40MiB value per group at group_bytes=TEST_GB - the failing shape
 
 
 class _RetryCapture(logging.Handler):
@@ -74,7 +75,7 @@ def test_concurrent_large_push_no_retries(tmp_path):
     urllib3_logger = logging.getLogger('urllib3.connectionpool')
     urllib3_logger.addHandler(capture)
     try:
-        with open_ebooklet(conn, tmp_path / 'scale.blt', flag='n', num_groups=11) as eb:
+        with open_ebooklet(conn, tmp_path / 'scale.blt', flag='n', group_bytes=TEST_GB) as eb:
             for k, v in values.items():
                 eb[k] = v
             result = eb.changes().push()

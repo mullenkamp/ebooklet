@@ -6,7 +6,6 @@ Created on Thu Jan  5 11:04:13 2023
 @author: mike
 """
 import logging
-import hashlib
 import struct
 import threading
 import time
@@ -42,13 +41,68 @@ reserved_key_strs = frozenset(
     {metadata_key_str} | {k.decode() for k in booklet.utils.reserved_slot_key_bytes.values()}
 )
 
-## The remote storage format version this ebooklet reads and writes. Stamped
-## into the db object's S3 metadata on every push; remotes whose stamp exceeds
-## it are refused with UnsupportedFormatError (absence of the stamp = 1).
-## Format 2 (0.10): generation-named immutable group objects + the manifest/
-## metadata/index db-object payload. There is NO legacy read path for format 1
-## (deliberate - see the changelog's upgrade recipe).
-SUPPORTED_FORMAT_VERSION = 2
+## Remote storage formats (stamped into the db object's S3 metadata as
+## 'format_version'; absence of the stamp = 1):
+##   1        pre-0.10. Refused.
+##   2        0.10: generation-named immutable group objects + the manifest/
+##            metadata/index db-object payload. Since 0.11 a format-2 remote is
+##            readable ONLY in per-key mode (no 'num_groups' metadata); a
+##            format-2 remote WITH 'num_groups' is hash-grouped (legacy) and
+##            refused - hydrate it with ebooklet<0.11, delete it, republish.
+##   3        0.11: write-order groups. Each index entry carries its group id.
+## SUPPORTED_FORMAT_VERSION is the READER cap only: the stamp a commit writes
+## is chosen per storage mode (FORMAT_PER_KEY / FORMAT_GROUPED), so per-key
+## remotes stay format 2 and remain readable by 0.10 clients.
+FORMAT_PER_KEY = 2
+FORMAT_GROUPED = 3
+SUPPORTED_FORMAT_VERSION = 3
+
+## Remote-index entry layouts (the sidecar's fixed value_len is the layout
+## discriminator):
+##   per-key  15 bytes: timestamp(7) + offset(4) + length(4), offset/length 0
+##   grouped  19 bytes: timestamp(7) + gid(4) + offset(4) + length(4)
+INDEX_LEN_PER_KEY = 15
+INDEX_LEN_GROUPED = 19
+
+## The default packing target for grouped storage: new keys fill a group in
+## local-file write order until its packed size would exceed this many bytes.
+## Used when neither the writer nor the remote names one: a grouped remote
+## records the group_bytes its last commit packed with ('group_bytes' in the
+## db-object metadata), and writers that pass none inherit it.
+DEFAULT_GROUP_BYTES = 32 * 2**20
+
+## Storage modes, as the journal records them (defined there - one source)
+## and remote sessions report them. LEGACY = hash-grouped (format 2 +
+## num_groups) or format 1: refused online.
+from .journal import STORAGE_PER_KEY as STORAGE_PER_KEY, STORAGE_GROUPED as STORAGE_GROUPED  # noqa: E402
+STORAGE_LEGACY = 'legacy'
+
+
+class _Unset:
+    """Sentinel for 'group_bytes not given': inherit the existing mode."""
+    __slots__ = ()
+
+    def __repr__(self):
+        return 'UNSET'
+
+
+UNSET = _Unset()
+
+
+def encode_group_entry(timestamp_int, gid, offset, length):
+    """A grouped (19-byte) remote-index entry."""
+    return int_to_bytes(timestamp_int, 7) + int_to_bytes(gid, 4) + int_to_bytes(offset, 4) + int_to_bytes(length, 4)
+
+
+def decode_index_entry(entry):
+    """
+    Decode a remote-index entry of either layout. Returns (timestamp_int,
+    gid, offset, length); gid is None for a per-key (15-byte) entry.
+    """
+    if len(entry) == INDEX_LEN_GROUPED:
+        return (bytes_to_int(entry[:7]), bytes_to_int(entry[7:11]),
+                bytes_to_int(entry[11:15]), bytes_to_int(entry[15:19]))
+    return bytes_to_int(entry[:7]), None, bytes_to_int(entry[7:11]), bytes_to_int(entry[11:15])
 
 ## db-object payload layout (format 2). The sections that change together ride
 ## ONE object - one PUT is the push's atomic commit point:
@@ -56,7 +110,8 @@ SUPPORTED_FORMAT_VERSION = 2
 ##   | manifest_len >Q (8) | meta_len >Q (8) | index_len >Q (8)
 ##   | manifest: msgspec-JSON {gid: gen13}   (empty dict in per-key mode)
 ##   | meta:     msgspec-JSON {"timestamp": µs, "data": ...}  (len 0 = absent)
-##   | index:    raw FixedLengthValue booklet bytes (value_len=15, unchanged)
+##   | index:    raw FixedLengthValue booklet bytes (value_len 15 per-key,
+##                                                   19 grouped - see INDEX_LEN_*)
 ## Sections precede the index so the manifest and user metadata are cheap
 ## ranged GETs. v1 bodies start with booklet's 16-byte fixed-file type uuid,
 ## so the magic discriminates unambiguously.
@@ -105,8 +160,8 @@ def parse_db_payload_header(header):
     """
     if len(header) < PAYLOAD_HEADER_LEN or header[:12] != DB_MAGIC:
         raise UnsupportedFormatError(
-            'The remote db object is not a format-2 payload (a format-1 remote, or a '
-            'foreign object). 0.10 has no format-1 read path: re-create the remote by '
+            'The remote db object is not a format-2/3 payload (a format-1 remote, or a '
+            'foreign object). There is no format-1 read path: re-create the remote by '
             "pushing it with flag='n' from an upgraded client."
         )
     payload_version = struct.unpack_from('>H', header, 12)[0]
@@ -173,38 +228,47 @@ def new_generation(current_gen=None):
 ### Group functions
 
 
-def is_prime_small(n: int) -> bool:
-    """Trial-division primality test suitable for small n."""
-    if n < 2:
-        return False
-    if n < 4:
-        return True
-    if n % 2 == 0 or n % 3 == 0:
-        return False
-    i = 5
-    while i * i <= n:
-        if n % i == 0 or n % (i + 2) == 0:
-            return False
-        i += 6
-    return True
-
-
-def next_prime(n: int) -> int:
-    """Return the smallest prime >= n."""
-    if n <= 2:
-        return 2
-    candidate = n if n % 2 != 0 else n + 1
-    while not is_prime_small(candidate):
-        candidate += 2
-    return candidate
-
-
-def key_to_group_id(key: str, num_groups: int) -> int:
-    digest = hashlib.blake2b(key.encode(), digest_size=4).digest()
-    return int.from_bytes(digest, 'big') % num_groups
-
-
 _MAX_GROUP_BYTES = 2**32 - 1   # the >I offset and length fields' ceiling
+
+## A packed group object is [entry_count: >I] followed by its entries.
+group_header_len = 4
+
+
+def group_entry_size(key, value_len):
+    """The packed size of one group entry (see pack_group's layout)."""
+    return 2 + len(key.encode()) + 7 + 4 + value_len
+
+
+def plan_groups(new_keys, tail_gid, tail_size, next_gid, group_bytes):
+    """
+    Allocate group ids to keys that are new to the remote (format 3).
+
+    new_keys: [(key, entry_size)] in local-file WRITE order - the order the
+    allocation preserves, so keys written together share a group.
+    tail_gid / tail_size: the remote's current tail group (its highest gid)
+    and its projected packed size (header + live members), or None / 0 when
+    there is no tail to top up. next_gid: the first unused gid.
+
+    Keys go into the current group while its packed size stays <= group_bytes
+    (topping up the tail first); otherwise a fresh gid opens. A fresh group
+    always takes at least one key, so a value larger than group_bytes gets a
+    group of its own - and the key after it opens the next fresh group.
+
+    Returns {key: gid}.
+    """
+    assignment = {}
+    cur_gid = tail_gid
+    cur_size = tail_size if tail_gid is not None else 0
+    for key, size in new_keys:
+        if cur_gid is not None and cur_size + size <= group_bytes:
+            assignment[key] = cur_gid
+            cur_size += size
+            continue
+        cur_gid = next_gid
+        next_gid += 1
+        cur_size = group_header_len + size
+        assignment[key] = cur_gid
+    return assignment
 
 
 def pack_group(entries: list[tuple[str, int, bytes]]) -> tuple[bytes, dict[str, tuple[int, int]]]:
@@ -225,8 +289,9 @@ def pack_group(entries: list[tuple[str, int, bytes]]) -> tuple[bytes, dict[str, 
         if pos + entry_size > _MAX_GROUP_BYTES:
             raise GroupTooLargeError(
                 f'packing this group would exceed {_MAX_GROUP_BYTES} bytes (the 4-byte '
-                'offset/length ceiling). Not retryable as-is: re-create the database '
-                "with a larger num_groups (flag='n'), or store smaller values."
+                'offset/length ceiling) - its members grew in place. Not retryable as-is: '
+                "re-create the database (flag='n', which re-allocates every group) or store "
+                'smaller values.'
             )
         buf += struct.pack('>H', len(key_bytes))
         pos += 2
@@ -531,9 +596,11 @@ def reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts
     raises RuntimeError on mutation during iteration). A concurrent fetch
     worker completing a local_file.set() mid-scan aborts the scan: retry
     once, then skip with a log line - a skipped reconcile is the pre-fix
-    status quo and converges at the next fresh ingest.
+    status quo, and the caller then does not stamp the local file fresh, so
+    the next pull or open ingests (and reconciles) again.
 
-    Returns the sorted list of locally-deleted keys.
+    Returns the sorted list of locally-deleted keys, or None when the scan was
+    skipped.
     """
     if prev_synced_ts is None:
         return []
@@ -554,10 +621,10 @@ def reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts
             if attempt:
                 logger.warning(
                     'the local-vs-index reconciliation scan was aborted twice by '
-                    'concurrent writes; skipping it this round (it re-runs at the '
-                    'next fresh index ingest)'
+                    'concurrent writes; skipping it this round (the local file is '
+                    'not stamped fresh, so it re-runs at the next pull or open)'
                 )
-                return []
+                return None
 
     n_before = len(local_file)
     removed = []
@@ -583,17 +650,28 @@ def reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts
     return removed
 
 
-def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
+def sidecar_value_len(remote_index_path):
+    """The fixed value_len (= entry layout) of an existing remote-index
+    sidecar, or None when there is no sidecar."""
+    if not remote_index_path.exists():
+        return None
+    with booklet.FixedLengthValue(remote_index_path, 'r') as f:
+        return f._value_len
+
+
+def open_remote_index(remote_index_path, flag, n_buckets, buffer_size, value_len=INDEX_LEN_PER_KEY):
     """
     Open the local remote-index booklet (writable in every session mode - see
-    the in-function note; fresh file when none exists).
+    the in-function note; fresh file when none exists). An existing sidecar
+    keeps its own layout; value_len applies only to a new one.
 
-    Index entry layout (fixed value_len=15): timestamp(7) + offset(4) + length(4).
-    Per-key mode: offset and length are always 0. Grouped mode: offset/length
-    locate the member value inside its group object; length is the value's byte
-    length and MAY be 0 (an empty value) - it is NOT a mode discriminator. Future
-    layouts change the fixed value_len (the layout discriminator), gated by the
-    db object's format_version metadata.
+    Index entry layouts (the fixed value_len is the layout discriminator):
+      per-key, 15 bytes: timestamp(7) + offset(4) + length(4); offset and
+        length are always 0.
+      grouped, 19 bytes: timestamp(7) + gid(4) + offset(4) + length(4); the
+        gid names the group object (via the manifest), offset/length locate the
+        member value inside it. length is the value's byte length and MAY be 0
+        (an empty value).
     """
     if remote_index_path.exists():
         ## Writable in EVERY session mode since 0.10: replay-on-swap re-applies
@@ -604,7 +682,7 @@ def open_remote_index(remote_index_path, flag, n_buckets, buffer_size):
         ## read path.)
         return booklet.FixedLengthValue(remote_index_path, 'w')
     else:
-        return booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=15, n_buckets=n_buckets, buffer_size=buffer_size)
+        return booklet.FixedLengthValue(remote_index_path, 'n', key_serializer='str', value_len=value_len, n_buckets=n_buckets, buffer_size=buffer_size)
 
 
 class MissingRemoteObject:
@@ -1192,12 +1270,21 @@ class _PushProgress:
         )
 
 
-def update_remote(local_file, remote_index, remote_index_path, changelog_path, remote_session, force_push, journal, remote_state, replace_pending, ebooklet_type, num_groups=None, lock=None, loc_map=None, comp0=None, packers=1):
+def update_remote(local_file, remote_index, remote_index_path, changelog_path, remote_session, force_push, journal, remote_state, replace_pending, ebooklet_type, group_bytes=None, lock=None, loc_map=None, comp0=None, packers=1):
     """
-    Push the changelog to the remote - the format-2 protocol:
+    Push the changelog to the remote. group_bytes=None pushes per-key (format
+    2); an int pushes write-order groups packed to that target (format 3):
 
-      A. changelog union -> affected groups -> pull unmaterialized members
-         from the OLD generations (read-your-writes gated).
+      A. changelog -> allocation (plan_groups): keys already on the remote
+         keep the gid their index entry carries; keys NEW to the remote are
+         packed in local-file write order into the tail group (the highest
+         gid) and then fresh gids. Deletes are lazy - the index entry is
+         already gone from the sidecar, no group is repacked for them; a gid
+         left with no live index member is dropped. Then pull unmaterialized
+         members of the affected groups from their OLD generations
+         (read-your-writes gated). A group's member list is its live INDEX
+         members plus this push's allocations - local keys never join a
+         group by themselves.
       B. PUT each repacked group to a FRESH generation object (immutable -
          readers on the old manifest are untouched). Emptied groups PUT
          nothing. New index entries are STAGED, not written to the live
@@ -1216,6 +1303,9 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     A crash or failure before C leaves readers on the old, fully-consistent
     state and this session fully retryable; between C and D leaves only
     invisible orphans.
+
+    Returns (committed, failures): whether the commit happened (the remote
+    changed), and the per-key/per-group upload failures.
 
     Phase B is pipelined (0.10.1): loc_map ({key: (ts, value_offset,
     value_len)}, captured by create_changelog's header-only sweep) lets each
@@ -1239,8 +1329,11 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     pre_push_manifest = dict(remote_state.manifest)
     deletes = journal.deletes   # read here; journal mutated only post-commit
 
-    ## Upload data and update the remote_index file
+    ## Upload data and update the remote_index file. updated: something this
+    ## push carries needs a commit; committed: the commit happened (the
+    ## remote changed) - what the caller reports.
     updated = False
+    committed = False
     failures = {}
     failed_gids = set()
     staged_entries = {}
@@ -1249,29 +1342,116 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     staged_index_bytes = None
 
     with booklet.FixedLengthValue(changelog_path) as cl:
-        if num_groups is not None:
-            ## Grouped upload path
-            affected_group_ids = set()
-
+        ## A push that CREATES the remote journals every key it carries as
+        ## written, durably, before any upload. A hydrated local file's values
+        ## were materialized from a now-deleted remote and are unjournaled:
+        ## after a partly failed push, the next fresh-index ingest (a reopen
+        ## after a crash past the commit) would reconcile the failed keys away
+        ## as remotely deleted - their only copy. The journal guard keeps
+        ## them; the commit clears exactly the committed ones (review F1).
+        if not remote_session.initialized:
             for key in cl:
-                affected_group_ids.add(key_to_group_id(key, num_groups))
+                if key != metadata_key_str and key not in journal.written:
+                    journal.record_write(key)
+            journal.persist(local_file)
 
-            ## Also include groups affected by deletes
-            for key in deletes:
-                affected_group_ids.add(key_to_group_id(key, num_groups))
+        if group_bytes is not None:
+            ## Grouped upload path (format 3: write-order groups).
 
-            ## Build FULL key lists per affected group: the union of locally-present
-            ## keys (the captured loc_map - same live-key enumeration as
-            ## local_file.keys(), for free) and remote-index keys. A group object
-            ## is completely replaced on upload, so every current member must be
-            ## packed - not just the keys that happen to be materialized locally.
-            group_key_sets = {gid: set() for gid in affected_group_ids}
-            for key in loc_map:
-                if key == metadata_key_str:
+            ## Belt: grouped mode runs only over a grouped (19-byte) sidecar -
+            ## the session resolves the layout at open.
+            if remote_index._value_len != INDEX_LEN_GROUPED:
+                raise ValueError(
+                    f'internal error: a grouped push needs a {INDEX_LEN_GROUPED}-byte remote '
+                    f'index, this session holds a {remote_index._value_len}-byte one.'
+                )
+            ## The sidecar must be the index of the remote's CURRENT commit: a
+            ## stale one would make live groups look emptied and drop them
+            ## below. The open path re-fetches whenever the cached remote state
+            ## lags the remote, so this cannot fire through the API - an
+            ## internal-error belt.
+            if (not replace_pending and remote_session.initialized
+                    and remote_state.remote_ts != remote_session.timestamp):
+                raise RuntimeError(
+                    "internal error: this session's copy of the remote index is not the "
+                    "remote's current commit - aborting the push before any upload. All "
+                    'pending changes are retained; re-open the file and push again.'
+                )
+
+            ## The live index members of every group (a replacement starts from
+            ## nothing: its index was purged to the written keys, which are all
+            ## re-allocated). Deletes are lazy: their entries left the sidecar
+            ## at __delitem__, so they are simply not members.
+            in_index = {}
+            if not replace_pending:
+                ## NOTE: iterate items() in a single pass - one scan instead
+                ## of a per-key chain lookup for every get().
+                for key, remote_val in remote_index.items():
+                    if key == metadata_key_str:
+                        continue
+                    ts_r, gid, off, ln = decode_index_entry(remote_val)
+                    in_index.setdefault(gid, []).append((key, ts_r, off, ln))
+
+            ## Changed keys already on the remote keep their gid (their group
+            ## is repacked in place); keys NEW to the remote are allocated in
+            ## loc_map order - the local file's physical order, i.e. write order.
+            key_gid = {}
+            affected_group_ids = set()
+            new_keys = []
+            for key, (_ts, _off, ln) in loc_map.items():
+                if key == metadata_key_str or key not in cl:
                     continue
-                gid = key_to_group_id(key, num_groups)
-                if gid in group_key_sets:
+                remote_val = None if replace_pending else remote_index.get(key)
+                if remote_val is not None:
+                    gid = decode_index_entry(remote_val)[1]
+                    key_gid[key] = gid
+                    affected_group_ids.add(gid)
+                else:
+                    new_keys.append((key, group_entry_size(key, ln)))
+
+            ## The tail (highest gid) is topped up before fresh groups open. Its
+            ## projected size counts LIVE members only (dead bytes from lazy
+            ## deletes drop out at the repack), using updated values' local
+            ## lengths. A tail with no live member is dropped below, not refilled.
+            manifest_view = {} if replace_pending else pre_push_manifest
+            tail_gid = max(manifest_view) if manifest_view else None
+            if tail_gid is not None and not in_index.get(tail_gid):
+                tail_gid = None
+            tail_size = 0
+            if tail_gid is not None:
+                tail_size = group_header_len
+                for key, _ts, _off, ln in in_index[tail_gid]:
+                    entry = loc_map.get(key) if key in cl else None
+                    tail_size += group_entry_size(key, entry[2] if entry is not None else ln)
+            ## A gid number freed by an emptied group may be reused: object names
+            ## carry a fresh random generation, and readers pair index and
+            ## manifest from one commit.
+            next_gid = (max(manifest_view) + 1) if manifest_view else 0
+            assignment = plan_groups(new_keys, tail_gid, tail_size, next_gid, group_bytes)
+            key_gid.update(assignment)
+            affected_group_ids.update(assignment.values())
+
+            ## Full member list per affected group: its live index members plus
+            ## this push's allocations. A group object is completely replaced on
+            ## upload, so every current member must be packed - and ONLY the
+            ## index decides membership (a local key never joins a group by
+            ## itself, which is what keeps a lazily-deleted key deleted).
+            group_key_sets = {gid: set() for gid in affected_group_ids}
+            for gid in affected_group_ids:
+                for key, _ts, _off, _ln in in_index.get(gid, ()):
                     group_key_sets[gid].add(key)
+            for key, gid in assignment.items():
+                group_key_sets[gid].add(key)
+
+            ## Lazy deletes: a manifest group left with no live index member
+            ## (and nothing allocated to it) is dropped - no upload; its old
+            ## generation is GC'd in phase D. (The commit itself is the gate's
+            ## job: pending deletes always commit.)
+            if not replace_pending:
+                for gid in pre_push_manifest:
+                    if gid not in affected_group_ids and not in_index.get(gid):
+                        emptied_gids.add(gid)
+                        updated = True
 
             ## Keys whose value bytes were (or will be) materialized AFTER the
             ## capture: their loc_map offset - if any - predates the write and
@@ -1287,35 +1467,23 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             groups_to_download = {}
             pull_count = 0
             pull_bytes = 0
-            ## NOTE: iterate items() in a single pass - one scan instead of a
-            ## per-key chain lookup for every get(). (Before booklet 0.12.6 this
-            ## was also mandatory: iterators held the thread lock across yields,
-            ## so get() during iteration self-deadlocked. That constraint is
-            ## gone, but the single pass remains the right access pattern.)
-            for key, remote_val in remote_index.items():
-                if key == metadata_key_str or key in deletes:
-                    continue
-                gid = key_to_group_id(key, num_groups)
-                if gid not in group_key_sets:
-                    continue
-                group_key_sets[gid].add(key)
-                ## Read-your-writes gate: a journaled pending write is the
-                ## truth for its key - never pull the remote value over it
-                ## (this also covers the length==0 empty-value branch below).
-                ## Skew-stamped journaled edits were already timestamp-
-                ## normalized by create_changelog, so this gate is belt.
-                if key in journal.written:
-                    continue
-                entry = loc_map.get(key)
-                local_time_int = entry[0] if entry is not None else None
-                ## Mirrors check_local_vs_remote's exact truthiness (a stored
-                ## ts of 0 counts as absent there), driven by the capture.
-                if remote_val and not (local_time_int and bytes_to_int(remote_val[:7]) <= local_time_int):
+            for gid in affected_group_ids:
+                for key, timestamp_int, offset, length in in_index.get(gid, ()):
+                    ## Read-your-writes gate: a journaled pending write is the
+                    ## truth for its key - never pull the remote value over it
+                    ## (this also covers the length==0 empty-value branch below).
+                    ## Skew-stamped journaled edits were already timestamp-
+                    ## normalized by create_changelog, so this gate is belt.
+                    if key in journal.written:
+                        continue
+                    entry = loc_map.get(key)
+                    local_time_int = entry[0] if entry is not None else None
+                    ## Mirrors check_local_vs_remote's exact truthiness (a stored
+                    ## ts of 0 counts as absent there), driven by the capture.
+                    if local_time_int and timestamp_int <= local_time_int:
+                        continue
                     if local_time_int is not None:
                         logger.warning(f"Push is replacing the locally-stored value of '{key}' with the newer remote value before repacking its group - any unpushed local modification to it is discarded (its local timestamp is older than the remote's).")
-                    offset = bytes_to_int(remote_val[7:11])
-                    length = bytes_to_int(remote_val[11:15])
-                    timestamp_int = bytes_to_int(remote_val[:7])
                     if length > 0:
                         groups_to_download.setdefault(gid, []).append((key, offset, length, timestamp_int))
                         pull_count += 1
@@ -1420,7 +1588,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             ## not share a gate (or each other's push_packers choice).
             pack_gate = threading.BoundedSemaphore(max(1, packers))
             fallback_warned = threading.Event()
-            n_submit = sum(1 for gid, kig in group_keys.items() if kig)
+            n_submit = len(group_keys)
             total_keys = sum(len(kig) for kig in group_keys.values())
             total_bytes = sum(
                 4 + sum(2 + len(key.encode()) + 7 + 4 + ln for key, _ts, _off, ln in entries)
@@ -1433,10 +1601,10 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
                 futures = {}
                 for gid, keys_in_group in group_keys.items():
-                    if not keys_in_group:
-                        emptied_gids.add(gid)
-                        updated = True
-                        continue
+                    ## Every repacked group holds at least one key of this
+                    ## push's changelog (local, never pulled, never lost);
+                    ## groups emptied by deletes were dropped above.
+                    assert keys_in_group, f'internal error: repacked group {gid} has no members'
                     gen = new_generation(pre_push_manifest.get(gid))
                     new_gens[gid] = gen
                     f = executor.submit(upload_group, gid, gen, local_file, remote_session, group_entries[gid], pulled_keys, pack_gate, comp0, fallback_warned)
@@ -1461,7 +1629,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                         for key, (offset, length) in offsets.items():
                             ts = ts_map[key]
                             if ts:
-                                staged_entries[key] = int_to_bytes(ts, 7) + int_to_bytes(offset, 4) + int_to_bytes(length, 4)
+                                staged_entries[key] = encode_group_entry(ts, gid, offset, length)
                         updated = True
                     else:
                         failures[gid] = error
@@ -1483,7 +1651,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             failed_gids = {gid for gid in failures if isinstance(gid, int)}
 
         else:
-            ## Per-key upload path (legacy). Objects are overwritten in place
+            ## Per-key upload path (format 2). Objects are overwritten in place
             ## (each PUT is object-atomic; no cross-key snapshot isolation -
             ## documented), and index entries stay write-through.
             with ThreadPoolExecutor(max_workers=remote_session.threads) as executor:
@@ -1509,7 +1677,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     if failures:
         non_retryable = [k for k, v in failures.items() if isinstance(v, GroupTooLargeError)]
         if non_retryable:
-            logger.warning(f"There were {len(failures)} items that failed to upload; group(s) {non_retryable} exceed the 4 GiB pack limit and will NOT succeed on a plain retry (re-shard with a larger num_groups).")
+            logger.warning(f"There were {len(failures)} items that failed to upload; group(s) {non_retryable} exceed the 4 GiB pack limit and will NOT succeed on a plain retry (re-create the database with flag='n' to re-allocate its groups).")
         else:
             logger.warning(f"There were {len(failures)} items that failed to upload. Please run this again.")
 
@@ -1518,11 +1686,10 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     remote_index.sync()
 
     ## Build the index bytes the commit will carry: grouped mode applies the
-    ## staged entries and committed delete-entry removals to a throwaway COPY
-    ## of the sidecar; per-key mode reads the live sidecar as-is.
-    committed_delete_keys = []
-    if num_groups is not None:
-        committed_delete_keys = [k for k in deletes if key_to_group_id(k, num_groups) not in failed_gids]
+    ## staged entries to a throwaway COPY of the sidecar; per-key mode reads
+    ## the live sidecar as-is. (Deleted keys' entries left the sidecar at
+    ## __delitem__, so every journaled delete commits with this index.)
+    if group_bytes is not None:
         staged_path = remote_index_path.parent.joinpath(remote_index_path.name + '.staged')
         with remote_index._thread_lock:
             remote_index._file.seek(0)
@@ -1534,9 +1701,6 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             try:
                 for key, entry in staged_entries.items():
                     staged[key] = entry
-                for key in committed_delete_keys:
-                    if key in staged:
-                        del staged[key]
                 staged.sync()
                 with staged._thread_lock:
                     staged._file.seek(0)
@@ -1550,24 +1714,29 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 pass
 
     ## Phase C - the commit. Also runs for a metadata-only push (metadata no
-    ## longer rides the changelog - it is embedded at commit), when the remote
-    ## does not exist yet, or when a replacement is pending, so those cases
-    ## still materialize instead of being silent no-ops.
-    if updated or force_push or journal.meta_pending or (deletes and num_groups is None) or replace_pending or not remote_session.initialized:
+    ## longer rides the changelog - it is embedded at commit), for a
+    ## deletes-only push (lazy grouped deletes upload nothing - the index IS
+    ## the change), when the remote does not exist yet, or when a replacement
+    ## is pending, so those cases still materialize instead of being silent
+    ## no-ops.
+    if updated or force_push or journal.meta_pending or deletes or replace_pending or not remote_session.initialized:
         ## A partially-failed REPLACEMENT push commits NOTHING: the old remote
         ## stays fully intact (readable, uncorrupted) and the retry redoes the
         ## whole replacement. (The pre-0.10 wipe-first protocol left a wiped,
         ## half-uploaded remote here.)
         if replace_pending and failures:
             logger.warning('The replacement push had upload failures - NOT committing; the existing remote is untouched. Re-run the push.')
-            return failures
+            return False, failures
 
         time_int_us = booklet.utils.make_timestamp_int()
 
         ## Get main file init bytes. Direct _file access moves the shared file
         ## position, so hold the owning booklet's thread lock (booklet's own
-        ## contract since 0.12.6: every position-mover locks).
-        local_file._set_file_timestamp(time_int_us)
+        ## contract since 0.12.6: every position-mover locks). The commit
+        ## timestamp is patched into the COPY only: the local file's own stamp
+        ## (its "in sync with the remote" claim) is written after the commit
+        ## has succeeded and been applied locally - stamping first left a
+        ## crashed or lock-lost commit claiming freshness over a stale index.
         with local_file._thread_lock:
             local_file._file.seek(0)
             local_init_bytes = bytearray(local_file._file.read(200))
@@ -1576,6 +1745,9 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 'The local file does not start with the variable-length booklet magic - '
                 f'not an ebooklet local file (first bytes: {bytes(local_init_bytes[:16])!r}).'
             )
+        ts_pos = booklet.utils.file_timestamp_pos
+        local_init_bytes[ts_pos:ts_pos + booklet.utils.timestamp_bytes_len] = int_to_bytes(
+            time_int_us, booklet.utils.timestamp_bytes_len)
 
         n_keys_pos = booklet.utils.n_keys_pos
         local_init_bytes[n_keys_pos:n_keys_pos+4] = b'\x00\x00\x00\x00'
@@ -1583,7 +1755,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         ## The manifest this commit publishes: a replacement starts fresh
         ## (only this push's generations); otherwise the old manifest with
         ## successful groups re-pointed and emptied groups dropped.
-        if num_groups is not None:
+        if group_bytes is not None:
             if replace_pending:
                 new_manifest = dict(new_gens)
             else:
@@ -1608,10 +1780,16 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
             'uuid': local_file.uuid.hex,
             'type': ebooklet_type,
             'init_bytes': base64.urlsafe_b64encode(local_init_bytes).decode(),
-            'format_version': str(SUPPORTED_FORMAT_VERSION),
+            ## The stamp follows the storage mode, never the reader cap: a
+            ## per-key remote stays format 2 (readable by 0.10 clients).
+            'format_version': str(FORMAT_GROUPED if group_bytes is not None else FORMAT_PER_KEY),
         }
-        if num_groups is not None:
-            metadata['num_groups'] = str(num_groups)
+        ## A grouped remote records the target this commit packed with: later
+        ## writers that pass no group_bytes inherit it (one value, overwritten
+        ## by any writer that passes another - no lineage). Per-key metadata
+        ## stays exactly as 0.10 writes it.
+        if group_bytes is not None:
+            metadata['group_bytes'] = str(group_bytes)
 
         ## The commit PUT is the point of no return: re-verify the write lock
         ## so a holder whose ticket was broken (another client's force_lock)
@@ -1631,22 +1809,19 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
 
         push_logger.info(f'commit succeeded ({len(payload):,} B db object)')
 
-        ## remove deletes in remote (only for legacy per-key mode). A raised
-        ## delete failure propagates BEFORE the journal clearing below, so the
-        ## pending deletes are retained for retry.
-        if deletes and num_groups is None:
+        ## remove deletes in remote (per-key mode only - grouped deletes are
+        ## lazy). A raised delete failure propagates BEFORE the journal
+        ## clearing below, so the pending deletes are retained for retry.
+        if deletes and group_bytes is None:
             remote_session.delete_objects(list(deletes))
 
-        updated = True
+        committed = True
 
         ## COMMIT SUCCEEDED. Apply the staged index mutations to the live
         ## sidecar (it now matches what the commit published)...
-        if num_groups is not None:
+        if group_bytes is not None:
             for key, entry in staged_entries.items():
                 remote_index[key] = entry
-            for key in committed_delete_keys:
-                if key in remote_index:
-                    del remote_index[key]
             remote_index.sync()
 
         ## ...record the committed remote state (manifest + metadata section +
@@ -1660,26 +1835,46 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         if replace_pending:
             committed_written = set(journal.written) if not failures else set()
             committed_deletes = set(journal.deletes) if not failures else set()
-        elif num_groups is not None:
-            committed_written = {k for k in journal.written if key_to_group_id(k, num_groups) not in failed_gids}
-            committed_deletes = {k for k in journal.deletes if key_to_group_id(k, num_groups) not in failed_gids}
+        elif group_bytes is not None:
+            ## A written key is committed unless the group it was packed into
+            ## failed (its index entry was not staged; it stays journaled and
+            ## is re-allocated on retry). Keys with no group were not packed
+            ## (e.g. dropped by the changelog) and have nothing pending.
+            committed_written = {k for k in journal.written if key_gid.get(k) not in failed_gids}
+            committed_deletes = set(journal.deletes)
         else:
             committed_written = journal.written - set(failures)
             committed_deletes = set(journal.deletes)
         journal.clear_committed(committed_written, committed_deletes)
         if embedded_local_meta:
             journal.set_meta_pending(False)
-        ## Record the storage-mode choice this commit materialized (tri-state:
-        ## per-key is num_groups=None WITH num_groups_set=True).
-        if not journal.num_groups_set:
-            journal.set_num_groups(num_groups)
+        ## A replacement is finished the moment its commit lands (a partly
+        ## failed one never commits): the remote IS this file's database now,
+        ## and later pushes are ordinary merges. This MUST share the journal
+        ## write that cleared the written keys: replace_pending with no written
+        ## keys tells the next push to purge every local key (review round 2,
+        ## F1: a raise between the two writes wiped the database on retry).
+        if replace_pending:
+            journal.set_replace_pending(False)
         journal.persist(local_file)
+
+        ## The session now describes the remote this commit created (uuid,
+        ## timestamp, format): a second push in the same session continues
+        ## from it instead of taking its own commit for a remote that appeared
+        ## and force-pulling over unpushed local values (review F1).
+        remote_session._load_db_metadata()
+
+        ## LAST: stamp the local file with the commit timestamp - its claim to
+        ## be in sync with the remote. Everything it vouches for (sidecar,
+        ## remote-state cache) is already durable; a crash before this line
+        ## leaves the stamp OLD, and the next open re-fetches the index.
+        local_file._set_file_timestamp(time_int_us)
 
         ## Phase D - GC of the replaced/emptied OLD generations (exact keys).
         ## Failures are log-only: nothing references these objects any more
         ## (the commit already dropped them from the manifest and index;
         ## copy_remote is manifest-driven; fsck sweeps orphans).
-        if num_groups is not None:
+        if group_bytes is not None:
             if replace_pending:
                 ## Replacement: sweep EVERYTHING in the namespace the new
                 ## manifest does not reference - the old database's objects,
@@ -1719,10 +1914,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                         if err is not None:
                             logger.warning(f"Could not GC emptied group's generation '{gid}.{old_gen}' (orphan; fsck will sweep): {err}")
 
-    if failures:
-        return failures
-    else:
-        return updated
+    return committed, failures
 
 
 # Transport/system fields that s3func's add_metadata_from_urllib3 / add_metadata_from_s3_xml

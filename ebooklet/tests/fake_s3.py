@@ -137,8 +137,11 @@ class FakeS3Session:
 
     def list_objects(self, prefix=None, start_after=None, delimiter=None, max_keys=None):
         with self._lock:
+            ## content_length as s3func's listings report it (fsck's
+            ## dead-bytes report reads it).
             items = [{'key': k, 'version_id': None,
-                      'upload_timestamp': self.upload_times.get(k)}
+                      'upload_timestamp': self.upload_times.get(k),
+                      'content_length': len(self.store[k][0])}
                      for k in sorted(self.store)
                      if prefix is None or k.startswith(prefix)]
         return FakeListResp(items)

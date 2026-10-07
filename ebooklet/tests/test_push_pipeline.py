@@ -22,13 +22,11 @@ from ebooklet import (
     ConcurrentCompactionError,
 )
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB, gid_of
 
-NUM_GROUPS = 5
-
-
-def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=NUM_GROUPS):
+def _seed(store, db_key, tmp_path, name='seed.blt', items=None, group_bytes=TEST_GB):
     conn = fake_s3.FakeS3Connection(store, db_key)
-    with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
         assert eb.changes().push()
@@ -81,18 +79,17 @@ def test_pipelined_push_content_identical(tmp_path):
         for gid, gen in manifest.items():
             data = store[f'testdb/{utils.group_obj_key(gid, gen)}'][0]
             for key, (ts, val) in _unpack_group(data).items():
-                assert utils.key_to_group_id(key, NUM_GROUPS) == gid
+                ## Each packed member lives in the group its index entry names.
+                assert utils.decode_index_entry(eb._remote_index[key])[1] == gid
                 packed_all[key] = (ts, val, gid, gen)
         assert {k: v[1] for k, v in packed_all.items()} == expected
 
         ## Every index entry slices its group object to the right bytes, and
         ## the staged ts is identical to the packed ts.
         for key in expected:
-            entry = eb._remote_index[key]
-            ts = utils.bytes_to_int(entry[:7])
-            offset = utils.bytes_to_int(entry[7:11])
-            length = utils.bytes_to_int(entry[11:15])
+            ts, entry_gid, offset, length = utils.decode_index_entry(eb._remote_index[key])
             p_ts, p_val, gid, gen = packed_all[key]
+            assert entry_gid == gid
             assert ts == p_ts, f'{key}: staged ts != packed ts'
             data = store[f'testdb/{utils.group_obj_key(gid, gen)}'][0]
             assert data[offset:offset + length] == expected[key]
@@ -154,6 +151,8 @@ def test_progress_records(tmp_path, caplog):
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     try:
+        expected_groups = {gid_of(eb, f'k{i}') for i in range(15)}
+        assert len(expected_groups) > 1, 'precondition: several groups'
         for i in range(15):
             eb[f'k{i}'] = bytes([97 + i]) * 60   # touch every group
         with caplog.at_level(logging.INFO, logger='ebooklet.push'):
@@ -169,10 +168,9 @@ def test_progress_records(tmp_path, caplog):
     summaries = [m for m in msgs if m.startswith('push upload finished')]
     commits = [m for m in msgs if m.startswith('commit succeeded')]
     assert len(starts) == 1 and len(summaries) == 1 and len(commits) == 1
-    ## The affected-group count depends on key hashing (15 keys may land in
-    ## fewer than NUM_GROUPS groups) - the start record is the authority.
+    ## Every changed key already on the remote repacks its own group.
     n_groups = int(re.search(r'starting: (\d+) group', starts[0]).group(1))
-    assert 1 <= n_groups <= NUM_GROUPS
+    assert n_groups == len(expected_groups)
     assert len(groups) == n_groups
     assert all(r.levelno == logging.INFO for r in records)
 
@@ -318,7 +316,7 @@ def test_pack_failure_flows_to_pushresult(tmp_path, monkeypatch):
         assert len(result.failures) == 1
         (failed_gid, msg), = result.failures.items()
         assert 'RuntimeError: induced pack failure' in msg
-        failed_keys = {k for k in changed if utils.key_to_group_id(k, NUM_GROUPS) == failed_gid}
+        failed_keys = {k for k in changed if gid_of(eb, k) == failed_gid}
         assert failed_keys, 'failures key is not a group id'
         for k in failed_keys:
             assert k in eb._journal.written, 'failed group keys must stay journaled'
@@ -343,10 +341,10 @@ def test_upload_failure_mid_stream(tmp_path):
     store = {}
     items = {f'k{i}': bytes([65 + i]) * 20 for i in range(10)}
     conn = _seed(store, 'testdb', tmp_path, 'w.blt', items=items)
-    gid0 = utils.key_to_group_id('k0', NUM_GROUPS)
-
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     try:
+        gid0 = gid_of(eb, 'k0')
+        assert gid0 is not None, 'precondition'
         entry_before = eb._remote_index['k0']
         for i in range(10):
             eb[f'k{i}'] = f'NEW-{i}'.encode()
@@ -423,7 +421,7 @@ def test_push_packers_plumbing(tmp_path):
         open_ebooklet(conn, tmp_path / 'p0.blt', flag='r', push_packers=0)
 
     rcg_conn = fake_s3.FakeS3Connection(store, 'rcgdb')
-    with open_rcg(rcg_conn, tmp_path / 'rcg.blt', flag='n', num_groups=3, push_packers=2) as rcg:
+    with open_rcg(rcg_conn, tmp_path / 'rcg.blt', flag='n', group_bytes=TEST_GB, push_packers=2) as rcg:
         assert rcg._push_packers == 2
         assert rcg.changes().push()
     with pytest.raises(ValueError, match='push_packers'):

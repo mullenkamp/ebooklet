@@ -30,6 +30,7 @@ from .errors import (
     LockLostError,
     OfflineError,
     PushInProgressError,
+    UUIDMismatchError,
     TRANSPORT_ERRORS,
 )
 
@@ -64,10 +65,11 @@ class PushResult(msgspec.Struct):
     """
     The result of a push.
 
-    updated: the remote changed (the db-object commit happened, or - per-key
-    mode - objects were written/deleted). A partial REPLACEMENT push commits
-    nothing, so its updated is False; a partial ordinary push has already
-    committed its successful groups/keys, so its updated is True.
+    updated: the remote changed - the db-object commit happened. A partial
+    REPLACEMENT push commits nothing, so its updated is False; a partial
+    ordinary push commits its successful groups/keys (updated True), unless
+    every upload failed and nothing else (deletes, metadata, a new remote) was
+    pending - then nothing is committed and updated is False.
 
     failures: per-key/per-group upload failures as 'ExceptionClassName:
     message' strings; empty means no failures. The pending changes for failed
@@ -197,6 +199,15 @@ class Change:
                 del self._ebooklet._local_file[key]
                 journal.discard_written(key)
 
+        ## A discarded write whose key is missing from the local index copy
+        ## may be a delete-then-re-set: `del k` removed k's entry and
+        ## journaled a delete, the re-set cancelled that delete, and dropping
+        ## the write now leaves no journal trace - so the forced re-pull
+        ## below would be skipped, the index copy would stay without k, and
+        ## the next push would publish an index without it. (Also true of a
+        ## never-pushed key; the re-pull then simply restores nothing.)
+        restore_index = any(key not in self._ebooklet._remote_index for key in rm_keys)
+
         ## Cancel journaled deletions: forget them, then force an index
         ## re-pull to restore the entries __delitem__ removed from the local
         ## index copy (the timestamp-gated pull would skip an unchanged
@@ -217,7 +228,7 @@ class Change:
 
         journal.persist(self._ebooklet._local_file)
 
-        if discard_deletes:
+        if discard_deletes or restore_index:
             self._ebooklet._pull_remote_index(force=True)
 
         self._changelog_path.unlink()
@@ -270,13 +281,35 @@ class Change:
         ## this file's watermark - and carry on as an ordinary merge push.
         ## One extra HEAD, only on the absent path. Found by code review,
         ## 2026-09-08.
-        if not self._ebooklet._remote_session.initialized:
-            self._ebooklet._remote_session._load_db_metadata()
-            if self._ebooklet._remote_session.initialized:
-                logger.warning('the remote was reported absent when this session opened but exists '
-                               'now; adopting its index before pushing so this push merges into it '
-                               'instead of replacing it')
-                self._ebooklet._pull_remote_index(force=True)
+        remote_session = self._ebooklet._remote_session
+        appeared = False
+        if not remote_session.initialized:
+            remote_session._load_db_metadata()
+            appeared = remote_session.initialized
+
+        ## The open's uuid rule (check_local_remote_sync), on every push: a
+        ## remote made from a different local file is not this file's database.
+        ## The pre-push adoption below would skip it (its forced pull does not
+        ## check), reconciling this file against a foreign index - deleting
+        ## values, possibly the only copy, that it lacks - and re-stamping the
+        ## remote with this file's uuid, which locks out the writer that made
+        ## it. Checked on every push, not only the one that discovered the
+        ## remote, so a retry in the same session is refused too. A replacement
+        ## (flag 'n') replaces whatever is there.
+        if (remote_session.initialized and not journal.replace_pending
+                and remote_session.uuid != self._ebooklet._local_file.uuid):
+            raise UUIDMismatchError(
+                'The remote was created from a different local file (a different UUID) after this '
+                'session opened against it absent, so this push would not merge into it. Nothing was '
+                'pushed; the pending changes are retained. Open a new local file against the remote '
+                'and re-apply them there, or push this file elsewhere.'
+            )
+
+        if appeared:
+            logger.warning('the remote was reported absent when this session opened but exists '
+                           'now; adopting its index before pushing so this push merges into it '
+                           'instead of replacing it')
+            self._ebooklet._pull_remote_index(force=True)
 
         ## The push holds captured value offsets from the changelog sweep until
         ## its commit - a compaction (prune/clear) would invalidate them all,
@@ -304,43 +337,35 @@ class Change:
 
             self.build_changelog()
 
-            result = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._num_groups, lock=self._ebooklet.lock, loc_map=self._loc_map, comp0=self._comp0, packers=self._ebooklet._push_packers)
+            committed, failures = utils.update_remote(self._ebooklet._local_file, self._ebooklet._remote_index, self._ebooklet._remote_index_path, self._changelog_path, self._ebooklet._remote_session, force_push, journal, self._ebooklet._remote_state, journal.replace_pending, self._ebooklet.type, self._ebooklet._group_bytes, lock=self._ebooklet.lock, loc_map=self._loc_map, comp0=self._comp0, packers=self._ebooklet._push_packers)
 
-            if isinstance(result, dict):
+            if failures:
                 # Partial failure — don't clean up changelog so push can be retried.
                 # replace_pending is also kept so a retry redoes the full
                 # wipe-and-replace (the remote must never end up half old, half new).
-                # updated: a partial REPLACEMENT commits nothing (the old remote is
-                # untouched); a partial ordinary push has already committed its
-                # successful groups/keys (a failed commit PUT raises, never returns).
-                failures = {key: _failure_str(value) for key, value in result.items()}
-                return PushResult(updated=not journal.replace_pending, failures=failures)
+                # updated is whether the commit happened: a partial REPLACEMENT
+                # commits nothing, and neither does a push whose every upload
+                # failed with nothing else pending (a failed commit PUT raises).
+                failures = {key: _failure_str(value) for key, value in failures.items()}
+                return PushResult(updated=committed, failures=failures)
 
-            ## A replacement session is a REPLACEMENT only until the replacement
-            ## push completes - after that the remote IS this session's database,
-            ## and the session must behave like a plain writer. Without this,
-            ## every subsequent push re-ran update_remote's wipe and re-uploaded
-            ## only the new changelog, silently destroying everything pushed
-            ## earlier in the session (0.9.4's data-loss fix, now journal-backed
-            ## so the intent also survives sessions instead of dying with _flag).
-            if journal.replace_pending:
-                journal.set_replace_pending(False)
-                journal.persist(self._ebooklet._local_file)
+            ## (A replacement session stops being one at its commit:
+            ## update_remote clears replace_pending in the journal write that
+            ## clears the committed keys. Without that, every later push re-ran
+            ## the wipe - 0.9.4's data-loss fix.)
 
-            ## After this session's own v2 commit, a formerly format-1 remote is
-            ## format 2 - index fetches are allowed again.
+            ## After this session's own commit, a formerly legacy remote is in
+            ## the current format - index fetches are allowed again. (The
+            ## commit itself refreshed the session's db metadata.)
             if self._ebooklet._index_fetch_suppressed:
                 self._ebooklet._index_fetch_suppressed = False
-                self._ebooklet._remote_session._load_db_metadata()
 
-            if result:
-                self._changelog_path.unlink()
-                self._changelog_path = None
+            ## No failures: nothing is left to retry from this changelog, whether
+            ## or not anything was committed (a no-op push included).
+            self._changelog_path.unlink()
+            self._changelog_path = None
 
-                if not self._ebooklet._remote_session.initialized:
-                    self._ebooklet._remote_session._load_db_metadata()
-
-            return PushResult(updated=bool(result), failures={})
+            return PushResult(updated=committed, failures={})
         finally:
             self._ebooklet._push_active = False
 
@@ -357,7 +382,8 @@ class EVariableLengthValue(MutableMapping):
             value_serializer: str = None,
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            num_groups: int = None,
+            *,
+            group_bytes=utils.UNSET,
             lock_timeout: int = 300,
             force_lock: bool = False,
             push_packers: int = 1,
@@ -365,9 +391,9 @@ class EVariableLengthValue(MutableMapping):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', num_groups, lock_timeout, force_lock, push_packers)
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', group_bytes, lock_timeout, force_lock, push_packers)
 
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, num_groups=None, lock_timeout=300, force_lock=False, push_packers=1):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, group_bytes=utils.UNSET, lock_timeout=300, force_lock=False, push_packers=1):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
@@ -410,7 +436,7 @@ class EVariableLengthValue(MutableMapping):
 
             ## Re-read the remote db metadata now that the lock is held: another
             ## writer may have created or updated the remote while this writer was
-            ## waiting on the lock, and the uuid/timestamp/init_bytes/num_groups
+            ## waiting on the lock, and the uuid/timestamp/init_bytes/format
             ## cached at session creation would otherwise be stale (a writer with a
             ## stale uuid=None would skip the remote index pull and clobber the
             ## other writer's push).
@@ -426,23 +452,29 @@ class EVariableLengthValue(MutableMapping):
         local_file = None
         remote_index = None
         try:
+            remote_kind = remote_session.storage_kind
+            ## Legacy remotes (format 1, or hash-grouped format 2) are never
+            ## read; only the replacement paths may proceed (gate below).
+            legacy_remote = remote_kind == utils.STORAGE_LEGACY
+            explicit_mode = group_bytes is not utils.UNSET
+            wanted_kind = None
+            if explicit_mode:
+                wanted_kind = utils.STORAGE_GROUPED if group_bytes is not None else utils.STORAGE_PER_KEY
+
             ## flag 'n' guard: the 'n' contract keeps the old remote readable until
-            ## push, and those reads need the OLD grouping - a conflicting
-            ## num_groups cannot be honored. Carve-out: a format-1 remote is
-            ## never read (index-fetch-suppressed replacement), so its old
-            ## grouping is irrelevant and a fresh num_groups choice is fine.
-            v1_remote = (remote_session.initialized and remote_session.format_version is not None
-                         and remote_session.format_version < utils.SUPPORTED_FORMAT_VERSION)
-            if (flag == 'n' and not v1_remote and num_groups is not None
-                    and remote_session.num_groups is not None and num_groups != remote_session.num_groups):
+            ## push, and those reads need the OLD storage mode's index layout - a
+            ## conflicting mode cannot be honored. (A different group_bytes within
+            ## grouped mode is fine: it only steers this writer's allocation.)
+            if (flag == 'n' and explicit_mode and remote_kind in (utils.STORAGE_PER_KEY, utils.STORAGE_GROUPED)
+                    and wanted_kind != remote_kind):
                 raise ValueError(
-                    f"num_groups={num_groups} conflicts with the existing remote's num_groups={remote_session.num_groups}. "
-                    "flag 'n' keeps the old remote readable until push, which requires the existing grouping. "
-                    "Either omit num_groups to inherit it, or call delete_remote() first to change the grouping."
+                    f"group_bytes={group_bytes!r} asks for {wanted_kind} storage, but the existing remote "
+                    f"is {remote_kind}. flag 'n' keeps the old remote readable until push, which requires "
+                    "its storage mode. Either omit group_bytes to inherit it, or call delete_remote() "
+                    'first to change the storage mode.'
                 )
 
             ## Init the local file
-            local_file_existed = local_file_path.exists()
             local_file, overwrite_remote_index = utils.init_local_file(local_file_path, flag, remote_session, value_serializer, n_buckets, buffer_size)
 
             ## Load the persistent journal. flag 'n' recreates the local file,
@@ -504,30 +536,103 @@ class EVariableLengthValue(MutableMapping):
                     utils.forget_remote_incarnation(local_file, journal, remote_state,
                                                     reason=f"open flag='{flag}'")
 
-            ## Format gate (no-compat ruling): 0.10 reads ONLY format-2
-            ## remotes. A format-1 remote is refused for r/w/c; the two
+            ## Format gate. 0.11 reads per-key (format 2) and write-order
+            ## grouped (format 3) remotes. Legacy remotes - format 1, and
+            ## hash-grouped format 2 - are refused for r/w/c; the two
             ## REPLACEMENT paths (flag='n', and 'w' recovering a crashed 'n'
             ## via the journaled intent) may proceed, but run "index-fetch-
-            ## suppressed": no v1 index body is ever ingested - reads serve
-            ## only the local image until this session's own v2 commit.
+            ## suppressed": no legacy index body is ever ingested - reads serve
+            ## only the local image until this session's own commit.
             index_fetch_suppressed = False
-            if v1_remote:
+            if legacy_remote:
                 if flag == 'n' or journal.replace_pending:
                     index_fetch_suppressed = True
                 else:
+                    if remote_session.legacy_num_groups is not None:
+                        what = (f'a hash-grouped remote (format_version {remote_session.format_version}, '
+                                f'num_groups={remote_session.legacy_num_groups})')
+                    else:
+                        what = f'a format_version {remote_session.format_version} remote'
                     raise utils.UnsupportedFormatError(
-                        f'This remote database uses storage format_version '
-                        f'{remote_session.format_version}; 0.10 has no format-1 read path. '
-                        "Re-create the remote by re-pushing it with flag='n' (re-pass "
-                        'num_groups - it is not inherited from the old remote).'
+                        f'This is {what}, which ebooklet >= 0.11 does not read. Move it to the '
+                        "current format: with ebooklet<0.11, open it 'w' against its remote and "
+                        'call load_items() so the local file holds every value, then '
+                        "delete_remote(); then push the local file again with this ebooklet "
+                        '(it becomes a write-order grouped remote).'
                     )
 
+            ## Resolve the storage mode BEFORE the index fetch - the sidecar's
+            ## layout follows it. An existing remote decides (an explicit
+            ## group_bytes for the other mode is ignored with a warning; under
+            ## flag 'n' it raised above). A READER with no remote to ask
+            ## (offline, or the remote is gone) holds an index, and its layout
+            ## decides in the same way. Otherwise an explicit group_bytes, then
+            ## the journal's recorded mode, then the 0.11 default: grouped. (A
+            ## writer never infers from the sidecar: a 0.10 hash-grouped
+            ## sidecar is 15 bytes too, and a writer's mode decides what it
+            ## pushes.)
+            remote_index_path = utils.remote_index_sidecar_path(local_file_path)
+            sidecar_len = utils.sidecar_value_len(remote_index_path)
+            if remote_kind in (utils.STORAGE_PER_KEY, utils.STORAGE_GROUPED):
+                storage = remote_kind
+                deciding = 'the remote'
+            elif flag == 'r' and remote_kind is None and sidecar_len is not None:
+                storage = (utils.STORAGE_GROUPED if sidecar_len == utils.INDEX_LEN_GROUPED
+                           else utils.STORAGE_PER_KEY)
+                deciding = "this reader's local index"
+            else:
+                storage = None
+            if storage is not None:
+                if explicit_mode and wanted_kind != storage:
+                    warnings.warn(
+                        f'group_bytes={group_bytes!r} asks for {wanted_kind} storage, but '
+                        f'{deciding} is {storage}; {deciding} wins.',
+                        UserWarning, stacklevel=4,
+                    )
+            elif explicit_mode:
+                storage = wanted_kind
+            elif journal.storage is not None:
+                storage = (utils.STORAGE_PER_KEY if journal.storage == utils.STORAGE_PER_KEY
+                           else utils.STORAGE_GROUPED)
+            else:
+                storage = utils.STORAGE_GROUPED
+            explicit_group_bytes = group_bytes if isinstance(group_bytes, int) else None
+            if storage == utils.STORAGE_GROUPED:
+                resolved_group_bytes = _grouped_target(explicit_group_bytes, remote_session)
+            else:
+                resolved_group_bytes = None
+            if flag != 'r':
+                journal.set_storage(storage)
+            index_value_len = (utils.INDEX_LEN_GROUPED if storage == utils.STORAGE_GROUPED
+                               else utils.INDEX_LEN_PER_KEY)
+
+            ## Sidecar layout. A sidecar whose layout does not match the mode
+            ## is discarded. That happens only when this open replaces it: a
+            ## live remote (re-fetched below, or a suppressed replacement over a
+            ## legacy remote, which is live too), or a writer. An OFFLINE
+            ## session, or a reader whose remote is gone, took its mode from
+            ## the sidecar above, so it always keeps it: the sidecar is what
+            ## keys() and the materialized values hang on.
+            if sidecar_len is not None and sidecar_len != index_value_len:
+                remote_index_path.unlink()
+                overwrite_remote_index = True
+
+            ## The cached remote state must describe the remote's CURRENT
+            ## commit, or the sidecar beside it is stale: a commit that crashed
+            ## after its PUT, or another writer's commit after this file's
+            ## writer lost its lock (whose local stamp can then even be NEWER
+            ## than the remote's). Re-fetch the whole index - never refresh the
+            ## manifest alone over a stale index.
+            if (not index_fetch_suppressed and remote_session.initialized
+                    and remote_state.remote_ts != remote_session.timestamp):
+                overwrite_remote_index = True
+
             if index_fetch_suppressed:
-                ## Never fetch the format-1 body. flag='n' starts from a fresh
+                ## Never fetch the legacy body. flag='n' starts from a fresh
                 ## EMPTY index (old keys read as absent - the documented
-                ## semantic narrowing of a replacement over v1); 'w'-recovery
-                ## keeps the crashed session's sidecar (the replacement image).
-                remote_index_path = utils.remote_index_sidecar_path(local_file_path)
+                ## semantic narrowing of a replacement over a legacy remote);
+                ## 'w'-recovery keeps the crashed session's sidecar (the
+                ## replacement image) when its layout fits.
                 if flag == 'n' and remote_index_path.exists():
                     remote_index_path.unlink()
                 index_fetched = False
@@ -537,29 +642,20 @@ class EVariableLengthValue(MutableMapping):
                 remote_index_path, index_fetched, fetched_manifest, fetched_meta = utils.get_remote_index_file(local_file_path, overwrite_remote_index, remote_session, flag)
 
             ## Open remote index file
-            remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size)
+            remote_index = utils.open_remote_index(remote_index_path, flag, n_buckets, buffer_size, index_value_len)
 
             ## The persistent remote-state cache (manifest + metadata section
-            ## of the last in-sync db object). Refresh it from what the open
-            ## fetched, or - when the local stamp says in-sync but the cache
-            ## disagrees (a crash window) - from a cheap ranged GET.
+            ## of the last in-sync db object), refreshed from what the open
+            ## fetched.
             ## The ingest stamp of the PREVIOUS index this local file adopted -
             ## captured BEFORE update_committed overwrites it; it is the
             ## reconciliation discriminator between remotely-sourced values
             ## (ts <= it) and post-sync local writes (ts > it).
             prev_synced_ts = remote_state.remote_ts
-            if fetched_manifest is not None:
+            if index_fetched:
                 remote_state.update_committed(fetched_manifest, fetched_meta, remote_session.timestamp)
                 utils.refresh_local_metadata(local_file, journal, fetched_meta)
                 remote_state.persist(local_file)
-            elif (not index_fetch_suppressed and remote_session.initialized
-                    and remote_session.timestamp is not None
-                    and remote_state.remote_ts != remote_session.timestamp
-                    and remote_session.num_groups is not None):
-                rs_manifest, rs_meta = utils.fetch_remote_state(remote_session)
-                if rs_manifest is not None:
-                    remote_state.update_committed(rs_manifest, rs_meta, remote_session.timestamp)
-                    remote_state.persist(local_file)
 
             ## Replay journaled deletes onto the fresh index copy so deleted
             ## keys cannot resurrect through contains/keys/len/reads (the
@@ -573,48 +669,17 @@ class EVariableLengthValue(MutableMapping):
             ## materialized copy is served (and re-pushed) forever. Only when
             ## this open actually INGESTED a fresh index - a reused cached
             ## sidecar was already reconciled by the ingest that fetched it.
+            ## LAST: stamp the local file with the timestamp of the commit it
+            ## just ingested (the same order as _pull_remote_index: the index
+            ## and the remote-state cache are durable first). Without it, every
+            ## later open saw the remote as newer and re-downloaded the whole
+            ## db object until a pull or push caught the stamp up. A skipped
+            ## reconciliation leaves the stamp old, so the next open retries it.
             if index_fetched:
-                utils.reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts)
+                removed = utils.reconcile_local_with_index(local_file, remote_index, journal, prev_synced_ts)
+                if removed is not None:
+                    local_file._set_file_timestamp(remote_session.timestamp)
 
-            ## Resolve num_groups: remote metadata > journal > user param.
-            ## (A v1 remote's grouping is never inherited - its objects are
-            ## never read; the replacement chooses fresh.)
-            if remote_session.num_groups is not None and not index_fetch_suppressed:
-                resolved_num_groups = remote_session.num_groups
-                if journal.num_groups_set and journal.num_groups not in (None, resolved_num_groups):
-                    warnings.warn(
-                        f'The journal records num_groups={journal.num_groups} but the remote says '
-                        f'{resolved_num_groups}; the remote wins and the journal is updated.',
-                        UserWarning, stacklevel=4,
-                    )
-                journal.set_num_groups(resolved_num_groups)
-            elif journal.num_groups_set:
-                if num_groups is not None and num_groups != journal.num_groups:
-                    raise ValueError(
-                        f'num_groups={num_groups} conflicts with this local file\'s recorded choice '
-                        f'of {journal.num_groups}. Omit num_groups to keep the recorded choice, or '
-                        'recreate the database (flag=\'n\') to change the grouping.'
-                    )
-                resolved_num_groups = journal.num_groups
-            else:
-                resolved_num_groups = num_groups
-                if resolved_num_groups is not None:
-                    journal.set_num_groups(resolved_num_groups)
-
-            ## Reopening a created-but-not-yet-pushed database without a
-            ## recorded num_groups choice would silently make the first push
-            ## per-key. The journal records the choice since 0.10 (tri-state:
-            ## num_groups_set distinguishes "per-key chosen" from "never
-            ## recorded"), so this warning survives only for pre-journal files.
-            if (flag in ('w', 'c') and local_file_existed and not remote_session.initialized
-                    and num_groups is None and not journal.num_groups_set):
-                warnings.warn(
-                    'This database has not been pushed to the remote yet and num_groups was not '
-                    'provided - the first push will use per-key storage. If the database was '
-                    'created with grouped storage, re-open it passing the same num_groups.',
-                    UserWarning,
-                    stacklevel=4,  # _init_common -> subclass __init__ -> open_ebooklet/open_rcg -> user code
-                )
         except BaseException:
             if remote_index is not None:
                 try:
@@ -651,7 +716,7 @@ class EVariableLengthValue(MutableMapping):
         ## calling _pull_remote_index.
         self._index_lock = threading.RLock()
         ## The persistent pending-change journal: written keys, pending deletes,
-        ## the num_groups choice, replacement intent, pending metadata. Replaces
+        ## the storage-mode choice, replacement intent, pending metadata. Replaces
         ## the memory-only _written_keys/_deletes sets (Seam 2).
         self._journal = journal
         ## The persistent remote-state cache: the manifest (gid -> live
@@ -674,8 +739,24 @@ class EVariableLengthValue(MutableMapping):
         ## True while a push is running - prune()/clear() raise during it
         ## (they would invalidate the push's captured value offsets).
         self._push_active = False
-        self._num_groups = resolved_num_groups
+        ## The storage mode pushes use: None = per-key, an int = grouped with
+        ## that packing target (see the group_bytes property). An explicit int
+        ## argument is kept so a re-pull never replaces it with the remote's.
+        self._group_bytes = resolved_group_bytes
+        self._explicit_group_bytes = explicit_group_bytes
 
+
+    @property
+    def group_bytes(self):
+        """
+        This session's storage mode: None for per-key storage (one remote
+        object per key, format 2), or the packing target in bytes for
+        write-order grouped storage (format 3). The mode follows the remote
+        once it exists. The target is the group_bytes argument if one was
+        passed; otherwise the value the grouped remote records (whatever its
+        last commit packed with); otherwise ebooklet.DEFAULT_GROUP_BYTES.
+        """
+        return self._group_bytes
 
     @property
     def offline(self):
@@ -928,73 +1009,60 @@ class EVariableLengthValue(MutableMapping):
                 else:
                     items_iter = ((k, self._remote_index.get(k)) for k in keys)
 
-                if self._num_groups is not None:
-                    groups_to_download = {}
-                    for key, remote_val in items_iter:
-                        ## Stale metadata entries can survive in indexes built
-                        ## from pre-format-2 local files - never fetched.
-                        if key == utils.metadata_key_str:
-                            continue
-                        ## Read-your-writes gate: a journaled pending write is
-                        ## the truth for its key - never pull the remote value
-                        ## over it, regardless of timestamps.
-                        if key in self._journal.written:
-                            continue
-                        remote_time_bytes = remote_val[:7] if remote_val else None
-                        check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                        if check:
-                            group_id = utils.key_to_group_id(key, self._num_groups)
-                            offset = utils.bytes_to_int(remote_val[7:11])
-                            length = utils.bytes_to_int(remote_val[11:15])
-                            timestamp_int = utils.bytes_to_int(remote_val[:7])
+                ## Each index entry says how its value is stored: a grouped
+                ## (19-byte) entry names its group, a per-key (15-byte) entry
+                ## its own object.
+                groups_to_download = {}
+                to_fetch = []
+                for key, remote_val in items_iter:
+                    ## Stale metadata entries can survive in indexes built
+                    ## from pre-format-2 local files - never fetched.
+                    if key == utils.metadata_key_str:
+                        continue
+                    ## Read-your-writes gate: a journaled pending write is
+                    ## the truth for its key - never pull the remote value
+                    ## over it, regardless of timestamps.
+                    if key in self._journal.written:
+                        continue
+                    remote_time_bytes = remote_val[:7] if remote_val else None
+                    check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
+                    if check:
+                        timestamp_int, group_id, offset, length = utils.decode_index_entry(remote_val)
+                        if group_id is None:
+                            to_fetch.append(key)
+                        else:
                             groups_to_download.setdefault(group_id, []).append((key, offset, length, timestamp_int))
 
-                    ## Offline: never dispatch fetch workers - raise ONE named
-                    ## error before any future exists (a worker raise would
-                    ## surface as a raw future exception, not a clean error).
-                    if self._offline and groups_to_download:
-                        needed = sorted(k for infos in groups_to_download.values()
-                                        for k, _o, _l, _t in infos)
-                        raise OfflineError(
-                            f'This session is offline and the value(s) for key(s) {needed} '
-                            'are not materialized in the local cache.'
-                        )
+                ## Offline: never dispatch fetch workers - raise ONE named
+                ## error before any future exists (a worker raise would
+                ## surface as a raw future exception, not a clean error).
+                if self._offline and (groups_to_download or to_fetch):
+                    needed = sorted([k for infos in groups_to_download.values()
+                                     for k, _o, _l, _t in infos] + to_fetch)
+                    raise OfflineError(
+                        f'This session is offline and the value(s) for key(s) {needed} '
+                        'are not materialized in the local cache.'
+                    )
 
-                    ## Resolve generations INSIDE _index_lock: the manifest is
-                    ## updated atomically with the index handle, so the pairs
-                    ## are consistent here.
-                    for group_id, key_infos in groups_to_download.items():
-                        gen = self._remote_state.manifest.get(group_id)
-                        if gen is None:
-                            ## The index claims members of a group the manifest
-                            ## does not reference - route through the re-check
-                            ## protocol like any missing backing object.
-                            failure_dict[f'_group_{group_id}'] = utils.MissingRemoteObject(
-                                f'{group_id}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
-                            continue
-                        f = executor.submit(utils.get_remote_group_values, group_id, gen, key_infos, self._local_file, self._remote_session)
-                        futures[f] = f'_group_{group_id}'
-                        dispatched.extend(k for k, _o, _l, _t in key_infos)
-                else:
-                    to_fetch = []
-                    for key, remote_val in items_iter:
-                        ## Read-your-writes gate (see the grouped branch).
-                        if key in self._journal.written:
-                            continue
-                        remote_time_bytes = remote_val[:7] if remote_val else None
-                        check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
-                        if check:
-                            to_fetch.append(key)
-                    ## Offline: see the grouped branch - one named error, no workers.
-                    if self._offline and to_fetch:
-                        raise OfflineError(
-                            f'This session is offline and the value(s) for key(s) '
-                            f'{sorted(to_fetch)} are not materialized in the local cache.'
-                        )
-                    for key in to_fetch:
-                        f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
-                        futures[f] = key
-                    dispatched.extend(to_fetch)
+                ## Resolve generations INSIDE _index_lock: the manifest is
+                ## updated atomically with the index handle, so the pairs
+                ## are consistent here.
+                for group_id, key_infos in groups_to_download.items():
+                    gen = self._remote_state.manifest.get(group_id)
+                    if gen is None:
+                        ## The index claims members of a group the manifest
+                        ## does not reference - route through the re-check
+                        ## protocol like any missing backing object.
+                        failure_dict[f'_group_{group_id}'] = utils.MissingRemoteObject(
+                            f'{group_id}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
+                        continue
+                    f = executor.submit(utils.get_remote_group_values, group_id, gen, key_infos, self._local_file, self._remote_session)
+                    futures[f] = f'_group_{group_id}'
+                    dispatched.extend(k for k, _o, _l, _t in key_infos)
+                for key in to_fetch:
+                    f = executor.submit(utils.get_remote_value, self._local_file, key, self._remote_session)
+                    futures[f] = key
+                dispatched.extend(to_fetch)
 
             for f in as_completed(futures):
                 key = futures[f]
@@ -1039,9 +1107,9 @@ class EVariableLengthValue(MutableMapping):
         restore index entries a journaled delete removed locally).
         """
         with self._index_lock:
-            ## An index-fetch-suppressed session (replacing a format-1 remote)
+            ## An index-fetch-suppressed session (replacing a legacy remote)
             ## must never ingest the old body; its view is the local image
-            ## until its own v2 commit.
+            ## until its own commit.
             if self._index_fetch_suppressed:
                 return
 
@@ -1053,17 +1121,36 @@ class EVariableLengthValue(MutableMapping):
             ## the index pull (a stranded reader).
             self._remote_session._load_db_metadata()
 
-            ## The session's group-mode view may predate the remote's creation (e.g. a
-            ## reader opened before the first push) - adopt the remote's num_groups so
-            ## subsequent reads use the right storage layout.
-            if self._remote_session.num_groups is not None:
-                if self._num_groups != self._remote_session.num_groups:
-                    self._num_groups = self._remote_session.num_groups
-                    self._journal.set_num_groups(self._num_groups)
-                    self._journal.persist(self._local_file)
+            ## The session's storage mode may predate the remote's creation (a
+            ## session opened before the first push, or a writer whose remote
+            ## turned out to exist at its pre-push re-check) - adopt the
+            ## remote's mode so pushes write the layout the index has, and its
+            ## recorded group_bytes unless this session was given one. A legacy
+            ## remote is never ingested.
+            remote_kind = self._remote_session.storage_kind
+            if remote_kind == utils.STORAGE_LEGACY:
+                raise utils.UnsupportedFormatError(
+                    'The remote is a legacy (hash-grouped or format-1) database, which '
+                    'ebooklet >= 0.11 does not read - see the open-time error for the move '
+                    'to the current format.'
+                )
+            if remote_kind == utils.STORAGE_GROUPED:
+                self._group_bytes = _grouped_target(self._explicit_group_bytes, self._remote_session)
+            elif remote_kind == utils.STORAGE_PER_KEY:
+                self._group_bytes = None
+            if remote_kind is not None and self.writable:
+                self._journal.set_storage(remote_kind)
+                self._journal.persist(self._local_file)
 
-            ## Determine if a change has occurred
-            overwrite_remote_index = force or utils.check_local_remote_sync(self._local_file, self._remote_session, self._flag)
+            ## Determine if a change has occurred: a newer remote stamp, or a
+            ## cached remote state that does not describe the remote's current
+            ## commit (see the open path).
+            overwrite_remote_index = (
+                force
+                or utils.check_local_remote_sync(self._local_file, self._remote_session, self._flag)
+                or (self._remote_session.initialized
+                    and self._remote_state.remote_ts != self._remote_session.timestamp)
+            )
             if not overwrite_remote_index:
                 return
 
@@ -1097,7 +1184,7 @@ class EVariableLengthValue(MutableMapping):
             ## is read BEFORE update_committed: it is the ingest stamp of the
             ## PREVIOUS index, the discriminator between remotely-sourced
             ## values (ts <= it) and post-sync local writes (ts > it).
-            utils.reconcile_local_with_index(self._local_file, new_index, self._journal, self._remote_state.remote_ts)
+            removed = utils.reconcile_local_with_index(self._local_file, new_index, self._journal, self._remote_state.remote_ts)
 
             ## Adopt the pulled manifest + metadata INSIDE the same critical
             ## section as the handle swap - load_items must never pair a new
@@ -1116,8 +1203,11 @@ class EVariableLengthValue(MutableMapping):
 
             ## Record the freshness of this view so an immediate second pull() is a
             ## no-op. NOTE: this stamp must stay AFTER the fetch gate above - hoisting
-            ## it would let a no-op re-check mask a later real index change.
-            self._local_file._set_file_timestamp(self._remote_session.timestamp)
+            ## it would let a no-op re-check mask a later real index change. A
+            ## skipped reconciliation leaves the stamp old, so the next pull
+            ## re-fetches and reconciles again.
+            if removed is not None:
+                self._local_file._set_file_timestamp(self._remote_session.timestamp)
 
 
     def _resolve_missing(self, missing):
@@ -1221,32 +1311,30 @@ class EVariableLengthValue(MutableMapping):
         manifest. Returns None when everything materialized, or the remaining
         failure (marker or error). Caller holds _index_lock.
         """
-        if self._num_groups is not None:
-            by_group = {}
-            for k in keys:
-                remote_val = self._remote_index.get(k)
-                if remote_val is None:
-                    continue
-                gid = utils.key_to_group_id(k, self._num_groups)
-                offset = utils.bytes_to_int(remote_val[7:11])
-                length = utils.bytes_to_int(remote_val[11:15])
-                timestamp_int = utils.bytes_to_int(remote_val[:7])
+        by_group = {}
+        per_key = []
+        for k in keys:
+            remote_val = self._remote_index.get(k)
+            if remote_val is None:
+                continue
+            timestamp_int, gid, offset, length = utils.decode_index_entry(remote_val)
+            if gid is None:
+                per_key.append(k)
+            else:
                 by_group.setdefault(gid, []).append((k, offset, length, timestamp_int))
-            for gid, key_infos in by_group.items():
-                gen = self._remote_state.manifest.get(gid)
-                if gen is None:
-                    return utils.MissingRemoteObject(
-                        f'{gid}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
-                failure = utils.get_remote_group_values(gid, gen, key_infos, self._local_file, self._remote_session)
-                if failure is not None:
-                    return failure
-            return None
-        else:
-            for k in keys:
-                failure = utils.get_remote_value(self._local_file, k, self._remote_session)
-                if failure is not None:
-                    return failure
-            return None
+        for gid, key_infos in by_group.items():
+            gen = self._remote_state.manifest.get(gid)
+            if gen is None:
+                return utils.MissingRemoteObject(
+                    f'{gid}.<unmanifested>', [k for k, _o, _l, _t in key_infos])
+            failure = utils.get_remote_group_values(gid, gen, key_infos, self._local_file, self._remote_session)
+            if failure is not None:
+                return failure
+        for k in per_key:
+            failure = utils.get_remote_value(self._local_file, k, self._remote_session)
+            if failure is not None:
+                return failure
+        return None
 
 
     def _load_item(self, key):
@@ -1260,8 +1348,10 @@ class EVariableLengthValue(MutableMapping):
         with self._index_lock:
             remote_val = self._remote_index.get(key)
             ## Resolve the generation inside the lock (manifest and index are
-            ## updated atomically).
-            gen = self._remote_state.manifest.get(utils.key_to_group_id(key, self._num_groups)) if self._num_groups is not None else None
+            ## updated atomically). The entry itself says whether the value is
+            ## grouped (and in which group) or stored per key.
+            group_id = utils.decode_index_entry(remote_val)[1] if remote_val else None
+            gen = self._remote_state.manifest.get(group_id) if group_id is not None else None
         remote_time_bytes = remote_val[:7] if remote_val else None
         check = utils.check_local_vs_remote(self._local_file, remote_time_bytes, key)
 
@@ -1272,16 +1362,13 @@ class EVariableLengthValue(MutableMapping):
                     'and this session is offline. (The key exists; its value needs the '
                     'remote.)'
                 )
-            if self._num_groups is not None and key != utils.metadata_key_str:
-                group_id = utils.key_to_group_id(key, self._num_groups)
+            if group_id is not None and key != utils.metadata_key_str:
                 if gen is None:
                     ## Index claims the key, manifest lacks its group - treat
                     ## like a missing backing object (re-check protocol).
                     failure = utils.MissingRemoteObject(f'{group_id}.<unmanifested>', [key])
                 else:
-                    offset = utils.bytes_to_int(remote_val[7:11])
-                    length = utils.bytes_to_int(remote_val[11:15])
-                    timestamp_int = utils.bytes_to_int(remote_val[:7])
+                    timestamp_int, _gid, offset, length = utils.decode_index_entry(remote_val)
                     failure = utils.get_remote_group_value(group_id, gen, key, offset, length, timestamp_int, self._local_file, self._remote_session)
             else:
                 failure = utils.get_remote_value(self._local_file, key, self._remote_session)
@@ -1516,7 +1603,8 @@ class RemoteConnGroup(EVariableLengthValue):
             flag: str = "r",
             n_buckets: int=12007,
             buffer_size: int = 2**22,
-            num_groups: int = None,
+            *,
+            group_bytes=utils.UNSET,
             lock_timeout: int = 300,
             force_lock: bool = False,
             push_packers: int = 1,
@@ -1524,7 +1612,7 @@ class RemoteConnGroup(EVariableLengthValue):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', num_groups, lock_timeout, force_lock, push_packers)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', group_bytes, lock_timeout, force_lock, push_packers)
 
 
     def add(self, remote_conn: remote.S3Connection, key: str = None, user_meta=None):
@@ -1616,6 +1704,45 @@ class RemoteConnGroup(EVariableLengthValue):
         self.add(remote_conn, key=key)
 
 
+def _grouped_target(explicit_group_bytes, remote_session):
+    """The packing target of a grouped session: the group_bytes argument if
+    one was passed; else the value the grouped remote records (what its last
+    commit packed with); else ebooklet.DEFAULT_GROUP_BYTES."""
+    if explicit_group_bytes is not None:
+        return explicit_group_bytes
+    if remote_session.storage_kind == utils.STORAGE_GROUPED and remote_session.group_bytes is not None:
+        return remote_session.group_bytes
+    return utils.DEFAULT_GROUP_BYTES
+
+
+def _check_group_bytes_arg(group_bytes, num_groups):
+    """
+    Validate the storage-mode arguments; returns group_bytes (utils.UNSET,
+    None, or a validated int). num_groups is the pre-0.11 hash-grouping
+    argument, kept for one release: an explicit num_groups=None keeps its old
+    meaning - per-key storage - so callers that pass it keep their layout; an
+    int is refused (hash grouping is gone).
+    """
+    if num_groups is not utils.UNSET:
+        if num_groups is not None:
+            raise ValueError(
+                'num_groups (hash grouping) was removed in ebooklet 0.11. Grouped storage now '
+                'fills groups in write order up to group_bytes (default '
+                f'{utils.DEFAULT_GROUP_BYTES} bytes); pass group_bytes=<int> to choose the '
+                'target, group_bytes=None for per-key storage, or omit it.'
+            )
+        if group_bytes is not utils.UNSET:
+            raise ValueError('pass group_bytes only (num_groups is the removed pre-0.11 argument).')
+        group_bytes = None
+    if group_bytes is utils.UNSET or group_bytes is None:
+        return group_bytes
+    if isinstance(group_bytes, bool) or not isinstance(group_bytes, int):
+        raise TypeError('group_bytes must be an int (bytes per group) or None (per-key storage).')
+    if not 1 <= group_bytes <= utils._MAX_GROUP_BYTES:
+        raise ValueError(f'group_bytes must be between 1 and {utils._MAX_GROUP_BYTES}.')
+    return group_bytes
+
+
 def _check_offline_arg(offline, flag):
     if not (offline is False or offline is True or offline == 'auto'):
         raise ValueError("offline must be False, 'auto', or True.")
@@ -1630,11 +1757,13 @@ def open_ebooklet(
     value_serializer: str = None,
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    num_groups: int = None,
+    *,
+    group_bytes=utils.UNSET,
     lock_timeout: int = 300,
     force_lock: bool = False,
     offline: Union[bool, str] = False,
     push_packers: int = 1,
+    num_groups=utils.UNSET,
     ):
     """
     Open an S3 dbm-style database. This allows the user to interact with an S3 bucket like a MutableMapping (python dict) object.
@@ -1660,16 +1789,18 @@ def open_ebooklet(
         The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
         This is only used when the file is open for writing.
 
-    num_groups : int or None
-        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
-        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
-        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+    group_bytes : int, None, or omitted
+        The remote storage mode. An int means grouped storage (format 3): at each push, keys new to the remote are packed in local-file write order into the current last group, then into fresh groups, each filled up to group_bytes bytes, so an append uploads the new data plus at most one partly filled group. Keys already on the remote keep their group (an update repacks it); deletes only remove the index entry. None means per-key storage (format 2): one remote object per key.
+        Omitted: an existing remote keeps its mode and the group_bytes it records (whatever its last push packed with); a new database is grouped at ebooklet.DEFAULT_GROUP_BYTES (32 MiB). An int for a grouped remote changes the target from this session's pushes on (existing groups keep their size) and is recorded by its commits. An explicit value for the other mode than the remote's is ignored with a warning (with flag='n' it raises - call delete_remote() first to change the mode).
 
     lock_timeout : int
         Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
 
     force_lock : bool
         If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
+
+    num_groups : None
+        Removed in 0.11 (hash grouping); kept for one release. An explicit num_groups=None keeps its old meaning, per-key storage (same as group_bytes=None), so existing callers keep their layout; an int raises ValueError - use group_bytes.
 
     offline : False, 'auto', or True
         Offline READ mode (requires flag='r'). True: never touch the remote -
@@ -1715,10 +1846,7 @@ def open_ebooklet(
     |         | for reading and writing                   |
     +---------+-------------------------------------------+
     """
-    if num_groups is not None and num_groups < 1:
-        raise ValueError('num_groups must be a positive integer.')
-    if num_groups is not None:
-        num_groups = utils.next_prime(num_groups)
+    group_bytes = _check_group_bytes_arg(group_bytes, num_groups)
 
     _check_offline_arg(offline, flag)
 
@@ -1727,13 +1855,13 @@ def open_ebooklet(
     if offline is True:
         if not local_file_path.exists():
             raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
-        return EVariableLengthValue(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, push_packers=push_packers)
+        return EVariableLengthValue(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, push_packers=push_packers)
 
     if offline == 'auto':
         ## Wrap the WHOLE online open (both remote touches: the metadata HEAD
         ## and the index fetch) - a transport failure from either falls back.
         try:
-            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             ## Typed ebooklet errors never fall back (TRANSPORT_ERRORS lists
             ## transport classes only; this is the belt to the design rule).
@@ -1744,7 +1872,7 @@ def open_ebooklet(
                 f'serving the local data at {local_file_path} as-is (it may be stale).',
                 UserWarning, stacklevel=2,
             )
-            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True, push_packers=push_packers)
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, offline=True, push_packers=push_packers)
 
     local_file_exists = local_file_path.exists()
 
@@ -1755,7 +1883,7 @@ def open_ebooklet(
     if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
 
-    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
 
 
 def open_rcg(
@@ -1764,11 +1892,13 @@ def open_rcg(
     flag: str = "r",
     n_buckets: int=12007,
     buffer_size: int = 2**22,
-    num_groups: int = None,
+    *,
+    group_bytes=utils.UNSET,
     lock_timeout: int = 300,
     force_lock: bool = False,
     offline: Union[bool, str] = False,
     push_packers: int = 1,
+    num_groups=utils.UNSET,
     ):
     """
     Open an S3-backed remote connection group. A remote connection group stores S3Connection references as key-value pairs, using orjson serialization.
@@ -1791,16 +1921,17 @@ def open_rcg(
         The buffer memory size in bytes used for writing. Writes are first written to a block of memory, then once the buffer if filled up it writes to disk. This is to reduce the number of writes to disk and consequently the CPU write overhead.
         This is only used when the file is open for writing.
 
-    num_groups : int or None
-        The number of groups for grouped S3 object storage. If not already prime, this value will be rounded up to the nearest prime for better hash distribution. Required when creating a new database (flag='n'). If None for a new database, per-key storage is used.
-        For databases already pushed to the remote, this value is read from S3 metadata and the user-provided value is ignored. For a database created locally but NOT yet pushed, the creation-time choice is not recorded anywhere - re-pass the same num_groups when reopening before the first push; reopening without it emits a UserWarning and the first push would use per-key storage.
-        Guidance: aim for groups of 10-100MB each. A reasonable starting point is max(10, total_expected_keys // 50). Too few groups means large S3 objects and slow partial updates; too many means more API calls per push. Each group's data is limited to 4GB due to offset encoding.
+    group_bytes : int, None, or omitted
+        The remote storage mode - see open_ebooklet for the full semantics. Omitted: an existing remote keeps its mode and recorded group_bytes; a new group is grouped at ebooklet.DEFAULT_GROUP_BYTES (a catalogue typically fits one group, so a full read is one request).
 
     lock_timeout : int
         Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
 
     force_lock : bool
         If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
+
+    num_groups : None
+        Removed in 0.11 - see open_ebooklet.
 
     offline : False, 'auto', or True
         Offline READ mode (requires flag='r') - see open_ebooklet for the full
@@ -1832,10 +1963,7 @@ def open_rcg(
     |         | for reading and writing                   |
     +---------+-------------------------------------------+
     """
-    if num_groups is not None and num_groups < 1:
-        raise ValueError('num_groups must be a positive integer.')
-    if num_groups is not None:
-        num_groups = utils.next_prime(num_groups)
+    group_bytes = _check_group_bytes_arg(group_bytes, num_groups)
 
     _check_offline_arg(offline, flag)
 
@@ -1844,12 +1972,12 @@ def open_rcg(
     if offline is True:
         if not local_file_path.exists():
             raise OfflineError(f'offline=True requires an existing local file; nothing found at {local_file_path}.')
-        return RemoteConnGroup(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, push_packers=push_packers)
+        return RemoteConnGroup(remote_session=remote.OfflineSession(), local_file_path=local_file_path, flag='r', n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, push_packers=push_packers)
 
     if offline == 'auto':
         ## Wrap the WHOLE online open (both remote touches) - see open_ebooklet.
         try:
-            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             if isinstance(err, Error):
                 raise
@@ -1858,7 +1986,7 @@ def open_rcg(
                 f'serving the local data at {local_file_path} as-is (it may be stale).',
                 UserWarning, stacklevel=2,
             )
-            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, offline=True, push_packers=push_packers)
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, offline=True, push_packers=push_packers)
 
     local_file_exists = local_file_path.exists()
 
@@ -1869,6 +1997,6 @@ def open_rcg(
     if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
 
-    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, num_groups=num_groups, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
 
 

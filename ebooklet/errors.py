@@ -9,7 +9,7 @@ HTTPError parentage, so pre-taxonomy `except ValueError` / `except HTTPError`
 handlers continue to work while consumers migrate to the typed names.
 
 Deliberately NOT typed (stay builtin): argument/configuration validation
-(reserved-key and key-charset guards, num_groups conflicts, connection
+(reserved-key and key-charset guards, storage-mode conflicts, connection
 parameter checks - TypeError/ValueError), the lock-acquire TimeoutError, and
 copy_remote's target-already-exists ValueError. Transport/status failures
 surface as urllib3.exceptions.HTTPError from the session layer.
@@ -50,19 +50,20 @@ class RemoteMissingError(Error, ValueError):
 
 class UnsupportedFormatError(Error, ValueError):
     """
-    The remote database's storage format_version does not match what this
-    ebooklet version supports (too new: upgrade ebooklet; too old: the remote
-    must be re-created - 0.10 dropped the format-1 read path). A compatibility
-    fault, deliberately distinct from RemoteIntegrityError (which means the
-    store contradicts its own index).
+    The remote database's storage format is one this ebooklet version does not
+    read (too new: upgrade ebooklet; format 1 or hash-grouped format 2: the
+    remote must be re-created - hydrate it with an older ebooklet, delete it,
+    republish). A compatibility fault, deliberately distinct from
+    RemoteIntegrityError (which means the store contradicts its own index).
     """
 
 
 class GroupTooLargeError(Error, ValueError):
     """
     A group's packed size would exceed the 4-byte offset/length fields
-    (2**32 - 1 bytes). Not retryable as-is: re-shard the database with a
-    larger num_groups (flag='n' re-creation), or store smaller values.
+    (2**32 - 1 bytes) - its members grew in place. Not retryable as-is:
+    re-create the database (flag='n', which re-allocates every group), or
+    store smaller values.
     """
 
 

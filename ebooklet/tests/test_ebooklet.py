@@ -11,6 +11,7 @@ import booklet
 import ebooklet
 from ebooklet import __version__, remote, RemoteConnGroup, EVariableLengthValue
 from copy import deepcopy
+from ebooklet.tests.groups import TEST_GB
 
 #################################################
 ### Parameters
@@ -39,7 +40,7 @@ flag = "n"
 buffer_size = 524288
 read_timeout = 60
 threads = 10
-num_groups = 11
+group_bytes = TEST_GB
 
 db_key = uuid.uuid8().hex[-13:]
 db_key2 = uuid.uuid8().hex[-13:]
@@ -112,7 +113,7 @@ def cleanup(request):
 
 
 def test_set_items():
-    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -123,7 +124,7 @@ def test_set_items():
 
 
 def test_update():
-    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         f.update(data_dict)
 
     with ebooklet.open_ebooklet(remote_conn, file_path) as f:
@@ -294,7 +295,7 @@ def test_clear():
 
 
 def test_push():
-    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -443,14 +444,14 @@ def test_remote_conn_grp_read_remote():
 def test_flag_n_does_not_delete_remote():
     """flag='n' should reset local file but preserve remote, pulling UUID and index from it."""
     # Ensure remote has data
-    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         f['persist_test'] = 'should_survive'
         f.sync()
         changes = f.changes()
         changes.push()
 
     # Re-open with flag='n' — local file is reset but inherits remote UUID and index
-    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn, file_path, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         # Remote data is accessible via transparent pull
         assert f.get('persist_test') == 'should_survive'
 

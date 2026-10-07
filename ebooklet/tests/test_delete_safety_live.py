@@ -22,7 +22,8 @@ except ImportError:
     import tomli as toml
 import uuid6 as uuid
 
-from ebooklet import open_ebooklet, remote, utils
+from ebooklet import open_ebooklet, remote
+from ebooklet.tests.groups import TEST_GB, gid_of
 
 script_path = pathlib.Path(os.path.realpath(os.path.dirname(__file__)))
 
@@ -62,15 +63,6 @@ def local_path(name):
     return p
 
 
-def _key_for_group(gid, num_groups, taken=()):
-    i = 0
-    while True:
-        k = f'k{i}'
-        if utils.key_to_group_id(k, num_groups) == gid and k not in taken:
-            return k
-        i += 1
-
-
 @pytest.fixture(scope="session", autouse=True)
 def cleanup(request):
     def remove_test_data():
@@ -96,21 +88,22 @@ def cleanup(request):
 
 
 def test_live_emptied_group_delete_spares_siblings():
-    """Emptying group 1 (num_groups=13) must remove every version of exactly
-    'db/1' and leave 'db/10' and 'db/12' fully intact on the real store."""
-    num_groups = 13
-    k1 = _key_for_group(1, num_groups)
-    k10 = _key_for_group(10, num_groups)
-    k12 = _key_for_group(12, num_groups)
+    """Emptying group 1 must remove every version of exactly 'db/1' and leave
+    'db/10' and 'db/12' (whose names share its prefix) fully intact on the real
+    store."""
+    k1, k10, k12 = 'k1', 'k10', 'k12'
 
     db_key = 'delsafe-grp-' + uuid.uuid8().hex[-10:]
     conn = make_conn(db_key)
 
-    with open_ebooklet(conn, local_path('grp-w'), flag='n', num_groups=num_groups) as eb:
-        eb[k1] = b'one'
-        eb[k10] = b'ten'
-        eb[k12] = b'twelve'
+    ## group_bytes=1: one key per group, gids in write order.
+    values = {f'k{i}': b'other' for i in range(13)}
+    values.update({k1: b'one', k10: b'ten', k12: b'twelve'})
+    with open_ebooklet(conn, local_path('grp-w'), flag='n', group_bytes=1) as eb:
+        for k in (f'k{i}' for i in range(13)):
+            eb[k] = values[k]
         assert eb.changes().push()
+        assert (gid_of(eb, k1), gid_of(eb, k10), gid_of(eb, k12)) == (1, 10, 12), 'precondition'
 
     with open_ebooklet(conn, local_path('grp-w2'), flag='w') as eb:
         del eb[k1]
@@ -145,12 +138,12 @@ def test_live_delete_remote_spares_sibling_db_and_own_lock():
     sib_conn = make_conn(sib_key)
 
     ## Seed the sibling database first.
-    with open_ebooklet(sib_conn, local_path('sib-w'), flag='n', num_groups=5) as eb:
+    with open_ebooklet(sib_conn, local_path('sib-w'), flag='n', group_bytes=TEST_GB) as eb:
         eb['other'] = b'precious'
         assert eb.changes().push()
 
     ## Seed the target database.
-    with open_ebooklet(conn, local_path('tgt-w'), flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, local_path('tgt-w'), flag='n', group_bytes=TEST_GB) as eb:
         eb['mine'] = b'value'
         assert eb.changes().push()
 

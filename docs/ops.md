@@ -1,8 +1,9 @@
 # Operations guide
 
 Recovery recipes and operational conventions for running ebooklet databases,
-collected from the changelogs into one place. Everything here assumes 0.10+
-(storage format 2, the persistent journal, and the typed exception taxonomy).
+collected from the changelogs into one place. Everything here assumes 0.11+
+(storage format 3 grouped / format 2 per-key, the persistent journal, and the
+typed exception taxonomy).
 
 ## The two failure channels of `push()`
 
@@ -42,9 +43,9 @@ if result.failures:
 ```
 
 Non-retryable failure classes are visible in the failure string —
-`GroupTooLargeError` means a group's packed size exceeds 4 GiB: re-shard the
-database (`flag='n'` re-creation with a larger `num_groups`) instead of
-retrying.
+`GroupTooLargeError` means a group's packed size exceeds 4 GiB - its members
+grew in place: re-create the database (`flag='n'`, which re-allocates every
+group) instead of retrying.
 
 ### `force_push=True` after a failed commit
 
@@ -97,8 +98,8 @@ RAID), raise it — `push_packers=threads` removes the gate entirely.
 
 RAM: each in-flight group holds its full packed payload in memory (SigV4
 needs the payload hash before the first byte), so peak usage is up to
-`threads` × the largest group size — size `num_groups` so groups stay in the
-10–100 MB range.
+`threads` × the largest group size — about 320 MB at the default 10 threads
+and 32 MiB `group_bytes`. Lower `group_bytes` (or `threads`) on a small machine.
 
 ### Never prune mid-push
 
@@ -197,8 +198,12 @@ including offline) keep their cache: their values heal per key, but
 `keys()`/`in`/`len` on a warm reader keep listing the dead claims until that
 local file is replaced.
 
-Changing `num_groups` needs `delete_remote()` followed by a `flag='n'` session:
-a `'w'`/`'c'` reopen keeps the journal's grouping. If you rebuild a remote from a
+Changing the storage mode (grouped vs per-key) needs `delete_remote()` followed
+by a push: an existing remote always decides the mode. (`group_bytes`, the
+grouped packing target, can change at any open: the remote records the value
+its last push packed with, writers that pass none inherit it, and passing
+another value packs new data to it from then on.)
+If you rebuild a remote from a
 *different* local file, other caches of the old incarnation raise
 `UUIDMismatchError` on their next online open — delete those local files and
 re-open from the remote.
@@ -222,20 +227,36 @@ re-open from the remote.
 - To pre-populate a cache for offline use, open online and call
   `eb.load_items()` (everything) or read the keys you need.
 
-## Upgrading format-1 remotes (pre-0.10) to format 2
+## Moving a hash-grouped remote (0.10) to 0.11
 
-There is no format-1 read path in 0.10 (deliberate): 0.10 refuses format-1
-remotes for `r`/`w`/`c` with `UnsupportedFormatError`, and pre-0.10 clients
-refuse format-2 remotes.
+0.11 replaces hash grouping (`num_groups`) with write-order groups (format 3)
+and has no read path for hash-grouped remotes (format 2 WITH `num_groups` in
+its metadata): they refuse `r`/`w`/`c` with `UnsupportedFormatError`. Per-key
+format-2 remotes are unaffected - 0.11 reads and writes them as they are, and
+they stay readable by 0.10 clients. Format-3 remotes refuse 0.10 clients
+("upgrade ebooklet").
 
-Per remote, once:
+Per hash-grouped remote, once:
 
-1. With the OLD ebooklet (0.9.x), push any pending local changes.
-2. Upgrade ebooklet.
-3. Re-push the database with `flag='n'` from a local file that holds the full
-   content (re-pass `num_groups` — it is not inherited from the old remote).
-4. RemoteConnGroup catalogues: re-add members after the member remotes are
-   upgraded.
+1. **Hydrate, with the OLD ebooklet** (`ebooklet<0.11`): open the remote `'w'`
+   against the local file that will be re-pushed and call `load_items()`. The
+   local file then holds every value. Check that nothing failed and that the
+   local key count equals the remote index's - after the delete, the local
+   file is the only copy. Push or discard any pending local changes first.
+2. `delete_remote()` (still with the old ebooklet, or via a 0.11 session's
+   `S3SessionWriter.delete_remote()`, which works on any format).
+3. **Republish with 0.11**: open the same local file `'w'` and push. A file
+   whose journal recorded `num_groups` becomes grouped (`group_bytes` omitted:
+   `DEFAULT_GROUP_BYTES`); the uuid and the metadata are kept, so existing
+   reader caches of the remote keep working (their 15-byte index sidecar is
+   discarded and re-fetched on their next online open; offline, it is kept).
+   Pushing to a NEW key instead leaves the old remote untouched until you
+   delete it.
 
-A crashed upgrade push is recoverable: the journaled replacement intent lets a
-`'w'` reopen of the same local file finish the replacement.
+## Format-1 remotes (pre-0.10)
+
+Refused like hash-grouped ones. With 0.9.x push any pending changes, then
+re-push the database with `flag='n'` from a local file that holds the full
+content using 0.11. A crashed `flag='n'` push is recoverable: the journaled
+replacement intent lets a `'w'` reopen of the same local file finish the
+replacement.

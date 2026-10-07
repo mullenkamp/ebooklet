@@ -14,11 +14,12 @@ import urllib3
 
 from ebooklet import open_ebooklet, utils
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB, gid_of
 
 
-def _seed(store, db_key, tmp_path, name='seed.blt', items=None, num_groups=5, metadata=None):
+def _seed(store, db_key, tmp_path, name='seed.blt', items=None, group_bytes=TEST_GB, metadata=None):
     conn = fake_s3.FakeS3Connection(store, db_key)
-    with open_ebooklet(conn, tmp_path / name, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, tmp_path / name, flag='n', group_bytes=group_bytes) as eb:
         for k, v in (items or {'k1': b'v1', 'k2': b'v2'}).items():
             eb[k] = v
         if metadata is not None:
@@ -106,21 +107,31 @@ def test_gc_failure_is_invisible_orphan(tmp_path):
     orphan nothing references."""
     store = {}
     conn = _seed(store, 'testdb', tmp_path, 'w.blt')
-    before = set(_group_objects(store))
+    old_manifest = utils.parse_db_payload(store['testdb'][0])[0]
 
     eb = open_ebooklet(conn, tmp_path / 'w.blt', flag='w')
     try:
+        k1_gid = gid_of(eb, 'k1')
+        old_obj = f'testdb/{utils.group_obj_key(k1_gid, old_manifest[k1_gid])}'
+        assert old_obj in store, 'precondition'
         eb['k1'] = b'v1b'
+        ## Phase D deletes through the session's exact-key delete_objects -
+        ## make it fail. (Patching delete_object alone patched nothing.)
         session = eb._remote_session._write_session
-        orig_del = session.delete_object
-        session.delete_object = lambda key: {'message': 'induced GC failure'}
+        orig_dels = session.delete_objects
+        def failing_delete_objects(keys=None, prefix=None, purge=True):
+            raise urllib3.exceptions.HTTPError('induced GC failure')
+        session.delete_objects = failing_delete_objects
         assert eb.changes().push(), 'a GC failure must not fail the push'
-        session.delete_object = orig_del
+        session.delete_objects = orig_dels
     finally:
         eb.close()
 
-    ## Old generation(s) remain as orphans; readers resolve only the manifest.
-    assert before & set(_group_objects(store)), 'expected the old generation to linger as an orphan'
+    ## The repacked group's OLD generation remains as an orphan; readers
+    ## resolve only the manifest, which now names the new generation.
+    new_manifest = utils.parse_db_payload(store['testdb'][0])[0]
+    assert new_manifest[k1_gid] != old_manifest[k1_gid], 'precondition: k1 group was repacked'
+    assert old_obj in store, 'expected the old generation to linger as an orphan'
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as r:
         assert r['k1'] == b'v1b'
@@ -151,37 +162,36 @@ def test_reader_heals_after_generational_gc(tmp_path):
 
 
 def test_emptied_group_lifecycle(tmp_path):
-    """Deleting a group's last member: no PUT for the group, it leaves the
-    manifest at commit, and its old generation is GC'd afterwards."""
+    """Deleting a group's last member (a lazy delete): NO upload at all - the
+    group leaves the manifest at commit, and its old generation is GC'd
+    afterwards."""
     store = {}
-    num_groups = 13
-    def key_for_group(gid):
-        i = 0
-        while True:
-            k = f'k{i}'
-            if utils.key_to_group_id(k, num_groups) == gid:
-                return k
-            i += 1
-    k_a = key_for_group(1)
-    k_b = key_for_group(2)
+    k_a, k_b = 'ka', 'kb'
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=num_groups) as eb:
+    ## group_bytes=1: one key per group.
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=1) as eb:
         eb[k_a] = b'a'
         eb[k_b] = b'b'
         assert eb.changes().push()
+        g_a, g_b = gid_of(eb, k_a), gid_of(eb, k_b)
+    assert g_a != g_b, 'precondition: separate groups'
 
     manifest = utils.parse_db_payload(store['testdb'][0])[0]
-    assert 1 in manifest and 2 in manifest
+    assert g_a in manifest and g_b in manifest
 
     with open_ebooklet(conn, tmp_path / 'w.blt', flag='w') as eb:
         del eb[k_a]
+        put_log = eb._remote_session._write_session.put_log
+        n_puts = len(put_log)
         assert eb.changes().push()
+        group_puts = [k for k in put_log[n_puts:] if k != 'testdb']
+    assert group_puts == [], f'a lazy delete uploaded group objects: {group_puts}'
 
     manifest = utils.parse_db_payload(store['testdb'][0])[0]
-    assert 1 not in manifest, 'emptied group still in the manifest'
-    assert 2 in manifest
-    assert not any(k.startswith('testdb/1.') for k in store), 'emptied group generation not GC\'d'
+    assert g_a not in manifest, 'emptied group still in the manifest'
+    assert g_b in manifest
+    assert not any(k.startswith(f'testdb/{g_a}.') for k in store), 'emptied group generation not GC\'d'
 
     fresh = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(fresh, tmp_path / 'fresh.blt', flag='r') as r:
@@ -194,24 +204,17 @@ def test_replacement_partial_failure_commits_nothing(tmp_path):
     remote stays fully intact (the pre-0.10 wipe-first protocol left a wiped,
     half-uploaded remote)."""
     store = {}
-    num_groups = 13
-    def key_for_group(gid):
-        i = 0
-        while True:
-            k = f'x{i}'
-            if utils.key_to_group_id(k, num_groups) == gid:
-                return k
-            i += 1
     conn = _seed(store, 'testdb', tmp_path, 'seed.blt', items={'old1': b'o1', 'old2': b'o2'},
-                 num_groups=num_groups)
+                 group_bytes=1)
 
-    k_a = key_for_group(1)
-    k_b = key_for_group(2)
-    gid_a = 1
+    ## A replacement allocates from gid 0 in write order; group_bytes=1 puts
+    ## each key in its own group, so the failing PUT hits exactly k_a's group.
+    k_a, k_b = 'xa', 'xb'
+    gid_a = 0
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        eb = open_ebooklet(conn, tmp_path / 'n.blt', flag='n', num_groups=num_groups)
+        eb = open_ebooklet(conn, tmp_path / 'n.blt', flag='n', group_bytes=1)
     try:
         eb[k_a] = b'na'
         eb[k_b] = b'nb'
@@ -226,6 +229,7 @@ def test_replacement_partial_failure_commits_nothing(tmp_path):
 
         result = eb.changes().push()
         assert result.failures, 'induced failure did not surface'
+        assert set(result.failures) == {gid_a}, 'precondition: exactly k_a group failed'
         assert result.updated is False   # a partial REPLACEMENT commits nothing
 
         ## The OLD remote is untouched and fully readable.
@@ -261,7 +265,7 @@ def test_replacement_sweep_aborts_on_lost_lock(tmp_path):
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        eb = open_ebooklet(conn, tmp_path / 'n.blt', flag='n', num_groups=5)
+        eb = open_ebooklet(conn, tmp_path / 'n.blt', flag='n', group_bytes=TEST_GB)
     try:
         eb['new1'] = b'n1'
         ## verify() is called at push start, pre-commit, pre-sweep: fail the third.
@@ -313,7 +317,7 @@ def test_metadata_replacement_never_carries_forward(tmp_path):
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(conn, tmp_path / 'n.blt', flag='n', num_groups=5) as eb:
+        with open_ebooklet(conn, tmp_path / 'n.blt', flag='n', group_bytes=TEST_GB) as eb:
             eb['fresh'] = b'f'
             assert eb.changes().push()
 
@@ -370,7 +374,7 @@ def test_per_key_mode_on_v2_payload(tmp_path):
     conn = fake_s3.FakeS3Connection(store, 'testdb')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n') as eb:
+        with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=None) as eb:
             eb['alpha'] = b'a'
             eb['beta'] = b'b'
             eb.set_metadata({'mode': 'per-key'})

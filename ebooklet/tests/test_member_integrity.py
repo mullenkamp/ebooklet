@@ -13,19 +13,22 @@ import pytest
 
 from ebooklet import open_ebooklet, utils, RemoteIntegrityError
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB, remote_index_gids
 
 
-def _keys_same_group(num_groups, n):
-    """Find n short keys that all hash into one group id."""
-    seen = {}
-    i = 0
-    while True:
-        k = f'm{i}'
-        gid = utils.key_to_group_id(k, num_groups)
-        seen.setdefault(gid, []).append(k)
-        if len(seen[gid]) == n:
-            return seen[gid], gid
-        i += 1
+def _keys_same_group(n):
+    """n short keys that, written together in one push, share a group (write-
+    order allocation; TEST_GB fits three of these small entries). Callers
+    assert the precondition after the push with _shared_gid."""
+    return [f'm{i}' for i in range(n)]
+
+
+def _shared_gid(store, db_key, keys):
+    """The one gid the committed index records for all of keys (asserted)."""
+    gids = remote_index_gids(store, db_key)
+    found = {gids[k] for k in keys}
+    assert len(found) == 1, f'precondition: {keys} share a group, got {found}'
+    return found.pop()
 
 
 def _group_store_key(store, db_key, gid):
@@ -60,13 +63,14 @@ def test_missing_member_is_loud_on_read(tmp_path):
     -> RemoteIntegrityError (0.9.4: `in` said True while `get` silently
     returned nothing)."""
     store = {}
-    (ka, kb), gid = _keys_same_group(5, 2)
+    ka, kb = _keys_same_group(2)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
         assert eb.changes().push()
+    gid = _shared_gid(store, 'testdb', [ka, kb])
 
     _repack_group_without(store, 'testdb', gid, {kb})
 
@@ -80,16 +84,19 @@ def test_missing_member_is_loud_on_read(tmp_path):
 
 def test_legit_member_deletion_resolves_to_clean_absence(tmp_path):
     """A stale reader whose index claims B reads it AFTER another writer
-    legitimately deleted B and pushed: one index re-pull -> clean absence
-    (0.9.4: silent absence with the stale index still claiming B)."""
+    legitimately deleted B and pushed. Deletes are lazy (0.11): the group
+    object is NOT rewritten, so the stale reader still finds B's bytes - a
+    consistent read of the snapshot its index describes (documented). Its next
+    pull converges: B is cleanly absent."""
     store = {}
-    (ka, kb), _gid = _keys_same_group(5, 2)
+    ka, kb = _keys_same_group(2)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
         assert eb.changes().push()
+    _shared_gid(store, 'testdb', [ka, kb])
 
     ## Reader opens now - its index snapshot claims kb.
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
@@ -103,8 +110,10 @@ def test_legit_member_deletion_resolves_to_clean_absence(tmp_path):
             del eb2[kb]
             assert eb2.changes().push()
 
-        assert reader.get(kb) is None         # re-check resolves to clean absence
-        assert kb not in reader               # ...and the index was refreshed
+        assert reader.get(kb) == b'bbb'       # stale snapshot: the lazy delete left the bytes
+        reader.changes().pull()
+        assert kb not in reader               # the refreshed index converges
+        assert reader.get(kb) is None
         assert reader[ka] == b'aaa'
     finally:
         reader.close()
@@ -116,13 +125,14 @@ def test_push_self_heal_preserved(tmp_path):
     repacked - instead of failing loudly. This is the recovery mechanism for
     test_missing_member_is_loud_on_read's error."""
     store = {}
-    (ka, kb, kc), gid = _keys_same_group(5, 3)
+    ka, kb, kc = _keys_same_group(3)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
         assert eb.changes().push()
+    gid = _shared_gid(store, 'testdb', [ka, kb])
 
     _repack_group_without(store, 'testdb', gid, {kb})
 
@@ -146,13 +156,14 @@ def test_empty_grouped_value_survives_repack(tmp_path):
     materialized used to fall into the lost-keys drop when its group was
     repacked - silently deleting the key."""
     store = {}
-    (ke, ka), _gid = _keys_same_group(5, 2)
+    ke, ka = _keys_same_group(2)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ke] = b''
         eb[ka] = b'aaa'
         assert eb.changes().push()
+    _shared_gid(store, 'testdb', [ke, ka])
 
     ## Fresh-local writer (ke not materialized) repacks the group.
     conn_w = fake_s3.FakeS3Connection(store, 'testdb')
@@ -170,13 +181,14 @@ def test_empty_grouped_value_survives_repack(tmp_path):
 def test_empty_grouped_value_reads_back(tmp_path):
     """The read path serves empty grouped values correctly (fresh reader)."""
     store = {}
-    (ke, ka), _gid = _keys_same_group(5, 2)
+    ke, ka = _keys_same_group(2)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ke] = b''
         eb[ka] = b'aaa'
         assert eb.changes().push()
+    _shared_gid(store, 'testdb', [ke, ka])
 
     conn_r = fake_s3.FakeS3Connection(store, 'testdb')
     with open_ebooklet(conn_r, tmp_path / 'r.blt', flag='r') as eb:
@@ -189,13 +201,14 @@ def test_full_recovery_returns_no_marker(tmp_path):
     produce a marker (an empty truthy marker would trigger a needless index
     re-pull per read)."""
     store = {}
-    (ka, kb), gid = _keys_same_group(5, 2)
+    ka, kb = _keys_same_group(2)
 
     conn = fake_s3.FakeS3Connection(store, 'testdb')
-    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', num_groups=5) as eb:
+    with open_ebooklet(conn, tmp_path / 'w.blt', flag='n', group_bytes=TEST_GB) as eb:
         eb[ka] = b'aaa'
         eb[kb] = b'bbb'
         assert eb.changes().push()
+    gid = _shared_gid(store, 'testdb', [ka, kb])
 
     _reorder_group(store, 'testdb', gid)      # offsets shift; both members present
 

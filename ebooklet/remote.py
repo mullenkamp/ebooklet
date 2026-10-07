@@ -147,6 +147,25 @@ class JsonSerializer:
         return msgspec.json.encode(self.to_dict())
 
 
+def _parse_recorded_group_bytes(value):
+    """The group_bytes a grouped remote records in its db-object metadata, or
+    None when it records none or an invalid one (warned)."""
+    if value is None:
+        return None
+    try:
+        group_bytes = int(value)
+    except (TypeError, ValueError):
+        group_bytes = None
+    if group_bytes is None or not 1 <= group_bytes <= utils._MAX_GROUP_BYTES:
+        warnings.warn(
+            f'The remote records an invalid group_bytes ({value!r}); ignoring it '
+            f'(the default, {utils.DEFAULT_GROUP_BYTES} bytes, applies unless one is passed).',
+            UserWarning, stacklevel=2,
+        )
+        return None
+    return group_bytes
+
+
 class S3SessionReader:
     """
 
@@ -176,6 +195,24 @@ class S3SessionReader:
         scattering `uuid is None` checks (Seam-1 decomposition).
         """
         return self.uuid is not None
+
+    @property
+    def storage_kind(self):
+        """
+        How the remote stores its values - decided by the db object's
+        metadata alone: None (no remote), utils.STORAGE_PER_KEY (format 2
+        without num_groups), utils.STORAGE_GROUPED (format 3, write-order
+        groups), or utils.STORAGE_LEGACY (format 1, or hash-grouped format 2 -
+        refused online since 0.11). The format NUMBER alone cannot classify a
+        remote: per-key remotes stay format 2.
+        """
+        if not self.initialized:
+            return None
+        if self.format_version == utils.FORMAT_GROUPED:
+            return utils.STORAGE_GROUPED
+        if self.format_version == utils.FORMAT_PER_KEY and self.legacy_num_groups is None:
+            return utils.STORAGE_PER_KEY
+        return utils.STORAGE_LEGACY
 
     def __enter__(self):
         return self
@@ -211,13 +248,21 @@ class S3SessionReader:
             self.timestamp = int(meta['timestamp'])
             self.uuid = uuid.UUID(hex=meta['uuid'])
             self.type = meta['type']
-            self.num_groups = int(meta['num_groups']) if 'num_groups' in meta else None
+            ## Only hash-grouped (pre-0.11) remotes carry num_groups; its
+            ## presence is what marks a format-2 remote as legacy.
+            self.legacy_num_groups = int(meta['num_groups']) if 'num_groups' in meta else None
+            ## A grouped remote records the group_bytes its last commit packed
+            ## with: the dataset's default for writers that pass none. A value
+            ## that is not a valid target is treated as unrecorded (the default
+            ## applies) rather than failing every open, readers included.
+            self.group_bytes = _parse_recorded_group_bytes(meta.get('group_bytes'))
         elif resp_obj.status == 404:
             self._init_bytes = None
             self.uuid = None
             self.timestamp = None
             self.type = None
-            self.num_groups = None
+            self.legacy_num_groups = None
+            self.group_bytes = None
             self.format_version = None
         else:
             raise urllib3.exceptions.HTTPError(resp_obj.error)
@@ -429,7 +474,8 @@ class S3SessionWriter(S3SessionReader):
             self.uuid = None
             self.timestamp = None
             self.type = None
-            self.num_groups = None
+            self.legacy_num_groups = None
+            self.group_bytes = None
             self.format_version = None
         else:
             raise ReadOnlyError('Session is not writable.')
@@ -467,7 +513,11 @@ class S3SessionWriter(S3SessionReader):
                 raise urllib3.exceptions.HTTPError(db_resp.error)
             src_manifest, _src_meta, src_index_bytes = utils.parse_db_payload(db_resp.data)
 
-            if src_manifest:
+            ## Branch on the storage kind, not on the manifest: a grouped remote
+            ## whose groups were all emptied has an empty manifest, and its
+            ## index keys are NOT object names. (Legacy remotes are copied
+            ## manifest-driven too - a pre-migration backup.)
+            if self.storage_kind != utils.STORAGE_PER_KEY:
                 child_keys = [utils.group_obj_key(gid, gen) for gid, gen in src_manifest.items()]
             else:
                 ## Per-key mode: the object names are the index's keys.
@@ -648,7 +698,9 @@ class OfflineSession:
     initialized = False
     uuid = None
     timestamp = None
-    num_groups = None
+    legacy_num_groups = None
+    group_bytes = None
+    storage_kind = None
     format_version = None
     type = None
     _init_bytes = None

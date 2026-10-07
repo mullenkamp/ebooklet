@@ -4,19 +4,51 @@ import pathlib
 import booklet
 from ebooklet import utils, remote, open_ebooklet
 from ebooklet.tests import fake_s3
+from ebooklet.tests.groups import TEST_GB
 import uuid6 as uuid
 
 
-def test_key_to_group_id():
-    # Deterministic
-    assert utils.key_to_group_id('test', 10) == utils.key_to_group_id('test', 10)
-    # Different keys can map to different groups
-    results = set(utils.key_to_group_id(str(i), 10) for i in range(100))
-    assert len(results) > 1
-    # Always within range
-    for i in range(100):
-        gid = utils.key_to_group_id(str(i), 10)
-        assert 0 <= gid < 10
+def test_plan_groups_packs_in_order_to_the_target():
+    """Keys fill a group in the given (write) order while the packed size
+    stays <= group_bytes; then a fresh gid opens."""
+    ## A fresh group packs header(4) + entries.
+    new_keys = [('a', 10), ('b', 10), ('c', 10), ('d', 10)]
+    assignment = utils.plan_groups(new_keys, None, 0, 7, 24)
+    ## 4+10+10 = 24 fits exactly (<=); the third key opens gid 8.
+    assert assignment == {'a': 7, 'b': 7, 'c': 8, 'd': 8}
+
+
+def test_plan_groups_exact_fit_boundary():
+    """size + entry == group_bytes fits; one byte over opens a new group."""
+    assignment = utils.plan_groups([('a', 10), ('b', 10)], None, 0, 0, 24)
+    assert assignment == {'a': 0, 'b': 0}
+    assignment = utils.plan_groups([('a', 10), ('b', 10)], None, 0, 0, 23)
+    assert assignment == {'a': 0, 'b': 1}
+
+
+def test_plan_groups_tops_up_the_tail_first():
+    assignment = utils.plan_groups([('a', 10), ('b', 10)], 3, 15, 4, 30)
+    assert assignment == {'a': 3, 'b': 4}
+    ## A full tail is not used.
+    assignment = utils.plan_groups([('a', 10)], 3, 25, 4, 30)
+    assert assignment == {'a': 4}
+
+
+def test_plan_groups_oversized_value_gets_its_own_group():
+    """A value larger than group_bytes still gets a group (a fresh group
+    always takes one key) - and the NEXT key opens another fresh group,
+    never the oversized one."""
+    assignment = utils.plan_groups([('big', 100), ('small', 5)], 3, 10, 4, 30)
+    assert assignment == {'big': 4, 'small': 5}
+
+
+def test_index_entry_codec():
+    grouped = utils.encode_group_entry(1_700_000_000_000_000, 12, 345, 678)
+    assert len(grouped) == utils.INDEX_LEN_GROUPED
+    assert utils.decode_index_entry(grouped) == (1_700_000_000_000_000, 12, 345, 678)
+    per_key = utils.int_to_bytes(1_700_000_000_000_000, 7) + b'\x00' * 8
+    assert len(per_key) == utils.INDEX_LEN_PER_KEY
+    assert utils.decode_index_entry(per_key) == (1_700_000_000_000_000, None, 0, 0)
 
 
 def test_pack_unpack_roundtrip():
@@ -86,34 +118,6 @@ def test_pack_group_offsets_merged_range():
         offset, length = offsets[key]
         rel_offset = offset - range_start
         assert chunk[rel_offset:rel_offset + length] == value
-
-
-def test_key_to_group_id_single_group():
-    """With num_groups=1 every key maps to group 0."""
-    for i in range(50):
-        assert utils.key_to_group_id(str(i), 1) == 0
-
-def test_is_prime_small():
-    assert not utils.is_prime_small(0)
-    assert not utils.is_prime_small(1)
-    assert utils.is_prime_small(2)
-    assert utils.is_prime_small(3)
-    assert not utils.is_prime_small(4)
-    assert utils.is_prime_small(5)
-    assert not utils.is_prime_small(9)
-    assert utils.is_prime_small(11)
-    assert utils.is_prime_small(97)
-    assert not utils.is_prime_small(100)
-
-
-def test_next_prime():
-    assert utils.next_prime(1) == 2
-    assert utils.next_prime(2) == 2
-    assert utils.next_prime(3) == 3
-    assert utils.next_prime(4) == 5
-    assert utils.next_prime(10) == 11
-    assert utils.next_prime(11) == 11
-    assert utils.next_prime(100) == 101
 
 
 def test_check_local_vs_remote(tmp_path):
@@ -321,14 +325,16 @@ class _CredS3Connection(fake_s3.FakeS3Connection):
         return remote.S3SessionWriter(sess, sess, self.db_key, self.db_key, self.threads)
 
 
-def test_copy_remote_indirect_path_different_creds(tmp_path):
+@pytest.mark.parametrize('group_bytes', [None, TEST_GB])
+def test_copy_remote_indirect_path_different_creds(tmp_path, group_bytes):
     """The one test that exercises the REAL indirect path end-to-end (fake-vs-fake
     same-creds copies never reach it). Different credentials force copy_remote to
     download+upload, then the target db must reopen (db-object metadata preserved
-    through the filter) and the per-key child bodies round-trip (read from .data)."""
+    through the filter) and the child bodies - per-key objects or group objects -
+    round-trip (read from .data)."""
     store = {}
     src_conn = _CredS3Connection(store, 'srcdb', 'akid-A', 'ak-A')
-    with open_ebooklet(src_conn, tmp_path / 'src.blt', flag='n') as eb:
+    with open_ebooklet(src_conn, tmp_path / 'src.blt', flag='n', group_bytes=group_bytes) as eb:
         eb['k1'] = b'v1'
         eb['k2'] = b'v2'
         assert eb.changes().push()

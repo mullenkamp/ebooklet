@@ -30,7 +30,8 @@ import uuid6 as uuid
 import urllib3
 
 from ebooklet import open_ebooklet, remote, RemoteIntegrityError
-from ebooklet.utils import key_to_group_id, MissingRemoteObject, metadata_key_str
+from ebooklet.utils import MissingRemoteObject, metadata_key_str
+from ebooklet.tests.groups import TEST_GB, gid_of
 
 script_path = pathlib.Path(os.path.realpath(os.path.dirname(__file__)))
 
@@ -47,7 +48,11 @@ except:
     access_key = os.environ['access_key']
 
 bucket = 'achelous'
-num_groups = 5
+## One key per group (a fresh group always takes one key): deleting a key
+## empties and drops its group, so a stale reader's fetch 404s and the re-check
+## protocol runs - the path these tests exercise. (Lazy deletes leave a
+## partly-deleted group's object, and its bytes, in place.)
+group_bytes = 1
 
 _conns = []
 _paths = []
@@ -72,16 +77,15 @@ def local_path(name):
     return p
 
 
-def seed_remote(conn, keys_values, ng=num_groups):
+def seed_remote(conn, keys_values, ng=group_bytes):
     p = local_path('seed404')
-    kwargs = {'num_groups': ng} if ng is not None else {}
-    with open_ebooklet(conn, p, flag='n', **kwargs) as eb:
+    with open_ebooklet(conn, p, flag='n', group_bytes=ng) as eb:
         for k, v in keys_values.items():
             eb[k] = v
         assert eb.changes().push()
 
 
-def sole_member_key(ng=num_groups):
+def sole_member_key(ng=group_bytes):
     """A key that is the only member of its group when seeded alone."""
     return 'key000'
 
@@ -215,7 +219,7 @@ def test_metadata_reads_are_local_in_format2():
     k = sole_member_key()
     conn = make_conn('metaint')
     p = local_path('metaint-seed')
-    with open_ebooklet(conn, p, flag='n', num_groups=num_groups) as eb:
+    with open_ebooklet(conn, p, flag='n', group_bytes=group_bytes) as eb:
         eb[k] = b'v1'
         eb.set_metadata({'m': 1})
         assert eb.changes().push()
@@ -284,19 +288,14 @@ def test_push_pull_404_is_loud_and_retryable():
     ## the unpulled member's value survives.
     conn = make_conn('pushfail')
     ## two keys in the SAME group
-    same, _control = [], None
-    i = 0
-    keys = []
-    while len(keys) < 2:
-        cand = f'key{i:03d}'
-        if not keys or key_to_group_id(cand, num_groups) == key_to_group_id(keys[0], num_groups):
-            keys.append(cand)
-        i += 1
-    k1, k2 = keys
-    seed_remote(conn, {k1: b'v1', k2: b'v2'})
+    k1, k2 = 'key000', 'key001'
+    seed_remote(conn, {k1: b'v1', k2: b'v2'}, ng=TEST_GB)
 
     with open_ebooklet(conn, local_path('pushfail-writer'), flag='w') as eb:
-        del eb[k1]  # k2 unmaterialized -> push must pull the group to repack
+        assert gid_of(eb, k1) == gid_of(eb, k2), 'precondition: one group'
+        ## An UPDATE repacks k1's group (a delete would be lazy and repack
+        ## nothing); k2 is unmaterialized, so the push must pull it.
+        eb[k1] = b'v1-new'
 
         original_get = eb._remote_session.get_object
 
@@ -311,12 +310,12 @@ def test_push_pull_404_is_loud_and_retryable():
 
         assert result.failures
         assert any('MissingRemoteObject' in v for v in result.failures.values())
-        assert k1 in eb._journal.deletes         # retry signal retained
+        assert k1 in eb._journal.written         # retry signal retained
 
         assert eb.changes().push()       # retry completes
 
     with open_ebooklet(conn, local_path('pushfail-reader'), flag='r') as eb:
-        assert eb.get(k1) is None
+        assert eb.get(k1) == b'v1-new'
         assert eb.get(k2) == b'v2'               # old silent path dropped k2
 
 
@@ -372,9 +371,10 @@ def test_live_group_object_deleted_under_reader():
     k = sole_member_key()
     conn = make_conn('live')
     seed_remote(conn, {k: b'v1'})
-    gid = key_to_group_id(k, num_groups)
 
     with open_ebooklet(conn, local_path('live-reader'), flag='r') as eb:
+        gid = gid_of(eb, k)
+        assert gid is not None, 'precondition'
         with conn.open('w') as s:
             ## Find and delete the group's LIVE generation object (format 2).
             children = [o['key'] for o in s.list_objects().iter_objects()]

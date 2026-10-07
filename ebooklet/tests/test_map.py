@@ -7,6 +7,7 @@ except ImportError:
     import tomli as toml
 import ebooklet
 from ebooklet import remote
+from ebooklet.tests.groups import TEST_GB
 
 #################################################
 ### Parameters
@@ -26,7 +27,7 @@ except:
     access_key = os.environ['access_key']
 
 bucket = 'achelous'
-num_groups = 11
+group_bytes = TEST_GB
 
 db_key_map = uuid.uuid8().hex[-13:]
 file_path_map = script_path.joinpath(db_key_map)
@@ -85,7 +86,7 @@ def cleanup(request):
 
 
 def test_map_all_keys():
-    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -99,7 +100,7 @@ def test_map_all_keys():
 
 
 def test_map_specific_keys():
-    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
 
@@ -118,7 +119,7 @@ def test_map_specific_keys():
 
 def test_map_with_remote_data():
     # Write and push to S3
-    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
         f.changes().push()
@@ -138,11 +139,11 @@ def test_map_with_remote_data():
 
 
 def test_map_separate_write_db():
-    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as source:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', group_bytes=group_bytes) as source:
         for key, value in data_dict.items():
             source[key] = value
 
-        with ebooklet.open_ebooklet(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', num_groups=num_groups) as dest:
+        with ebooklet.open_ebooklet(remote_conn_map2, file_path_map2, 'n', value_serializer='pickle', group_bytes=group_bytes) as dest:
             results = list(source.map(remap_key, n_workers=2))
             for key, value in results:
                 dest[key] = value
@@ -153,7 +154,7 @@ def test_map_separate_write_db():
 
 
 def test_map_skip_none():
-    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', num_groups=num_groups) as f:
+    with ebooklet.open_ebooklet(remote_conn_map, file_path_map, 'n', value_serializer='pickle', group_bytes=group_bytes) as f:
         for key, value in data_dict.items():
             f[key] = value
 
