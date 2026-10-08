@@ -4,6 +4,20 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.11.1 (unreleased)
+
+- **A commit prunes the remote index it uploads.** The index is log-structured, so every overwrite
+  of a key leaves a superseded entry, and each commit uploaded the sidecar as is: superseded entries
+  were 90-94 % of the live ECan indexes (13.6 MB for 1,090 keys), uploaded by every hourly commit
+  and downloaded by every reader after it. The commit now builds its index bytes from a throwaway
+  copy of the sidecar (per-key mode too, as grouped mode already did), prunes the copy, and uploads
+  that. The live sidecar is never pruned in place, so a crash mid-prune cannot damage local state.
+  The local data file is not pruned (that stays `prune()`).
+- **Fix: an open refused by the uuid check left the local file open.** `UUIDMismatchError` was raised
+  after the local booklet had been opened, and the handle was never closed, so the file stayed
+  locked until garbage collection and was then flagged as closed incorrectly. The refusal now closes
+  it.
+
 ## 0.11.0 (unreleased)
 
 **Write-order groups (storage format 3) replace hash grouping.** Under hash grouping

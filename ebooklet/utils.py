@@ -411,7 +411,14 @@ def init_local_file(local_file_path, flag, remote_session, value_serializer, n_b
             ## The local file will need to always be open for write since data will be loaded from the remote regardless if the user has only opened it for read-only
             local_file = booklet.open(local_file_path, 'w')
 
-            overwrite_remote_index = check_local_remote_sync(local_file, remote_session, flag)
+            ## Close on a refusal (UUIDMismatchError): the caller never receives
+            ## this handle, so leaving it to garbage collection left the file
+            ## flagged as closed incorrectly and locked until collected.
+            try:
+                overwrite_remote_index = check_local_remote_sync(local_file, remote_session, flag)
+            except BaseException:
+                local_file.close()
+                raise
 
     else:
         if remote_uuid:
@@ -1685,33 +1692,38 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
     ## mode - it must never reference uncommitted generations).
     remote_index.sync()
 
-    ## Build the index bytes the commit will carry: grouped mode applies the
-    ## staged entries to a throwaway COPY of the sidecar; per-key mode reads
-    ## the live sidecar as-is. (Deleted keys' entries left the sidecar at
+    ## Build the index bytes the commit will carry, in both modes from a
+    ## throwaway COPY of the sidecar: grouped mode applies the staged entries
+    ## to it; then the copy is pruned, because the index is log-structured and
+    ## every commit uploads it whole (and every reader downloads it whole after
+    ## a change) - superseded entries were 90-94 % of the live ECan indexes.
+    ## Pruning the copy rather than the live sidecar keeps a crash mid-prune
+    ## away from the local state. (Deleted keys' entries left the sidecar at
     ## __delitem__, so every journaled delete commits with this index.)
-    if group_bytes is not None:
-        staged_path = remote_index_path.parent.joinpath(remote_index_path.name + '.staged')
-        with remote_index._thread_lock:
-            remote_index._file.seek(0)
-            base_index_bytes = remote_index._file.read()
+    staged_path = remote_index_path.parent.joinpath(remote_index_path.name + '.staged')
+    with remote_index._thread_lock:
+        remote_index._file.seek(0)
+        base_index_bytes = remote_index._file.read()
+    try:
+        with open(staged_path, 'wb') as f:
+            f.write(base_index_bytes)
+        staged = booklet.FixedLengthValue(staged_path, 'w')
         try:
-            with open(staged_path, 'wb') as f:
-                f.write(base_index_bytes)
-            staged = booklet.FixedLengthValue(staged_path, 'w')
-            try:
+            if group_bytes is not None:
                 for key, entry in staged_entries.items():
                     staged[key] = entry
-                staged.sync()
-                with staged._thread_lock:
-                    staged._file.seek(0)
-                    staged_index_bytes = staged._file.read()
-            finally:
-                staged.close()
+            staged.prune()
+            staged.sync()
+            with staged._thread_lock:
+                staged._file.seek(0)
+                staged_index_bytes = staged._file.read()
         finally:
-            try:
-                staged_path.unlink()
-            except FileNotFoundError:
-                pass
+            staged.close()
+    finally:
+        try:
+            staged_path.unlink()
+        except FileNotFoundError:
+            pass
 
     ## Phase C - the commit. Also runs for a metadata-only push (metadata no
     ## longer rides the changelog - it is embedded at commit), for a
@@ -1763,12 +1775,9 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 new_manifest.update(new_gens)
                 for gid in emptied_gids:
                     new_manifest.pop(gid, None)
-            index_bytes_for_commit = staged_index_bytes
         else:
             new_manifest = {}
-            with remote_index._thread_lock:
-                remote_index._file.seek(0)
-                index_bytes_for_commit = remote_index._file.read()
+        index_bytes_for_commit = staged_index_bytes
 
         embedded_local_meta = journal.meta_pending
         meta_section = _build_meta_section_for_push(local_file, journal, remote_state, replace_pending, time_int_us,
