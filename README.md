@@ -85,7 +85,7 @@ db = ebooklet.open_ebooklet(remote_conn, '/tmp/big_data.blt', flag='n',
 - A grouped remote records the `group_bytes` its last push packed with. Omitted, an existing remote keeps its storage mode and its recorded `group_bytes`; a new database is grouped at 32 MiB. Passing another value changes the target from that push on: new data packs to it, existing groups keep their size, and the remote records the new value (no history is kept). `db.group_bytes` reports the value in effect. An explicit value for the other mode is ignored with a warning (with `flag='n'` it raises — call `delete_remote()` first to change the mode).
 - A value larger than `group_bytes` gets a group of its own. A group can still exceed the 4 GiB packing ceiling if its members grow in place (`GroupTooLargeError`).
 
-**Per-key storage** (`group_bytes=None`, format 2) puts each value in its own S3 object. It suits databases pushed very often in small increments (each push uploads exactly the changed values, with no group to top up).
+**Per-key storage** (`group_bytes=None`, format 2) puts each value in its own S3 object. Each push uploads exactly the changed values, with no group to top up. That costs one request per value, so a database updated often across many keys (e.g. hourly station telemetry) is usually better served by small groups written in the order they will be updated.
 
 **Hash-grouped remotes (pre-0.11, `num_groups`) are not readable by 0.11.** To move one to the current format: with `ebooklet<0.11`, open it `'w'` and call `load_items()` so the local file holds every value; `delete_remote()`; then push the local file again with 0.11. The `num_groups` argument is gone: for one release an explicit `num_groups=None` still means per-key (as it always did); an int raises.
 
@@ -163,7 +163,8 @@ magic b'ebooklet-db\x00' (12) | payload_version >H (2) | reserved (2)
 | manifest_len >Q (8) | meta_len >Q (8) | index_len >Q (8)
 | manifest: JSON {group_id: generation}      (empty in per-key mode)
 | meta:     JSON {"timestamp": µs, "data": ...}   (length 0 = no metadata)
-| index:    the serialized remote-index booklet
+| index:    the serialized remote-index booklet (pruned before upload since 0.11.1:
+|           no superseded entries)
 ```
 
 - **`format_version`** stamps the remote storage format: 3 for grouped, 2 for per-key (a per-key remote stays readable by 0.10 clients). The stamp follows the storage mode; `SUPPORTED_FORMAT_VERSION` is only the highest format this client reads. Opening a remote with a NEWER stamp refuses with `UnsupportedFormatError` (upgrade ebooklet). Legacy remotes — format 1, and hash-grouped format 2 (with `num_groups`) — refuse too; see "Hash-grouped remotes" above for the move to the current format.
@@ -172,7 +173,7 @@ magic b'ebooklet-db\x00' (12) | payload_version >H (2) | reserved (2)
 - **Group object layout**: `[entry_count: >I]` then per entry `[key_len: >H][key][timestamp: 7 bytes][value_len: >I][value]`. Self-describing: recovery paths trust the embedded keys/timestamps over the index. A group's packed size is capped at 4 GiB (`GroupTooLargeError` at pack time — reachable only by in-place growth; a `flag='n'` re-creation re-allocates every group).
 - **RCG entry schema v1**: frozen (see Remote Connection Groups above).
 
-**Integrity checking** — `ebooklet.fsck(remote_conn)` reports orphans (objects nothing references: abandoned generations from crashed pushes, failed GC leftovers), referenced-but-missing objects, and torn teardowns; `fsck(conn, delete_orphans=True)` sweeps aged orphans under the write lock (orphans are invisible to readers, so this is housekeeping, not repair).
+**Integrity checking** — `ebooklet.fsck(remote_conn)` reports orphans (objects nothing references: abandoned generations from crashed pushes, failed GC leftovers), referenced-but-missing objects, and torn teardowns; `fsck(conn, delete_orphans=True)` sweeps aged orphans under the write lock (orphans are invisible to readers, so this is housekeeping, not repair). The orphans are listed before the lock is taken, so a `min_age` shorter than a push is safe only when nothing else is writing; keep the default unless you know that.
 
 **Local state** — pending (unpushed) writes and deletions are journaled inside the local booklet file and survive sessions: reads always see your own unpushed changes, deletions cannot resurrect, and the next `push()` applies everything pending. `force_lock=True` on open breaks only lock tickets older than 2 hours (a live writer is protected; it would otherwise abort at its next push's lock re-verification).
 

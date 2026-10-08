@@ -281,6 +281,18 @@ WRITER assigns at push time.
 - **esa-sst:** `config.py:129-133` and `publish.py:103-111`.
 
 ### 4. Hydrate, delete, release, republish (each run is Mike's, supervised)
+
+> **Superseded in part (2026-10-08/09). The current status and order are in
+> `envlib-repos/ingest/envlib-ingest-base/OPEN_WORK.md`, the first Backlog item (moved there from
+> `envlib/OPEN_WORK.md` on 2026-10-09; the implementation record is in `envlib/OPEN_WORK_DONE.md`).**
+> - The commons catalogue is republished **per-key** (format 2) from its hydrated file, keeping its uuid,
+>   and BEFORE esa-sst. Format 2 is readable by 0.10 and 0.11, so there is no cutover window. This is
+>   Mike's decision "D3" in the ECan telemetry plan (`~/.claude/plans/please-read-the-first-splendid-moon.md`),
+>   not this plan's D3 below.
+> - The ECan datasets move separately, by `envlib-ingest-ecan-env/raw/rechunk_republish.py`.
+> - The MEGA `era5_cfdb` (format 1) and `sst_cfdb` (absent) are out of scope.
+> - Releases done: ebooklet 0.11.0 and 0.11.1, cfdb 0.11.0, envlib 0.1.8, envlib-ingest-base 0.5.0 and 0.6.0.
+
 1. **Freeze publishing** on every machine.
 2. **Hydrate and delete, with the current 0.10.5 locks**, on the machine that holds each archive.
    - For each of the 12 WRF-3k datasets and esa-sst:

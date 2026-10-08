@@ -4,7 +4,7 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.11.1 (unreleased)
+## 0.11.1 (2026-10-09)
 
 - **A commit prunes the remote index it uploads.** The index is log-structured, so every overwrite
   of a key leaves a superseded entry, and each commit uploaded the sidecar as is: superseded entries
@@ -18,7 +18,7 @@ Entries for 0.8.3 and earlier were reconstructed from commit history after the f
   locked until garbage collection and was then flagged as closed incorrectly. The refusal now closes
   it.
 
-## 0.11.0 (unreleased)
+## 0.11.0 (2026-10-07)
 
 **Write-order groups (storage format 3) replace hash grouping.** Under hash grouping
 (`blake2b(key) % num_groups`) an append scattered its new keys over nearly every group, and each
