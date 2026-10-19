@@ -282,9 +282,12 @@ WRITER assigns at push time.
 
 ### 4. Hydrate, delete, release, republish (each run is Mike's, supervised)
 
-> **Superseded in part (2026-10-08/09). The current status and order are in
-> `envlib-repos/ingest/envlib-ingest-base/OPEN_WORK.md`, the first Backlog item (moved there from
-> `envlib/OPEN_WORK.md` on 2026-10-09; the implementation record is in `envlib/OPEN_WORK_DONE.md`).**
+> **Superseded in part (2026-10-08/09); COMPLETE 2026-10-18.** Every grouped remote in the commons has moved: the
+> catalogue per-key, the ECan datasets rechunked, and esa-sst and the 12 WRF-3k datasets deleted and republished
+> without hydration (their local builds were complete; Mike, 2026-10-18). Record: the closed item "Roll ebooklet
+> 0.11 (storage format 3) and the telemetry layout out to the live datasets" in
+> `envlib-repos/ingest/envlib-ingest-base/OPEN_WORK_DONE.md` (the implementation record is in
+> `envlib/OPEN_WORK_DONE.md`).
 > - The commons catalogue is republished **per-key** (format 2) from its hydrated file, keeping its uuid,
 >   and BEFORE esa-sst. Format 2 is readable by 0.10 and 0.11, so there is no cutover window. This is
 >   Mike's decision "D3" in the ECan telemetry plan (`~/.claude/plans/please-read-the-first-splendid-moon.md`),
