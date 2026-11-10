@@ -1497,9 +1497,14 @@ class EVariableLengthValue(MutableMapping):
         Pending (unpushed) writes and deletions survive the close: they are
         recorded in the local file's persistent journal and will be included
         in the next session's push.
+
+        The finalizer (which closes the files and releases the S3 lock) runs even when the sync raises, so a failed
+        sync can never leave the remote locked by a process that has given up on it.
         """
-        self.sync()
-        self._finalizer()
+        try:
+            self.sync()
+        finally:
+            self._finalizer()
 
 
     def sync(self):

@@ -345,16 +345,27 @@ def ebooklet_finalizer(local_file, remote_index, remote_session, lock, journal=N
     never called) still records its pending state; a finalizer must never
     raise, so persistence failures are logged and swallowed.
     """
-    if journal is not None:
+    ## Each step runs even when an earlier one raises (a KeyboardInterrupt included), so the S3 lock is always
+    ## released: a raise here used to skip lock.release(), and a writer that died that way left an orphaned lock
+    ## ticket on the remote.
+    try:
+        if journal is not None:
+            try:
+                journal.persist(local_file)
+            except Exception:
+                logger.exception('journal persistence failed during finalization; pending state may be stale')
+    finally:
         try:
-            journal.persist(local_file)
-        except Exception:
-            logger.exception('journal persistence failed during finalization; pending state may be stale')
-    local_file.close()
-    remote_index.close()
-    remote_session.close()
-    if lock is not None:
-        lock.release()
+            local_file.close()
+        finally:
+            try:
+                remote_index.close()
+            finally:
+                try:
+                    remote_session.close()
+                finally:
+                    if lock is not None:
+                        lock.release()
 
 
 def open_remote_conn(remote_conn, flag, local_file_exists):
