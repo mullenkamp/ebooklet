@@ -4,6 +4,21 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.11.2 (2026-11-10)
+
+- **Requires booklet >= 0.12.11.** booklet 0.12.10 hangs forever at the second reindex of a `FixedLengthValue`
+  whose index has been relocated. Every remote-index sidecar is in that layout (the staged copy is pruned on every
+  commit), so the first push that took an index past 144,013 keys hung at 100 % CPU while holding the remote's S3
+  lock. That is how the WRF 3 km publishes stopped on 2026-11-10. See booklet's 0.12.11 changelog.
+- **The finalizer always releases the S3 lock.** Each teardown step of `ebooklet_finalizer` (journal persistence,
+  closing the local file, the index sidecar and the remote session) now runs in a `try/finally`, so a raise in an
+  earlier step, a `KeyboardInterrupt` included, can no longer skip `lock.release()`.
+- **`close()` runs the finalizer even when its sync raises.** This releases the S3 lock at once, but the finalizer
+  runs only once, so a retried `close()` after a transient failure (a full disk) can no longer reach the local file.
+  booklet keeps the instance open for a retry instead. Making ebooklet match booklet is an open item in
+  `envlib/OPEN_WORK.md` ("Make `EVariableLengthValue.close()` match booklet's on a failed sync").
+- New tests: `ebooklet/tests/test_finalizer_release.py`.
+
 ## 0.11.1 (2026-10-09)
 
 - **A commit prunes the remote index it uploads.** The index is log-structured, so every overwrite
