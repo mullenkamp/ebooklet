@@ -9,6 +9,7 @@ from ebooklet.errors import (
     UnsupportedFormatError,
     GroupTooLargeError,
     RemoteIntegrityError,
+    StaleIndexError,
     LockLostError,
     ConcurrentCommitError,
     OfflineError,
@@ -24,9 +25,9 @@ __all__ = [
     "open_ebooklet", "open_rcg", "EVariableLengthValue", 'RemoteConnGroup', 'S3Connection',
     'PushResult', 'DEFAULT_GROUP_BYTES',
     'Error', 'ReadOnlyError', 'UUIDMismatchError', 'RemoteMissingError',
-    'UnsupportedFormatError', 'GroupTooLargeError', 'RemoteIntegrityError',
+    'UnsupportedFormatError', 'GroupTooLargeError', 'RemoteIntegrityError', 'StaleIndexError',
     'LockLostError', 'ConcurrentCommitError', 'OfflineError', 'PushInProgressError', 'ConcurrentCompactionError',
     'fsck', 'FsckReport',
 ]
 
-__version__ = '0.12.0'
+__version__ = '0.13.0'

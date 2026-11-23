@@ -166,6 +166,55 @@ def _parse_recorded_group_bytes(value):
     return group_bytes
 
 
+def classify_db_metadata(meta):
+    """
+    Parse a db object's user metadata (from a HEAD or a GET response) into the fields a reader
+    keeps: format_version, init_bytes, timestamp, uuid, type, legacy_num_groups and group_bytes.
+
+    The single definition of the format gate: a too-new format_version raises
+    UnsupportedFormatError BEFORE anything else is parsed. Remotes without the stamp predate it
+    and are format 1. S3SessionReader applies it to its HEAD, and ebooklet.mongo's refresh to the
+    GET it reads the index from.
+    """
+    format_version = int(meta.get('format_version', 1))
+    if format_version > utils.SUPPORTED_FORMAT_VERSION:
+        raise utils.UnsupportedFormatError(
+            f'This remote database uses storage format_version '
+            f'{format_version}, but this ebooklet version only supports '
+            f'up to {utils.SUPPORTED_FORMAT_VERSION}. Upgrade ebooklet to open it.'
+        )
+    return {
+        'format_version': format_version,
+        'init_bytes': base64.urlsafe_b64decode(meta['init_bytes']),
+        'timestamp': int(meta['timestamp']),
+        'uuid': uuid.UUID(hex=meta['uuid']),
+        'type': meta['type'],
+        ## Only hash-grouped (pre-0.11) remotes carry num_groups; its
+        ## presence is what marks a format-2 remote as legacy.
+        'legacy_num_groups': int(meta['num_groups']) if 'num_groups' in meta else None,
+        ## A grouped remote records the group_bytes its last commit packed
+        ## with: the dataset's default for writers that pass none. A value
+        ## that is not a valid target is treated as unrecorded (the default
+        ## applies) rather than failing every open, readers included.
+        'group_bytes': _parse_recorded_group_bytes(meta.get('group_bytes')),
+    }
+
+
+def storage_kind_of(format_version, legacy_num_groups):
+    """
+    How an existing remote stores its values, from its db object's metadata alone:
+    utils.STORAGE_PER_KEY (format 2 without num_groups), utils.STORAGE_GROUPED (format 3,
+    write-order groups) or utils.STORAGE_LEGACY (format 1, or hash-grouped format 2 - refused
+    online since 0.11). The format NUMBER alone cannot classify a remote: per-key remotes stay
+    format 2. (A missing remote has no kind; callers check that first.)
+    """
+    if format_version == utils.FORMAT_GROUPED:
+        return utils.STORAGE_GROUPED
+    if format_version == utils.FORMAT_PER_KEY and legacy_num_groups is None:
+        return utils.STORAGE_PER_KEY
+    return utils.STORAGE_LEGACY
+
+
 class S3SessionReader:
     """
 
@@ -208,11 +257,7 @@ class S3SessionReader:
         """
         if not self.initialized:
             return None
-        if self.format_version == utils.FORMAT_GROUPED:
-            return utils.STORAGE_GROUPED
-        if self.format_version == utils.FORMAT_PER_KEY and self.legacy_num_groups is None:
-            return utils.STORAGE_PER_KEY
-        return utils.STORAGE_LEGACY
+        return storage_kind_of(self.format_version, self.legacy_num_groups)
 
     def __enter__(self):
         return self
@@ -233,29 +278,17 @@ class S3SessionReader:
         """
         resp_obj = self.head_object()
         if resp_obj.status == 200:
-            meta = resp_obj.metadata
             ## Refuse too-new remotes BEFORE parsing anything else - this is the
             ## single choke point for reader init, writer init, and every index
-            ## re-pull. Remotes without the stamp predate it and are v1.
-            self.format_version = int(meta.get('format_version', 1))
-            if self.format_version > utils.SUPPORTED_FORMAT_VERSION:
-                raise utils.UnsupportedFormatError(
-                    f'This remote database uses storage format_version '
-                    f'{self.format_version}, but this ebooklet version only supports '
-                    f'up to {utils.SUPPORTED_FORMAT_VERSION}. Upgrade ebooklet to open it.'
-                )
-            self._init_bytes = base64.urlsafe_b64decode(meta['init_bytes'])
-            self.timestamp = int(meta['timestamp'])
-            self.uuid = uuid.UUID(hex=meta['uuid'])
-            self.type = meta['type']
-            ## Only hash-grouped (pre-0.11) remotes carry num_groups; its
-            ## presence is what marks a format-2 remote as legacy.
-            self.legacy_num_groups = int(meta['num_groups']) if 'num_groups' in meta else None
-            ## A grouped remote records the group_bytes its last commit packed
-            ## with: the dataset's default for writers that pass none. A value
-            ## that is not a valid target is treated as unrecorded (the default
-            ## applies) rather than failing every open, readers included.
-            self.group_bytes = _parse_recorded_group_bytes(meta.get('group_bytes'))
+            ## re-pull (classify_db_metadata holds the rule).
+            fields = classify_db_metadata(resp_obj.metadata)
+            self.format_version = fields['format_version']
+            self._init_bytes = fields['init_bytes']
+            self.timestamp = fields['timestamp']
+            self.uuid = fields['uuid']
+            self.type = fields['type']
+            self.legacy_num_groups = fields['legacy_num_groups']
+            self.group_bytes = fields['group_bytes']
         elif resp_obj.status == 404:
             self._init_bytes = None
             self.uuid = None

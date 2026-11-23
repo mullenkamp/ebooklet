@@ -1,0 +1,18 @@
+[
+ {"name": "per-key delete before commit", "file": "ebooklet/utils.py",
+  "old": "        ## The commit PUT is the point of no return: re-verify the write lock",
+  "new": "        if deletes and group_bytes is None:\n            remote_session.delete_objects(list(deletes))\n        ## The commit PUT is the point of no return: re-verify the write lock",
+  "tests": ["ebooklet/tests/test_writer_order.py"]},
+ {"name": "delete_remote children first", "file": "ebooklet/remote.py",
+  "old": "            self._write_session.delete_objects(keys=[self.write_db_key], purge=True)\n            self._write_session.delete_objects(prefix=self.write_db_key + '/', purge=True)",
+  "new": "            self._write_session.delete_objects(prefix=self.write_db_key + '/', purge=True)\n            self._write_session.delete_objects(keys=[self.write_db_key], purge=True)",
+  "tests": ["ebooklet/tests/test_writer_order.py"]},
+ {"name": "storage_kind_of swaps grouped/per-key", "file": "ebooklet/remote.py",
+  "old": "    if format_version == utils.FORMAT_GROUPED:\n        return utils.STORAGE_GROUPED",
+  "new": "    if format_version == utils.FORMAT_GROUPED:\n        return utils.STORAGE_PER_KEY",
+  "tests": ["ebooklet/tests/test_remote_metadata.py"]},
+ {"name": "format gate off", "file": "ebooklet/remote.py",
+  "old": "    if format_version > utils.SUPPORTED_FORMAT_VERSION:\n        raise utils.UnsupportedFormatError(",
+  "new": "    if format_version > 999:\n        raise utils.UnsupportedFormatError(",
+  "tests": ["ebooklet/tests/test_remote_metadata.py"]}
+]

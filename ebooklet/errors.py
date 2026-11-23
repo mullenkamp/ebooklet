@@ -77,6 +77,22 @@ class RemoteIntegrityError(Error, urllib3.exceptions.HTTPError):
     """
 
 
+class StaleIndexError(Error):
+    """
+    A read through ebooklet.mongo's store found its MongoDB copy of the remote index behind the
+    remote: a chunk 404'd and the remote has committed since the copy the request was built on
+    (or a refresh changed the dataset during the request). Retryable once the worker's next
+    refresh lands; an API answers it with 503 and Retry-After.
+
+    Attributes: ``dataset_id``, and ``applied`` - the (uuid, timestamp) pair the request was
+    built on, or None.
+    """
+    def __init__(self, message, dataset_id=None, applied=None):
+        super().__init__(message)
+        self.dataset_id = dataset_id
+        self.applied = applied
+
+
 class LockLostError(Error):
     """
     This session no longer holds the write lock: its ticket was broken by

@@ -282,6 +282,140 @@ re-open from the remote.
 - To pre-populate a cache for offline use, open online and call
   `eb.load_items()` (everything) or read the keys you need.
 
+## The MongoDB read path (`ebooklet[mongo]`, 0.13)
+
+`ebooklet.mongo` lets any number of stateless readers serve a remote dataset from MongoDB. Install it
+with `pip install 'ebooklet[mongo]'`. It has two halves:
+
+- **`refresh(db, dataset_id, remote_conn)`** copies one dataset's remote index and metadata into
+  MongoDB. Run it from **one** process (a worker) on a timer.
+- **`MongoStore(db, dataset_id, reader)`** is a read-only store for one request. Open it with
+  `cfdb.open_store_dataset(store)`. It reads everything from MongoDB, and on a cache miss fetches the
+  chunk from the remote with ebooklet's own fetchers and inserts it into the cache. Build the reader
+  with `object_reader(db_url, http_session)`; it makes no request until a miss, and one HTTP session
+  can be shared per process.
+
+Call `ensure_schema(db, chunk_ttl_seconds)` once before first use.
+
+**The three collections:**
+
+| Collection | One document per | Block compressor | Notes |
+|---|---|---|---|
+| `datasets` | dataset | zstd | The metadata section, the storage kind and format, the remote's ebooklet type (`ebooklet_type`, e.g. `EVariableLengthValue` or `RemoteConnGroup`; the store serves the stored bytes whatever the type), `applied` (the remote commit's `(uuid, timestamp)` the entries reflect), `rev` (bumped when an apply starts), `applying` (an apply is in progress), `checked_at`, `missing` |
+| `entries` | remote-index key | zstd | `ts`, group id `g`, generation `n`, offset `o`, length `l`, remote uuid `u` |
+| `chunks` | (dataset, uuid, key, timestamp) | none | Insert-only cache of the compressed chunk bytes. A TTL index on `t` (a BSON date) expires it. |
+
+`ensure_schema` sets the compressors when it creates a collection, because MongoDB fixes them then.
+They were measured on 167k real entries and 620 real chunks (2026-11-24):
+- **`entries`:** about 41 bytes per entry on disk with zstd, against 55 with the default snappy and
+  215 uncompressed, indexes included.
+- **`chunks`:** compression gains nothing, because cfdb already zstd-compresses the bytes. Snappy saved
+  only 1%.
+- **Scale:** today's catalogue is about 2 M entries, so roughly 80 MB.
+
+An existing collection keeps the compressor it was created with, and `ensure_schema` logs a warning
+on a mismatch. To change it, drop the collection: `chunks` is only a cache, and `entries` is rebuilt
+by the next refresh of each dataset.
+
+**The refresh writes in a fixed order** (after its GET, parse and diff):
+0. claim: increment `rev` and set `applying`;
+1. upsert the changed entries;
+2. update the dataset document;
+3. delete the removed entries;
+4. set `applied` and `checked_at`, and clear `applying`, but only if `rev` is still the claimed
+   value. If it changed, another refresh interleaved: `applied` is cleared and the next poll redoes
+   the diff.
+
+The metadata never runs ahead of the entries. A crash at any step is redone on the next poll,
+because `applied` is written last and a left-over `applying` forces the redo.
+
+**A request is answered only if no commit was applied while it ran.** A store refuses to build while
+`applying` is set, and `store.verify()` raises `StaleIndexError` if `rev` has moved since the store
+was built. **Call `verify()` before using a request's results.** Without it, a request that overlaps
+an apply can decode the new commit's chunks with the old commit's metadata: values, and even
+coordinates, from neither commit, with no error (plan review `edr-mongo-code-1`, both arms). The
+window is the apply's MongoDB writes only, about tens of milliseconds for an hourly push, so about
+one request in 50,000 retries.
+
+`StaleIndexError` is retryable **with a new store**: a store that raised it stays stale.
+
+**Commit timestamps are wall-clock and can go backwards.** A commit counts as new when its
+`(uuid, timestamp)` *differs* from `applied`, never when it is "newer".
+
+**What a read answers:**
+
+| Situation | Result |
+|---|---|
+| The key has no entry, and `rev` is unchanged since the store was built | `None` (the key is genuinely absent) |
+| The key has no entry, and `rev` changed during the request | `StaleIndexError` (a commit was applied during the request); retry |
+| A per-key object's timestamp differs from its entry's (overwritten in place since the index was copied, perhaps not yet committed) | `StaleIndexError`; the bytes are cached under their own timestamp, so the retry after the next refresh hits the cache |
+| A chunk 404s, and its re-read entry changed | Fetched again from the new location |
+| A chunk 404s again after one refetch, and a HEAD of the db object **differs** from the `applied` pair read when the store was built | `StaleIndexError`: the index is behind; retry after the next refresh (an API answers 503 with `Retry-After`) |
+| The same, but the HEAD **equals** that pair | `RemoteIntegrityError`: the remote contradicts its own index (an API answers 500, loudly) |
+| The HEAD 404s | `RemoteMissingError` |
+| Any other fetch failure | It raises. It never returns `None`, which cfdb would read as fill values. |
+
+**Requirements for the operator:**
+- The endpoint the refresh and the store use **must not cache** db-object HEADs or GETs, nor 404s.
+  That includes per-key chunk 404s. A cache would show the refresh a stale commit, and would let a
+  read misclassify a fault.
+- The 404 rule depends on writers committing **before** they delete anything the previous commit
+  referenced: grouped GC, per-key deletes, and `delete_remote()` deleting the db object first.
+  ebooklet's writers do this, and `tests/test_writer_order.py` pins it.
+- Run **exactly one** refresh process per dataset. This is a hard requirement. Two overlapping
+  refreshes can leave MongoDB permanently inconsistent with the remote while `applied` matches it,
+  so every later poll reports `nochange`. A new key then reads `None` (fill) and moved entries name
+  GC'd generations (plan review `edr-mongo-code-1`; both arms reproduced it with different
+  schedules). The cause is that the older refresh's unconditional entry writes and deletes can land
+  around the newer refresh's checks. On Docker Swarm, use `replicas: 1` and the default stop-first
+  update order, and never run a manual refresh beside the worker.
+  - *If concurrent refreshers are ever wanted:* every entry write and delete would have to be
+    conditional. One way is to tag each entry with the claiming apply's `rev`, claim **before** the
+    GET (so a higher tag always means a later commit), write only over entries with a lower tag, and
+    turn deletes into tombstones. The other is a fenced lease that every write checks. Neither is
+    built.
+- Read with **primary** read preference (the default). The ordering above assumes a reader sees
+  MongoDB's writes in order.
+- **The store reads public remotes only.** `refresh()` takes any `S3Connection`, a public `db_url` or
+  one with S3 credentials, and only *records* the `db_url`. But `object_reader()`, the helper that
+  builds the store's reader, takes only a `db_url`: there is no public way to build a store for a
+  private bucket. That is enough for envlib, whose member buckets are public and whose catalogue
+  entries all carry a `db_url`.
+  - To serve private datasets, extend `object_reader` to accept an `S3Connection`. ebooklet's
+    `create_s3_read_session` already builds a signed `S3Session` from keys.
+  - A worker may refresh through B2's S3 API with read-only keys, for example to avoid a caching CDN
+    in front of the `db_url`, while the store keeps reading chunks through the public URL. That works
+    today.
+- Build the reader's shared session with `s3func.HttpSession(stream=False)`. `object_reader` refuses
+  a streaming session (s3func's default): its responses carry no body and hold their pool
+  connection, so fetches fail and the pool then blocks.
+- A transient HEAD 404 at a poll marks the dataset `missing`, which makes reads raise
+  `RemoteMissingError` until the next poll clears it. That is deliberate: it is better to refuse
+  than to serve a dataset that may be gone.
+- A dataset id must not contain `|`.
+
+**A safety net we have not built: a forced re-diff** (designed in code review `edr-mongo-code-1`;
+Mike, 2026-11-24: document it, and build it if divergence is ever seen).
+- **The mechanism:** `refresh(..., force=True)` would skip the "applied pair unchanged → nothing to
+  do" shortcut. It would download the db object, diff every entry against MongoDB, and repair any
+  difference.
+- **Why it is not needed often:** every normal refresh already diffs whole entries, so a dataset that
+  commits regularly heals at its next commit anyway.
+- **What it would add:** for rarely-committed datasets (the WRF hindcast, ESA SST, static
+  quality-controlled data) a divergence would heal within the forcing interval instead of never. The
+  divergence could come from a second refresher, a bug, a manual edit, or a MongoDB restore. More
+  importantly, it would detect drift: in normal operation a forced pass finds nothing.
+- **How to build it, if ever:**
+  - Claim (bump `rev`) only when the diff is non-empty, so a clean pass writes nothing but
+    `checked_at` and makes no in-flight request retry.
+  - Log loudly, with the count, whenever a forced pass repairs anything.
+  - Run it daily from the worker.
+- **The estimated cost** at today's 18 datasets: about 300 MB of B2 downloads per day (mostly the
+  twelve WRF indexes at about 21 MB each) and about 10 s of parse and MongoDB time.
+- **Signs that it is needed:** a dataset whose MongoDB entries differ from its remote while `applied`
+  matches it. Typical symptoms are a `RemoteIntegrityError` on a dataset nobody is writing to, or a
+  key the remote has that reads `None`.
+
 ## Moving a hash-grouped remote (0.10) to 0.11
 
 0.11 replaces hash grouping (`num_groups`) with write-order groups (format 3)

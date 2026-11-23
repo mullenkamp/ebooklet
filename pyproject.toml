@@ -30,8 +30,16 @@ dependencies = [
   "portalocker",
 ]
 
+[project.optional-dependencies]
+## The MongoDB read path (ebooklet.mongo): the refresh and the read-only store.
+mongo = ["pymongo>=4.9"]
+
 [dependency-groups]
 dev = [
+  ## pymongo for ebooklet.mongo's tests (CI's `uv sync` installs no extras); cfdb for the
+  ## hermetic cfdb-through-store integration test.
+  "pymongo>=4.9",
+  "cfdb>=0.11.0",
   "spyder-kernels==2.5.2",
   "black",
   "mypy",

@@ -4,7 +4,77 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.12.0 (unreleased)
+## 0.13.0 (2026-11-24)
+
+The MongoDB read path (plan `planning/mongo-read-path-plan.md`; plan review `edr-mongo-plan-1`, Fable 5.2
+and Sonnet 5.5, whose 13 proposed changes were all adopted). It is the library layer of envlib's
+read-only data API. One worker copies each dataset's remote index into MongoDB, and stateless readers
+serve every request from MongoDB, filling an insert-only chunk cache from the remote on a miss.
+`docs/ops.md`, "The MongoDB read path", has the operating rules.
+
+- **New optional extra `ebooklet[mongo]`** (`pymongo>=4.9`), with the package `ebooklet.mongo`:
+  - `refresh(db, dataset_id, remote_conn)`: copies one dataset's index and metadata into MongoDB.
+    Writes go in a fixed order (entries, then the dataset document with `rev` bumped, then
+    deletions, then the applied stamp). It diffs whole entries, so a repack's moved members are
+    rewritten. It treats a commit as new when its stamp differs from the applied one, never when it
+    is "newer", because stamps are wall-clock. It returns a plain dict.
+  - `MongoStore(db, dataset_id, reader)`: the per-request read-only store for
+    `cfdb.open_store_dataset`. It keeps a memo per request. A failed fetch always raises. A chunk 404
+    is classified by one HEAD compared with the applied stamp read when the store was built:
+    `RemoteIntegrityError` if the remote has not committed since, `StaleIndexError` if it has.
+  - `object_reader(db_url, http_session)`: a remote reader that makes no request until it is used.
+  - `ensure_schema(db, chunk_ttl_seconds)`: creates the collections, the `$jsonSchema` validators and
+    the indexes, including a TTL index on the chunk cache.
+- **New exception `StaleIndexError`.** The MongoDB copy is behind the remote, so the read is
+  retryable.
+- **`remote.classify_db_metadata` and `remote.storage_kind_of`.** The format gate and the
+  storage-kind rule move out of `S3SessionReader` into these pure helpers, one definition each, so the
+  refresh can apply them to a GET's metadata. Behaviour is unchanged: a table-driven test written
+  before the refactor pins it.
+- **New writer-order tests** (`tests/test_writer_order.py`). Nothing the previous commit referenced
+  may be deleted before the next commit's db-object PUT, and `delete_remote()` must delete the db
+  object first. The review found two mutants of these orders passing the whole suite.
+- **Tests.** Every MongoDB test runs against a real `mongod`, using `EBOOKLET_TEST_MONGO_URI`. CI gets
+  a `mongo:8.0` service; locally the tests skip with a reason, and with `CI` set they fail instead.
+  There is also a hermetic cfdb-through-the-store test for all four dataset types. 25 mutants are all
+  killed (`planning/mongo-read-path-evidence/`). The suite went from 276 tests in 5.1 s to 352 in
+  8.1 s.
+- **Dev dependencies:** `pymongo` and `cfdb`.
+- **Code review `edr-mongo-code-1`** (Fable 5.2 and Sonnet 5.5) found two silent-wrong-data paths and a
+  hang. All are fixed, and the regression tests are built from the arms' own experiments:
+  - **A request that overlapped an apply** could decode the new commit's chunks with the old
+    commit's metadata: values, and coordinates, from neither commit. An apply now **claims** `rev`
+    and sets `applying` before its first write. A store refuses to build while `applying` is set, and
+    the new **`MongoStore.verify()`** raises `StaleIndexError` if `rev` moved during the request. An
+    API calls it before responding.
+  - **Per-key remotes** could mix cached old chunks with chunks overwritten in place, even uncommitted
+    ones. A fetched per-key object whose timestamp differs from its entry's now raises
+    `StaleIndexError`. Its bytes are still cached under their own label.
+  - **`object_reader` refuses a streaming `s3func.HttpSession`** (s3func's default): its responses
+    carry no body, and the pool then hangs.
+  - **Two overlapping refreshes** leave MongoDB inconsistent with the remote. Running exactly one
+    refresher is now a stated hard requirement in `docs/ops.md`, with what concurrent refreshers would
+    need. The claim that the `rev` check made a second refresher converge was false and is removed.
+  - **Tests:** a test for every path either arm found untested (their surviving mutants). 53 mutants
+    are all killed. The suite has 379 tests and runs in 8.9 s.
+- **Block compression per collection** (2026-11-24, measured on real data). `ensure_schema` creates
+  `datasets` and `entries` with zstd, and `chunks` with none, because cfdb has already compressed its
+  bytes.
+  - `entries` comes to about 41 B per entry on disk, against 55 B with the default snappy.
+  - An existing collection with another compressor is kept, and a warning is logged.
+  - The suite now has 381 tests, and 56 mutants are all killed.
+- **The remote's ebooklet type is recorded.** `refresh()` stores it as `ebooklet_type`, and
+  `MongoStore.ebooklet_type` exposes it. No type is refused: the store serves the stored bytes whatever
+  the type, and a cfdb open of a non-cfdb remote already fails clearly, because it has no
+  `dataset_type`.
+- **Benchmarks: `benchmarks/bench_mongo.py`** (new). It times the read path (per-key and batched,
+  warm and cold, misses, store construction, refresh) in about 45 s, against booklet and ebooklet
+  baselines on the same data in the same run.
+  - Batched warm reads reach about 0.4× booklet's local `random_read`.
+  - A per-key `get` costs about 0.5 ms (two loopback round trips).
+  - The results are in `planning/mongo-read-path-evidence/bench_mongo_*.json`.
+
+## 0.12.0 (2026-11-23)
 
 Lock leases and the commit guard (plan `lock-lease-plan-1`, Step 2). Prompted by the ECan orphaned lock tickets
 of 2026-10-13 and 2026-11-22: a degrading VM's stalled runs held tickets on three datasets, and every later run

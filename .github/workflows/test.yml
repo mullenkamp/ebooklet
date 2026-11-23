@@ -13,6 +13,13 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    services:
+      # A real MongoDB for the ebooklet.mongo tests (they fail, not skip, when CI is set and
+      # EBOOKLET_TEST_MONGO_URI is missing).
+      mongo:
+        image: mongo:8.0
+        ports:
+          - 27017:27017
     strategy:
       # prevent cancelling other jobs if one version fails
       fail-fast: false 
@@ -44,6 +51,7 @@ jobs:
           endpoint_url: ${{ secrets.ENDPOINT_URL }}
           access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          EBOOKLET_TEST_MONGO_URI: mongodb://localhost:27017
         run: uv run pytest
 
 

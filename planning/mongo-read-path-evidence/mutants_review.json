@@ -1,0 +1,365 @@
+[
+ {
+  "name": "verify never raises",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if self._changed():\n            raise StaleIndexError(\n                f'Dataset {self._d!r}: a refresh applied",
+  "new": "        if False:\n            raise StaleIndexError(\n                f'Dataset {self._d!r}: a refresh applied",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "construction ignores applying",
+  "file": "ebooklet/mongo/store.py",
+  "old": "if applied is None or doc.get('applying'):",
+  "new": "if applied is None:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "claim does not set applying",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "'$set': {'applying': True, 'db_url': db_url},",
+  "new": "'$set': {'applying': False, 'db_url': db_url},",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "step 4 does not clear applying",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "'checked_at': checked, 'applying': False}}",
+  "new": "'checked_at': checked}}",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "nochange despite applying",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "session.timestamp) and not doc.get('applying'):",
+  "new": "session.timestamp):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "_changed never reports a change",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        return doc is None or doc['rev'] != self._rev",
+  "new": "        return False",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "per-key ts mismatch served",
+  "file": "ebooklet/mongo/store.py",
+  "old": "entry['g'] is None and ts != entry['ts']",
+  "new": "False",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "streaming session accepted",
+  "file": "ebooklet/mongo/store.py",
+  "old": "elif getattr(http_session, '_stream', False):",
+  "new": "elif False:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "heal refetches with the old entry",
+  "file": "ebooklet/mongo/store.py",
+  "old": "retry = {k: fresh[k] for k in failures if k in fresh}",
+  "new": "retry = {k: entries[k] for k in failures if k in fresh}",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "group fetch keyed by gid only",
+  "file": "ebooklet/mongo/store.py",
+  "old": "groups.setdefault((e['g'], e['n']), [])",
+  "new": "groups.setdefault((e['g'], max(x['n'] for x in entries.values() if x['g'] == e['g'] and x['n'])), [])",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "store builds on applied=None",
+  "file": "ebooklet/mongo/store.py",
+  "old": "if applied is None or doc.get('applying'):",
+  "new": "if doc.get('applying'):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "classification HEAD non-200 ignored",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if head.status != 200:\n            raise",
+  "new": "        if False:\n            raise",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "chunk-GET error swallowed",
+  "file": "ebooklet/mongo/store.py",
+  "old": "raise urllib3.exceptions.HTTPError(f'Dataset {self._d!r}: remote fetch failed: {res}')",
+  "new": "pass",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "store batches: first batch only",
+  "file": "ebooklet/mongo/store.py",
+  "old": "    for i in range(0, len(seq), n):",
+  "new": "    for i in range(0, min(len(seq), n), n):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "refresh writes: first batch only",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "for i in range(0, len(ops), WRITE_BATCH):",
+  "new": "for i in range(0, min(len(ops), WRITE_BATCH), WRITE_BATCH):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "refresh deletes: first batch only",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "for i in range(0, len(ids), schema.IN_BATCH):",
+  "new": "for i in range(0, min(len(ids), schema.IN_BATCH), schema.IN_BATCH):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "GET-404 branch removed",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    if resp.status == 404:\n        _mark_missing",
+  "new": "    if False:\n        _mark_missing",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "stale_get removed",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    if pair == applied_pair and not doc.get('applying'):",
+  "new": "    if False:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "stale_get advances checked_at",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "db[DATASETS].update_one({'_id': dataset_id}, {'$set': {'missing': False}})",
+  "new": "db[DATASETS].update_one({'_id': dataset_id}, {'$set': {'missing': False, 'checked_at': checked}})",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "legacy gate on the GET removed",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    if kind == utils.STORAGE_LEGACY:\n",
+  "new": "    if False:\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "apply does not clear missing",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "                'missing': False,\n            },\n        },\n    )",
+  "new": "            },\n        },\n    )",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "validators not re-applied",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "            db.command('collMod', name, validator=validator, validationLevel='strict')",
+  "new": "            pass",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "no d index",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "    db[ENTRIES].create_index([('d', 1)], name='d_1')",
+  "new": "    pass",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "fetch threads forced to 1",
+  "file": "ebooklet/mongo/store.py",
+  "old": "max_workers=max(1, min(self._threads, len(tasks)))",
+  "new": "max_workers=1",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "object_reader default path broken",
+  "file": "ebooklet/mongo/store.py",
+  "old": "http_session, db_url = remote.create_s3_read_session(db_url=db_url, threads=threads)",
+  "new": "http_session, db_url = None, db_url",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "_mark_missing without setOnInsert",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "            '$setOnInsert': {'rev': 0, 'applied': None},\n",
+  "new": "",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "metadata timestamp edge",
+  "file": "ebooklet/mongo/store.py",
+  "old": "if include_timestamp and self._meta is not None:",
+  "new": "if include_timestamp:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "ensure_schema accepts bool",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "isinstance(chunk_ttl_seconds, bool) or ",
+  "new": "",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "chunks compressed with zstd",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "COMPRESSORS = {DATASETS: 'zstd', ENTRIES: 'zstd', CHUNKS: 'none'}",
+  "new": "COMPRESSORS = {DATASETS: 'zstd', ENTRIES: 'zstd', CHUNKS: 'zstd'}",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "compressor mismatch not warned",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "            if actual is not None and actual != wanted:",
+  "new": "            if False:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "new collections get no compressor",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "                storageEngine={'wiredTiger': {'configString': f'block_compressor={wanted}'}},\n",
+  "new": "",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "ebooklet type not recorded",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "                'ebooklet_type': fields['type'],\n",
+  "new": "",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "ebooklet type not exposed",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        self.ebooklet_type = doc.get('ebooklet_type')",
+  "new": "        self.ebooklet_type = None",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ }
+]

@@ -1,0 +1,233 @@
+[
+ {
+  "name": "return None on a fetch failure",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        fresh = self._read_entries(list(failures))",
+  "new": "        for k in failures:\n            self._values[k] = None\n        return\n        fresh = self._read_entries(list(failures))",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "skip the rev check on an absent entry",
+  "file": "ebooklet/mongo/store.py",
+  "old": "if keys and self._changed():",
+  "new": "if False and keys and self._changed():",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "no rev increment in step 2",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "'$inc': {'rev': 1},",
+  "new": "'$inc': {'rev': 0},",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "metadata before entries",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    ## Apply step 1: upsert changed and new entries.\n",
+  "new": "    db[DATASETS].update_one({'_id': dataset_id}, {'$set': {'meta_section': Binary(bytes(meta_section)) if meta_section else None}}, upsert=True)\n    ## Apply step 1: upsert changed and new entries.\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "applied before the deletes",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    ## Apply step 3: delete the removed entries.\n",
+  "new": "    db[DATASETS].update_one({'_id': dataset_id}, {'$set': {'applied': {'uuid': uuid_hex, 'ts': fields['timestamp']}}})\n    ## Apply step 3: delete the removed entries.\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "no rev condition in step 4",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "{'_id': dataset_id, 'rev': rev},",
+  "new": "{'_id': dataset_id},",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "GET skip on newer instead of equal",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    if pair == applied_pair and not doc.get('applying'):\n",
+  "new": "    if applied_pair and pair[1] <= applied_pair[1] and not doc.get('applying'):\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "HEAD nochange on newer instead of equal",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    if applied_pair == (session.uuid.hex, session.timestamp) and not doc.get('applying'):\n",
+  "new": "    if applied_pair and session.timestamp <= applied_pair[1] and not doc.get('applying'):\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "diff on ts only",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "changed = [k for k, e in new.items() if cur.get(k) != e]",
+  "new": "changed = [k for k, e in new.items() if (cur.get(k) or {}).get('ts') != e['ts']]",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "diff without gen",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "changed = [k for k, e in new.items() if cur.get(k) != e]",
+  "new": "changed = [k for k, e in new.items() if {**(cur.get(k) or {}), 'n': 0} != {**e, 'n': 0}]",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "per-key label = index ts",
+  "file": "ebooklet/mongo/store.py",
+  "old": "chunk_id(self._d, entry['u'], k, ts)",
+  "new": "chunk_id(self._d, entry['u'], k, entry['ts'])",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "no uuid in the chunk id",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "return f'{dataset_id}|{uuid_hex}|{key}|{ts}'",
+  "new": "return f'{dataset_id}|{key}|{ts}'",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "compare with a freshly read applied",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if (fields['uuid'].hex, fields['timestamp']) == self._applied:",
+  "new": "        _a = self._db[DATASETS].find_one({'_id': self._d})['applied']\n        if (fields['uuid'].hex, fields['timestamp']) == ((_a['uuid'], _a['ts']) if _a else None):",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "no refetch before a fault",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        items, failures = self._fetch(retry)\n        self._store(retry, items)\n        if not failures:\n            return\n\n        ## 3.",
+  "new": "        failures = retry\n\n        ## 3.",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "invert the HEAD classification",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if (fields['uuid'].hex, fields['timestamp']) == self._applied:",
+  "new": "        if (fields['uuid'].hex, fields['timestamp']) != self._applied:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "do not clear missing",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "{'$set': {'missing': False, 'checked_at': checked}}",
+  "new": "{'$set': {'checked_at': checked}}",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "checked_at on a failed refresh",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "    checked = _now()\n",
+  "new": "    checked = _now()\n    db[DATASETS].update_one({'_id': dataset_id}, {'$set': {'checked_at': checked}})\n",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "get bypasses the memo",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if key not in self._values:\n            self._fill([key])",
+  "new": "        if True:\n            self._fill([key])",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "store ignores missing",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        if doc.get('missing'):",
+  "new": "        if False:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "reader sends the HEAD at construction",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        self.threads = threads\n\n\ndef object_reader",
+  "new": "        self.threads = threads\n        self._load_db_metadata()\n\n\ndef object_reader",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "fetch an unmanifested group",
+  "file": "ebooklet/mongo/store.py",
+  "old": "            elif e['n'] is None:",
+  "new": "            elif False:",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ }
+]
