@@ -145,6 +145,17 @@ with ebooklet.open_rcg(remote_conn_rcg, '/tmp/rcg.blt', 'n') as rcg:
     changes.push()
 ```
 
+## Serving a remote from MongoDB (`ebooklet[mongo]`)
+
+`pip install 'ebooklet[mongo]'` adds `ebooklet.mongo`. It lets any number of stateless readers serve a
+remote database from MongoDB instead of each keeping a local file:
+- **`refresh()`**, run by exactly one worker, copies the remote's index and metadata into MongoDB;
+- **`MongoStore`** is a read-only, per-request store that fills an insert-only chunk cache from the remote
+  on a miss. cfdb opens datasets on it with `cfdb.open_store_dataset`.
+
+The operating rules (write order, consistency, the 404 classification, requirements, limits) are in
+the [Operations guide](docs/ops.md#the-mongodb-read-path-ebookletmongo-013).
+
 ## Data Formats and Stability
 
 What EBooklet stores in a remote: storage **format 3** (grouped, since 0.11) or **format 2** (per-key; also the 0.10 hash-grouped layout, which 0.11 refuses). For a database at S3 key `D`:

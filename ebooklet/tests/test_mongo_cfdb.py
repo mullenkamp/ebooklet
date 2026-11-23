@@ -1,18 +1,13 @@
 """
 cfdb read through ebooklet.mongo.MongoStore equals cfdb read through open_edataset, for all four
-dataset types, hermetically (cfdb EDatasets pushed to the fake S3, a REAL MongoDB).
-
-Until cfdb ships `open_store_dataset` (cfdb 0.12.0), the dataset is opened on the store with the
-same type dispatch cfdb uses (`_open_on_store` below); switch to the public function then.
+dataset types, hermetically (cfdb EDatasets pushed to the fake S3, a REAL MongoDB). Datasets are
+opened on the store with cfdb's public `open_store_dataset` (cfdb >= 0.12.0).
 """
-import pathlib
-
 import cfdb
 import numpy as np
 import pytest
 import shapely
 from cfdb import dtypes
-from cfdb.main import Grid, GridForecast, TimeSeriesForecast, TimeSeriesOrtho
 
 from ebooklet.errors import StaleIndexError
 from ebooklet.mongo import MongoStore, ensure_schema, object_reader, refresh
@@ -26,17 +21,11 @@ from ebooklet.tests.mongo_support import (  # noqa: F401  (mongo_client, mongo_d
 
 DB = 'cf'
 DS = 'cf1'
-_CLASSES = {'grid': Grid, 'ts_ortho': TimeSeriesOrtho, 'ts_forecast': TimeSeriesForecast, 'grid_forecast': GridForecast}
 TIME = np.arange('2024-01-01T00', '2024-01-03T00', dtype='datetime64[h]')
 FRT = np.array(['2024-01-01T00', '2024-01-01T06', '2024-01-01T12'], dtype='datetime64[m]')
 LEAD = np.arange(1, 7, dtype='int32')
 F32 = dtypes.dtype('float32', precision=2, min_value=-100, max_value=1000)
 RNG = np.random.default_rng(7)
-
-
-def _open_on_store(store):
-    dt = store.get_metadata()['dataset_type']
-    return _CLASSES[dt](pathlib.Path('mongo-store'), store, False, 'zstd', None, dt)
 
 
 def _data(shape):
@@ -109,7 +98,7 @@ def test_cfdb_through_the_store_equals_open_edataset(db, tmp_path, dataset_type)
 
     session = CountingSession(store)
     with cfdb.open_edataset(fake_s3.FakeS3Connection(store, DB), tmp_path / 'r.cfdb', flag='r') as ref, \
-            _open_on_store(MongoStore(db, DS, object_reader(DB, http_session=session))) as got:
+            cfdb.open_store_dataset(MongoStore(db, DS, object_reader(DB, http_session=session))) as got:
         assert got.dataset_type == ref.dataset_type == dataset_type
         assert dict(got.attrs) == dict(ref.attrs)
         assert sorted(got.coord_names) == sorted(ref.coord_names)
@@ -151,7 +140,7 @@ def test_a_request_spanning_a_re_encoding_refresh_is_refused_by_verify(db, tmp_p
     build(tmp_path / 'a.cfdb', -100, 100, np.full((12, 2), 5.0, dtype='float32'))
     refresh(db, DS, HookConnection(store, DB))
     st = MongoStore(db, DS, object_reader(DB, http_session=CountingSession(store)))
-    with _open_on_store(st) as old:
+    with cfdb.open_store_dataset(st) as old:
         build(tmp_path / 'b.cfdb', 0, 5000, np.full((12, 2), 4000.0, dtype='float32'))   # same keys, new packing
         refresh(db, DS, HookConnection(store, DB))
         try:
@@ -168,6 +157,6 @@ def test_dataset_operations_the_store_does_not_support_fail_clearly(db, tmp_path
         _grid(ds)
         ds.push()
     refresh(db, DS, HookConnection(store, DB))
-    with _open_on_store(MongoStore(db, DS, object_reader(DB, http_session=CountingSession(store)))) as got:
+    with cfdb.open_store_dataset(MongoStore(db, DS, object_reader(DB, http_session=CountingSession(store)))) as got:
         with pytest.raises(NotImplementedError, match='copy'):
             got.copy(tmp_path / 'copy.cfdb')

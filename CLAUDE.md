@@ -65,6 +65,25 @@ uv build
    - `build_db_payload()` / `parse_db_payload()` — the db-object payload (manifest + metadata section + index bytes)
    - `plan_groups()` — pure allocation of gids to keys new to the remote (write order, tail top-up, fresh gids `max(manifest)+1`)
 
+### The MongoDB read path (`ebooklet/mongo/`, optional extra `ebooklet[mongo]`, 0.13)
+
+The library layer of envlib's read-only API. It is a separate subpackage; nothing in the core imports it.
+- **`refresh.py`:** `refresh(db, dataset_id, remote_conn)` copies one remote's index and metadata into
+  MongoDB, and is run by **exactly one** worker. Its writes go in a fixed order: claim (`rev`+1 and
+  `applying`), entries, the dataset document, deletes, then `applied`.
+- **`store.py`:** `MongoStore(db, dataset_id, reader)` is a read-only store, built per request, that
+  cfdb opens with `cfdb.open_store_dataset`. Call `verify()` before using its results. `object_reader`
+  takes a public `db_url` only.
+- **`schema.py`:** the three collections (`datasets`, `entries`, `chunks`), their validators,
+  `ensure_schema()`, and the per-collection compressors.
+
+The operating rules, the 404 table and the known limits are in `docs/ops.md`, "The MongoDB read path".
+The design history is `planning/mongo-read-path-plan.md` and the `edr-mongo-*` review records.
+- **Tests:** they need a real `mongod` through `EBOOKLET_TEST_MONGO_URI` (see
+  `ebooklet/tests/mongo_support.py`). They skip locally without it, and fail under CI.
+- **Mutation evidence:** `planning/mongo-read-path-evidence/` (runner `mutate.py`).
+- **Benchmarks:** `benchmarks/bench_mongo.py`, run from a scratch copy.
+
 ### Grouped S3 Storage (format 3, 0.11: write-order groups)
 
 The WRITER assigns groups at push time and records each key's gid in its 19-byte remote-index entry (`encode_group_entry` / `decode_index_entry`; per-key entries are 15 bytes — the sidecar's fixed value_len is the layout discriminator). Readers take the gid from the index, so ebooklet never interprets keys.
@@ -105,14 +124,21 @@ The WRITER assigns groups at push time and records each key's gid in its 19-byte
 
 ```python
 from ebooklet import (open_ebooklet, open_rcg, EVariableLengthValue, RemoteConnGroup,
-                      S3Connection, PushResult, RemoteIntegrityError, UnsupportedFormatError,
-                      GroupTooLargeError, PushInProgressError, ConcurrentCompactionError,
-                      fsck, FsckReport)
+                      S3Connection, PushResult, DEFAULT_GROUP_BYTES, fsck, FsckReport,
+                      # errors (errors.py): Error, ReadOnlyError, UUIDMismatchError, RemoteMissingError,
+                      # UnsupportedFormatError, GroupTooLargeError, RemoteIntegrityError, StaleIndexError,
+                      # LockLostError, ConcurrentCommitError, OfflineError, PushInProgressError,
+                      # ConcurrentCompactionError
+                      )
+from ebooklet.mongo import refresh, MongoStore, object_reader, ensure_schema   # needs ebooklet[mongo]
 ```
+`__all__` in `ebooklet/__init__.py` is the authority.
 
 ### Dependencies
 
-Core: `booklet>=0.12.7` (reserved slots), `s3func>=0.9.3` (lock verify + age-gated breaking), `urllib3>=2`, `msgspec` (all ebooklet-owned serialization), `portalocker` (plus `uuid6` via booklet)
+The floors are in `pyproject.toml` (`[project] dependencies`; the `mongo` extra adds pymongo). Keep
+`requirements.txt` in step with them (the conda recipe is unmaintained). The core needs booklet, s3func,
+urllib3, msgspec (all of ebooklet's own serialization) and portalocker.
 
 ### Open Flags
 

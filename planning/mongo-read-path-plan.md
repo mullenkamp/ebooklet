@@ -413,8 +413,14 @@ synthesis and verdicts are in `edr-mongo-code-1-review-synthesis.md`; the arm re
     plan 3 (prefetching attrs and coordinate chunks in one batch).
   - **Not comparable:** booklet's own stored `results.json` (str serializer, an older booklet, perhaps
     another machine), which is why the baseline is measured inline.
-- **Remaining:**
-  - Mike's review of the staged source and his releases (ebooklet 0.13.0, cfdb 0.12.0), then a lock
-    refresh;
-  - after the cfdb release, switch `test_mongo_cfdb.py` to `cfdb.open_store_dataset`, and raise
-    ebooklet's dev floor to `cfdb>=0.12.0`.
+- **Closed 2026-11-24.**
+  - **Release and CI:** Mike reviewed and released ebooklet 0.13.0 and cfdb 0.12.0, both verified on
+    PyPI with a wheel and an sdist. ebooklet's CI passed on `e153553` on 3.10–3.12, with the MongoDB
+    service.
+  - **Post-release (uncommitted):** the dev floor is now `cfdb>=0.12.0`, and `test_mongo_cfdb.py`
+    uses `cfdb.open_store_dataset` (382 passed). The cfdb, envlib and envlib-ingest-base locks were
+    refreshed. The four other repos' locks wait on Mike (the envlib `OPEN_WORK.md` item "Refresh locks
+    to booklet 0.12.11 and ebooklet 0.11.2").
+  - **The tracker item** "EDR plan 1: the MongoDB read path" is in envlib's `OPEN_WORK_DONE.md`.
+  - **Carried to later plans:** plan 2 (one worker replica, an uncached endpoint, the option of
+    credentials) and plan 3 (`verify()`, retry with a new store, fewer round trips).

@@ -4,6 +4,11 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## Unreleased
+
+- **Dev dependency:** `cfdb>=0.12.0`. `tests/test_mongo_cfdb.py` now opens datasets with the public
+  `cfdb.open_store_dataset` instead of cfdb's classes. No change to the package itself.
+
 ## 0.13.0 (2026-11-24)
 
 The MongoDB read path (plan `planning/mongo-read-path-plan.md`; plan review `edr-mongo-plan-1`, Fable 5.2
