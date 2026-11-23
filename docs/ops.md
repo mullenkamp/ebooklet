@@ -114,13 +114,68 @@ sweeps them), and re-running the push converges.
 ## Lost or stuck write locks
 
 - A crashed writer leaves its lock tickets behind. Opening with
-  `force_lock=True` breaks tickets **older than 2 hours only** — a live
-  writer's tickets survive, so this is safe to use routinely.
+  `force_lock=True` breaks tickets **older than 2 hours only**, so a live
+  writer's tickets survive. But ticket age is session *start*, so a legitimately
+  long session is breakable too. Treat it as a recovery tool, not a routine
+  setting.
 - To break *younger* tickets (you are certain the writer is dead), call
   `S3SessionWriter.break_other_locks(timestamp=<now>)` directly.
-- A writer whose ticket was broken discovers it at its next push boundary and
-  aborts with `LockLostError` **before** writing anything. Its pending changes
-  stay journaled: re-open the file (re-acquiring the lock) and push again.
+- **Leases (0.12, s3func ≥ 0.10).** `open_ebooklet(..., lock_lease=seconds)` (or
+  `open_rcg`) declares the session's maximum hold:
+  - Any other writer that waits on an expired leased ticket breaks it. That is
+    `lease + 60 s` old, on the storage server's clock. A dead or stalled writer
+    then blocks others for at most its lease, with no manual step.
+  - The holder itself stops trusting the lock 60 s before the lease ends: its
+    push aborts with `LockLostError` naming the lease.
+  - Its commit PUT is presigned to expire at that deadline, so a commit delayed
+    past it is refused by the server and nothing is committed.
+  - Declare a lease well above the longest healthy session, which includes the
+    lock wait, and keep `lock_timeout` well under it.
+  - The lease runs from the lock ticket's PUT, so the time spent waiting for the
+    lock counts against it.
+  - Leases are refused for per-key storage, `flag='n'`, a local file that carries
+    an unpushed `flag='n'` replacement, and `flag='r'`. The first three write or
+    delete live objects outside the guarded commit. The refusals are checked at
+    open and again at push, after the push has adopted the remote's current mode.
+  - Tickets without a lease are never broken automatically. That includes
+    every pre-0.12 writer's.
+- A writer whose ticket was broken, or whose lease ran out, discovers it at its
+  next push boundary. It aborts with `LockLostError` **before** committing. Its
+  pending changes stay journaled: re-open the file (re-acquiring the lock) and
+  push again.
+- **The commit guard (0.12, grouped writers).**
+  - Immediately before the commit PUT, the push HEADs the db object through
+    the write session. It compares the stamp with the base its manifest and
+    index were built from, which is captured at push start.
+  - If another writer committed in between, the push aborts with
+    `ConcurrentCommitError` (a `LockLostError`), and nothing is committed. That
+    can only happen once mutual exclusion was lost.
+  - Without the guard, the late commit republished a stale manifest. That left
+    an unreadable group, or silently dropped the other writer's update, and
+    both pushes reported success.
+  - **It narrows the window rather than closing it.**
+    - A commit that lands between the guard's HEAD and the commit PUT still
+      causes those failures. B2 offers no conditional write to close it.
+    - For a leased session, the presigned commit bounds the window at the lease
+      deadline.
+    - An unleased session, or one whose ticket was broken by hand before its
+      deadline, has no bound.
+  - **Per-key writers are not protected.** Their uploads overwrite live values
+    before the guard runs, so refusing the commit comes too late.
+  - **A commit that landed while the client saw an error** (a lost response, a
+    5xx after the store) is detected by one HEAD and treated as committed. The
+    guard also accepts the remote carrying this session's own earlier attempted
+    commit, so the retry works.
+  - The cleanup of replaced generations after a commit re-verifies the lock
+    first. If the check itself fails, the cleanup is skipped (leftovers are
+    orphans for fsck), and a committed push never raises over it.
+  - Cost: one HEAD and one lock check (a LIST) per push.
+  - Requirement: a writer's base stamp is read through its `db_url` when it has
+    one. If that url served cached HEADs, the session's second and later pushes
+    would be refused. On 2026-11-23, the B2-backed urls behind Cloudflare
+    answered `cf-cache-status: DYNAMIC` (uncached).
+- After a `LockLostError`, re-open the file. Since s3func 0.10, a failed
+  `verify()` releases the ticket, so the same session cannot push again.
 
 ## `fsck` — integrity checking and housekeeping
 

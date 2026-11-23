@@ -79,13 +79,25 @@ class RemoteIntegrityError(Error, urllib3.exceptions.HTTPError):
 
 class LockLostError(Error):
     """
-    This session's write-lock ticket was broken by another client (their
-    force_lock) - discovered by the pre-push or pre-commit verification.
-    Mutual exclusion is gone, so the push aborts; all pending changes stay
-    journaled. Re-open the file to re-acquire the lock and push again.
-    Deliberately NOT an HTTPError: the remote is reachable - losing the lock
-    is not a connectivity failure, and connectivity handlers must not treat
-    it as one.
+    This session no longer holds the write lock: its ticket was broken by
+    another client (their force_lock, or an expired lease), or its own declared
+    lease ran out (lock_lease) - discovered by the pre-push or pre-commit
+    verification, or by the fenced commit PUT being refused. Mutual exclusion
+    is gone, so the push aborts; all pending changes stay journaled. Re-open
+    the file to re-acquire the lock and push again. Deliberately NOT an
+    HTTPError: the remote is reachable - losing the lock is not a connectivity
+    failure, and connectivity handlers must not treat it as one.
+    """
+
+
+class ConcurrentCommitError(LockLostError):
+    """
+    The remote's db object changed after this session read it: another writer
+    committed in between (only possible once mutual exclusion has been lost,
+    e.g. a broken or expired lock). Committing now would publish an index and
+    manifest built on the old state - naming generations the other writer's
+    cleanup may already have deleted - so the push aborts before the commit
+    PUT, with every pending change journaled. Re-open the file and push again.
     """
 
 

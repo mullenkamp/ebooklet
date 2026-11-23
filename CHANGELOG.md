@@ -4,6 +4,69 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
+## 0.12.0 (unreleased)
+
+Lock leases and the commit guard (plan `lock-lease-plan-1`, Step 2). Prompted by the ECan orphaned lock tickets
+of 2026-10-13 and 2026-11-22: a degrading VM's stalled runs held tickets on three datasets, and every later run
+timed out until they were broken by hand. Code-reviewed in round `ebooklet-lease-code-1` (Fable 5.2 and
+Sonnet 5.5); every finding is fixed below.
+
+- **Requires s3func >= 0.10.0**, the release with leases and fenced PUTs. The floors in `requirements.txt` and
+  `conda/meta.yaml` are updated too.
+- **The commit guard (grouped writers).**
+  - Immediately before the commit PUT, the push HEADs the db object through the write session. It compares the
+    stamp with the base its manifest and index were built from, which is captured at push start.
+  - If another writer committed in between, it raises `ConcurrentCommitError` (a `LockLostError`) with every
+    pending change journaled.
+  - Before this, once mutual exclusion was lost (a broken or expired lock), the late commit republished its
+    push-start manifest. Writers repacking different groups left the remote unreadable (`RemoteIntegrityError`,
+    fsck `claimed_but_missing`), and a shared group silently lost the other writer's update. Both pushes reported
+    success. This is reproduced in `tests/test_lease_commit_guard.py` with the guard removed.
+  - **What it doesn't do:**
+    - It narrows the window but doesn't close it. A commit landing between the HEAD and the PUT still causes those
+      failures, and B2 has no conditional write. A lease bounds that window at its deadline.
+    - It doesn't protect per-key writers, whose uploads overwrite live values before the guard.
+  - Cost: one HEAD and one lock check per push.
+  - Requirement: a writer's `db_url` must not serve cached HEADs, or the session's second and later pushes are
+    refused.
+- **A commit that landed while the client saw an error is committed.**
+  - One HEAD after a failed commit PUT decides. A raised PUT, a 5xx, or a refused retry whose first attempt landed
+    all continue as committed: the journal is cleared and the base refreshed.
+  - The guard also accepts this session's own earlier attempted stamp, so the documented retry still works when
+    that HEAD failed too.
+  - Without this, the guard refused a writer's own landed commit as "another writer".
+- **The cleanups after a push re-verify the lock** before deleting replaced generations, for ordinary pushes and
+  replacement sweeps.
+  - A writer that lost the lock no longer deletes objects another writer's commit may name.
+  - A failing re-verify skips the cleanup (leftovers are orphans for fsck). It never fails a committed push.
+- **`lock_lease=` on `open_ebooklet`, `open_rcg` and both classes**, passed to s3func's lease.
+  - Another writer breaks a dead or stalled holder's ticket once it is past its lease (+ 60 s).
+  - The holder's own pushes abort 60 s before the lease ends.
+  - Its commit PUT is presigned to expire at the lease deadline.
+  - A refused fenced commit is reported as a lease expiry only when the lock confirms the lease has run out.
+    Otherwise it is an `HTTPError` ("not a lease expiry: check the credentials and the client clock").
+  - The lease runs from the lock ticket's PUT, so waiting for the lock counts against it.
+  - **Refused (`ValueError`) for:** per-key storage, `flag='n'`, a local file carrying an unpushed `flag='n'`
+    replacement, and `flag='r'`. The first three are also checked at push start, after the push has adopted the
+    remote's current mode.
+  - The `fsck` sweep's lock stays unleased.
+- **Messages:**
+  - `LockLostError` names why the lock was lost (broken, lease expired, or no server clock).
+  - The lock-timeout `TimeoutError` reports each blocking ticket's age and lease.
+  - The `force_lock` docstrings now state the 2-hour age gate, and that the break runs before lease validation.
+- **New `S3SessionWriter.get_timestamp_writer()`**, and `put_db_object(..., expires_at=)`.
+- **The test fake (`tests/fake_s3.py`) gains real leases.** `FakeLock` has a `lease_deadline` and a clock
+  injectable as `FakeLock.clock`; its `verify()` expires with `lost_reason`. Fenced PUTs are refused after their
+  deadline (403). Unlike s3func, the fake's `verify()` does not release on False.
+- **Tests:** `tests/test_lease_commit_guard.py` (33).
+  - The race in both orders, for writers touching different groups and the same group.
+  - A landed commit whose response failed. A retry after an undetected landed commit.
+  - The base snapshot, and the guard's appeared, vanished and write-session branches.
+  - Every refusal, lock release on a refused open, `open_rcg`'s lease.
+  - The fenced commit, the 401/403 distinction, the local lease refusal, and a failing post-commit verify.
+  - **Mutation:** all 23 mutants of the new mechanisms are caught, including every survivor the reviewers
+    reported.
+
 ## 0.11.2 (2026-11-10)
 
 - **Requires booklet >= 0.12.11.** booklet 0.12.10 hangs forever at the second reindex of a `FixedLengthValue`

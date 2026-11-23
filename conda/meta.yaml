@@ -38,7 +38,7 @@ requirements:
     - hatchling
   run:
     - python >=3.10
-    - s3func >=0.6
+    - s3func >=0.10.0
     - urllib3 >=2
     - booklet >=0.7.5
 

@@ -262,11 +262,7 @@ class Change:
         ## exclusion and must not push. (The commit PUT re-verifies again -
         ## the point of no return.)
         if self._ebooklet.lock is not None and not self._ebooklet.lock.verify():
-            raise LockLostError(
-                "The write lock is no longer held (this session's lock ticket was broken "
-                'by another client) - aborting the push. All pending changes are retained '
-                'in the journal; re-open the file to re-acquire the lock and push again.'
-            )
+            raise LockLostError(utils.lock_lost_message(self._ebooklet.lock, 'at its start'))
 
         journal = self._ebooklet._journal
 
@@ -310,6 +306,19 @@ class Change:
                            'now; adopting its index before pushing so this push merges into it '
                            'instead of replacing it')
             self._ebooklet._pull_remote_index(force=True)
+
+        ## A leased session must not push per-key (its uploads overwrite live
+        ## values before the guarded commit) or a replacement (its sweep deletes
+        ## after the commit). Checked AFTER the adoption above, which can switch
+        ## the session to the remote's mode; the open-time refusals cannot see
+        ## a mode that changed under the session.
+        if getattr(self._ebooklet, '_lock_lease', None) is not None:
+            if self._ebooklet._group_bytes is None:
+                raise ValueError('lock_lease is not supported for per-key storage, and this remote is now '
+                                 'per-key - re-open without lock_lease to push.')
+            if journal.replace_pending:
+                raise ValueError('lock_lease is not supported for a replacement push (this local file carries '
+                                 "an unpushed flag='n' replacement) - re-open without lock_lease to push it.")
 
         ## The push holds captured value offsets from the changelog sweep until
         ## its commit - a compaction (prune/clear) would invalidate them all,
@@ -386,52 +395,37 @@ class EVariableLengthValue(MutableMapping):
             group_bytes=utils.UNSET,
             lock_timeout: int = 300,
             force_lock: bool = False,
+            lock_lease: int = None,
             push_packers: int = 1,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', group_bytes, lock_timeout, force_lock, push_packers)
+        self._init_common(remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, 'EVariableLengthValue', group_bytes, lock_timeout, force_lock, push_packers, lock_lease=lock_lease)
 
-    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, group_bytes=utils.UNSET, lock_timeout=300, force_lock=False, push_packers=1):
+    def _init_common(self, remote_session, local_file_path, flag, value_serializer, n_buckets, buffer_size, ebooklet_type, group_bytes=utils.UNSET, lock_timeout=300, force_lock=False, push_packers=1, lock_lease=None):
         """
         Shared initialization logic for EVariableLengthValue and RemoteConnGroup.
         """
         if not isinstance(push_packers, int) or push_packers < 1:
             raise ValueError('push_packers must be an integer >= 1.')
         ## Lock the remote if file is opened for write
+        if lock_lease is not None and flag == 'r':
+            raise ValueError("lock_lease applies only to a writable session; flag='r' takes no lock.")
+        if lock_lease is not None and flag == 'n':
+            ## A replacement push sweeps the old database's objects after its
+            ## commit; a leased holder that stalled could sweep objects a newer
+            ## writer's commit names. Replacements stay unleased.
+            raise ValueError("lock_lease is not supported with flag='n' (a replacement push deletes the old "
+                             'database after its commit). Open without lock_lease.')
+        self._lock_lease = lock_lease
         if flag != 'r':
-            lock = remote_session.create_lock()
+            lock = remote_session.create_lock(lease=lock_lease) if lock_lease is not None else remote_session.create_lock()
             if force_lock:
                 lock.break_other_locks()
             acquired = lock.acquire(timeout=lock_timeout)
             if not acquired:
-                others = lock.other_locks()
-                if others:
-                    import datetime
-                    now = datetime.datetime.now(datetime.timezone.utc)
-                    ages = []
-                    for lock_id, info in others.items():
-                        ts = info.get('upload_timestamp')
-                        if ts:
-                            age = now - ts
-                            ages.append(str(age).split('.')[0])
-                    age_str = ', '.join(ages) if ages else 'unknown'
-                    msg = (
-                        f'Could not acquire write lock within {lock_timeout}s. '
-                        f'Blocked by existing lock(s) held for: {age_str}. '
-                        'If you are sure no other writer is active, re-open with force_lock=True '
-                        '(age-gated: it only breaks lock tickets older than 2 hours, so a live '
-                        'writer is protected; to break YOUNGER tickets, call '
-                        'S3SessionWriter.break_other_locks(timestamp=<now>) directly).'
-                    )
-                else:
-                    msg = (
-                        f'Could not acquire write lock within {lock_timeout}s. '
-                        'Re-open with force_lock=True to break stale locks (age-gated: only '
-                        'tickets older than 2 hours are broken).'
-                    )
-                raise TimeoutError(msg)
+                raise TimeoutError(_lock_timeout_message(lock, lock_timeout))
             self.writable = True
 
             ## Re-read the remote db metadata now that the lock is held: another
@@ -488,6 +482,11 @@ class EVariableLengthValue(MutableMapping):
             remote_state = RemoteState.load(local_file)
             if flag == 'n':
                 journal.set_replace_pending(True)
+            elif journal.replace_pending and lock_lease is not None:
+                ## The same rule as flag='n': this file's next push is a
+                ## replacement, whose sweep must not run under a lease.
+                raise ValueError("lock_lease is not supported for a replacement push: this local file carries an "
+                                 "unpushed flag='n' replacement. Re-open without lock_lease to push it.")
             elif journal.replace_pending:
                 warnings.warn(
                     "This local file carries an unpushed remote REPLACEMENT (a previous "
@@ -603,6 +602,12 @@ class EVariableLengthValue(MutableMapping):
                 resolved_group_bytes = None
             if flag != 'r':
                 journal.set_storage(storage)
+            if lock_lease is not None and storage == utils.STORAGE_PER_KEY:
+                ## Per-key pushes overwrite live values in place before the
+                ## commit, so a stalled leased holder could overwrite a newer
+                ## writer's committed values. Per-key sessions stay unleased.
+                raise ValueError('lock_lease is not supported for per-key storage (group_bytes=None): its '
+                                 'uploads overwrite live objects before the commit. Open without lock_lease.')
             index_value_len = (utils.INDEX_LEN_GROUPED if storage == utils.STORAGE_GROUPED
                                else utils.INDEX_LEN_PER_KEY)
 
@@ -1612,12 +1617,13 @@ class RemoteConnGroup(EVariableLengthValue):
             group_bytes=utils.UNSET,
             lock_timeout: int = 300,
             force_lock: bool = False,
+            lock_lease: int = None,
             push_packers: int = 1,
             ):
         """
 
         """
-        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', group_bytes, lock_timeout, force_lock, push_packers)
+        self._init_common(remote_session, local_file_path, flag, 'orjson', n_buckets, buffer_size, 'RemoteConnGroup', group_bytes, lock_timeout, force_lock, push_packers, lock_lease=lock_lease)
 
 
     def add(self, remote_conn: remote.S3Connection, key: str = None, user_meta=None):
@@ -1709,6 +1715,39 @@ class RemoteConnGroup(EVariableLengthValue):
         self.add(remote_conn, key=key)
 
 
+def _lock_timeout_message(lock, lock_timeout):
+    """
+    The TimeoutError text when the write lock could not be acquired: each
+    blocking ticket's age and its lease (s3func >= 0.10) - when it becomes
+    breakable by any writer, or that it never will be (no lease: a legacy or
+    unleased writer, cleared only by hand).
+    """
+    import datetime
+    others = lock.other_locks()
+    if not others:
+        return (f'Could not acquire write lock within {lock_timeout}s. Re-open with force_lock=True '
+                'to break stale locks (age-gated: only tickets older than 2 hours are broken).')
+    now = datetime.datetime.now(datetime.timezone.utc)
+    parts = []
+    for info in others.values():
+        ts = info.get('upload_timestamp')
+        held = str(now - ts).split('.')[0] if ts else 'unknown'
+        lease, expires_at = info.get('lease'), info.get('expires_at')
+        if lease is None:
+            parts.append(f'held for {held}, no lease (a legacy or unleased writer: never auto-broken)')
+        else:
+            left = (expires_at - now).total_seconds() if expires_at else None
+            when = f'breakable in about {left:.0f}s' if left and left > 0 else 'breakable now (expired)'
+            parts.append(f'held for {held}, lease {lease}s ({when})')
+    return (
+        f'Could not acquire write lock within {lock_timeout}s. Blocked by: ' + '; '.join(parts) + '. '
+        'An expired leased ticket is broken by the next writer that waits on it. For a ticket without '
+        'a lease, if you are sure no other writer is active, re-open with force_lock=True (age-gated: '
+        'it only breaks tickets older than 2 hours, so a live writer is protected; to break YOUNGER '
+        'tickets, call S3SessionWriter.break_other_locks(timestamp=<now>) directly).'
+    )
+
+
 def _grouped_target(explicit_group_bytes, remote_session):
     """The packing target of a grouped session: the group_bytes argument if
     one was passed; else the value the grouped remote records (what its last
@@ -1766,6 +1805,7 @@ def open_ebooklet(
     group_bytes=utils.UNSET,
     lock_timeout: int = 300,
     force_lock: bool = False,
+    lock_lease: int = None,
     offline: Union[bool, str] = False,
     push_packers: int = 1,
     num_groups=utils.UNSET,
@@ -1802,7 +1842,10 @@ def open_ebooklet(
         Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
 
     force_lock : bool
-        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
+        If True, break existing write-lock tickets older than 2 hours (s3func's age gate) before acquiring - a recovery tool for stale tickets left by crashed writers; a younger, live writer is protected. To break younger tickets call S3SessionWriter.break_other_locks(timestamp=<now>) directly. Default is False.
+
+    lock_lease : int or None
+        Declare a maximum hold for this session's write lock, in seconds (requires s3func >= 0.10). If this writer dies or stalls holding the lock, any other writer may break the ticket once it is older than the lease (+ 60 s), instead of timing out until someone breaks it by hand; this session itself stops trusting the lock 60 s before the lease ends, and its commit PUT is fenced so the server refuses it after that deadline. The lease runs from the lock ticket's PUT, so time spent waiting for the lock counts, and covers the whole session (any number of pushes) - declare one comfortably above the longest healthy session plus the wait, and keep lock_timeout well under it (s3func rejects a timeout the lease cannot cover; with force_lock=True the break runs before that check). Not supported for per-key storage (group_bytes=None), flag='n', a local file carrying an unpushed flag='n' replacement, or flag='r' (ValueError): the first three write or delete live objects outside the guarded commit. Default None: no lease, the ticket is never broken automatically.
 
     num_groups : None
         Removed in 0.11 (hash grouping); kept for one release. An explicit num_groups=None keeps its old meaning, per-key storage (same as group_bytes=None), so existing callers keep their layout; an int raises ValueError - use group_bytes.
@@ -1866,7 +1909,7 @@ def open_ebooklet(
         ## Wrap the WHOLE online open (both remote touches: the metadata HEAD
         ## and the index fetch) - a transport failure from either falls back.
         try:
-            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
+            return open_ebooklet(remote_conn, file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, lock_lease=lock_lease, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             ## Typed ebooklet errors never fall back (TRANSPORT_ERRORS lists
             ## transport classes only; this is the belt to the design rule).
@@ -1888,7 +1931,7 @@ def open_ebooklet(
     if ebooklet_type is not None and ebooklet_type != 'EVariableLengthValue':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not EVariableLengthValue. Use open_rcg() instead.')
 
-    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
+    return EVariableLengthValue(remote_session=remote_session, local_file_path=local_file_path, flag=flag, value_serializer=value_serializer, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, lock_lease=lock_lease, push_packers=push_packers)
 
 
 def open_rcg(
@@ -1901,6 +1944,7 @@ def open_rcg(
     group_bytes=utils.UNSET,
     lock_timeout: int = 300,
     force_lock: bool = False,
+    lock_lease: int = None,
     offline: Union[bool, str] = False,
     push_packers: int = 1,
     num_groups=utils.UNSET,
@@ -1933,7 +1977,10 @@ def open_rcg(
         Maximum time in seconds to wait for the write lock when opening for write. Default is 300 (5 minutes). Only applies when flag is not ``'r'``. Raises ``TimeoutError`` if the lock cannot be acquired within the timeout.
 
     force_lock : bool
-        If True, break any existing write locks before acquiring. Use this to recover from stale locks left by crashed processes. Default is False.
+        If True, break existing write-lock tickets older than 2 hours (s3func's age gate) before acquiring - a recovery tool for stale tickets left by crashed writers; a younger, live writer is protected. To break younger tickets call S3SessionWriter.break_other_locks(timestamp=<now>) directly. Default is False.
+
+    lock_lease : int or None
+        Declare a maximum hold for this session's write lock, in seconds (requires s3func >= 0.10). If this writer dies or stalls holding the lock, any other writer may break the ticket once it is older than the lease (+ 60 s), instead of timing out until someone breaks it by hand; this session itself stops trusting the lock 60 s before the lease ends, and its commit PUT is fenced so the server refuses it after that deadline. The lease runs from the lock ticket's PUT, so time spent waiting for the lock counts, and covers the whole session (any number of pushes) - declare one comfortably above the longest healthy session plus the wait, and keep lock_timeout well under it (s3func rejects a timeout the lease cannot cover; with force_lock=True the break runs before that check). Not supported for per-key storage (group_bytes=None), flag='n', a local file carrying an unpushed flag='n' replacement, or flag='r' (ValueError): the first three write or delete live objects outside the guarded commit. Default None: no lease, the ticket is never broken automatically.
 
     num_groups : None
         Removed in 0.11 - see open_ebooklet.
@@ -1982,7 +2029,7 @@ def open_rcg(
     if offline == 'auto':
         ## Wrap the WHOLE online open (both remote touches) - see open_ebooklet.
         try:
-            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, offline=False, push_packers=push_packers)
+            return open_rcg(remote_conn, file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, lock_lease=lock_lease, offline=False, push_packers=push_packers)
         except TRANSPORT_ERRORS as err:
             if isinstance(err, Error):
                 raise
@@ -2002,6 +2049,6 @@ def open_rcg(
     if ebooklet_type is not None and ebooklet_type != 'RemoteConnGroup':
         raise TypeError(f'The remote database is of type {ebooklet_type}, not RemoteConnGroup. Use open_ebooklet() instead.')
 
-    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, push_packers=push_packers)
+    return RemoteConnGroup(remote_session=remote_session, local_file_path=local_file_path, flag=flag, n_buckets=n_buckets, buffer_size=buffer_size, group_bytes=group_bytes, lock_timeout=lock_timeout, force_lock=force_lock, lock_lease=lock_lease, push_packers=push_packers)
 
 

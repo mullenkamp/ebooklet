@@ -10,6 +10,7 @@ from ebooklet.errors import (
     GroupTooLargeError,
     RemoteIntegrityError,
     LockLostError,
+    ConcurrentCommitError,
     OfflineError,
     PushInProgressError,
     ConcurrentCompactionError,
@@ -24,8 +25,8 @@ __all__ = [
     'PushResult', 'DEFAULT_GROUP_BYTES',
     'Error', 'ReadOnlyError', 'UUIDMismatchError', 'RemoteMissingError',
     'UnsupportedFormatError', 'GroupTooLargeError', 'RemoteIntegrityError',
-    'LockLostError', 'OfflineError', 'PushInProgressError', 'ConcurrentCompactionError',
+    'LockLostError', 'ConcurrentCommitError', 'OfflineError', 'PushInProgressError', 'ConcurrentCompactionError',
     'fsck', 'FsckReport',
 ]
 
-__version__ = '0.11.2'
+__version__ = '0.12.0'

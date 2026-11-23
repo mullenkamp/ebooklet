@@ -13,6 +13,7 @@ import warnings
 import uuid as _uuid
 import booklet
 import urllib3
+import s3func
 from datetime import datetime, timezone
 import base64
 import portalocker
@@ -130,9 +131,52 @@ from .errors import (  # noqa: E402
     UUIDMismatchError as UUIDMismatchError,
     RemoteMissingError as RemoteMissingError,
     LockLostError as LockLostError,
+    ConcurrentCommitError as ConcurrentCommitError,
     OfflineError as OfflineError,
     ConcurrentCompactionError as ConcurrentCompactionError,
 )
+
+
+def lock_lost_message(lock, where):
+    """The LockLostError text for a failed verify(), naming why (s3func >= 0.10 sets lock.lost_reason)."""
+    reason = getattr(lock, 'lost_reason', None)
+    lease = getattr(lock, 'lease', None)
+    if reason == 'lease_expired':
+        why = (f"this session's declared lock lease ({lease} s) has run out, so another writer "
+               'may now break its ticket')
+    elif reason == 'no_server_date':
+        why = 'the storage server stopped reporting its clock (no Date header), so the lease cannot be judged'
+    else:
+        why = "this session's lock ticket was broken by another client"
+    return (f'The write lock is no longer held ({why}) - aborting the push {where}. All pending '
+            'changes are retained in the journal; re-open the file to re-acquire the lock and push again.')
+
+
+def _attempted_commit_stamps(remote_session):
+    """The commit stamps this session has tried to commit (the guard accepts its own landed commit)."""
+    stamps = getattr(remote_session, '_attempted_commit_ts', None)
+    if stamps is None:
+        stamps = set()
+        remote_session._attempted_commit_ts = stamps
+    return stamps
+
+
+def _commit_landed(remote_session, time_int_us):
+    """True iff the remote's db object now carries THIS commit's stamp (one HEAD; False if that fails too)."""
+    try:
+        return remote_session.get_timestamp_writer() == time_int_us
+    except Exception:
+        return False
+
+
+def _verify_quietly(lock):
+    """lock.verify() for the AFTER-commit checks: a listing failure there must not turn a committed push
+    into a raise, so it counts as 'lock not held' (skip the cleanup; leftovers are orphans for fsck)."""
+    try:
+        return lock.verify()
+    except Exception as err:
+        logger.warning(f'Could not re-verify the write lock after the commit ({err}); skipping the cleanup.')
+        return False
 
 
 def build_db_payload(manifest, meta_section, index_bytes):
@@ -1345,6 +1389,12 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         loc_map = {key: (ts, off, ln) for key, ts, off, ln in local_file.locations()}
 
     pre_push_manifest = dict(remote_state.manifest)
+    ## The commit guard's base, captured with the manifest and index it labels:
+    ## a re-pull during the push (a reader thread resolving a missing key) can
+    ## move the live remote_session.timestamp onto another writer's commit,
+    ## which would let a stale commit pass the guard (review round
+    ## ebooklet-lease-code-1, Fable, executed).
+    base_ts = remote_session.timestamp
     deletes = journal.deletes   # read here; journal mutated only post-commit
 
     ## Upload data and update the remote_index file. updated: something this
@@ -1816,16 +1866,82 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
         ## aborts here instead of committing without mutual exclusion. All
         ## pending state stays journaled for a retry.
         if lock is not None and not lock.verify():
-            raise LockLostError(
-                "The write lock is no longer held (this session's lock ticket was broken by "
-                'another client) - aborting the push before the commit. All pending changes '
-                'are retained; re-open the file to re-acquire the lock and push again.'
+            raise LockLostError(lock_lost_message(lock, 'before the commit'))
+
+        ## THE PRE-COMMIT STAMP CHECK (0.12). The commit publishes a manifest
+        ## and index built from the state this session read; if another writer
+        ## committed in between (possible only once mutual exclusion is lost -
+        ## a broken or expired lock), publishing them would point at
+        ## generations that writer's cleanup may already have deleted, or
+        ## silently drop its update. So: one HEAD of the db object through the
+        ## WRITE session (the S3 API, never a cached public url), compared
+        ## with the stamp this session's state is based on (None = absent).
+        ## Any difference aborts before the point of no return.
+        ## The remote may also carry this SESSION's own earlier commit, one that
+        ## landed while the client saw an error (a lost response, a 5xx after
+        ## the store): that is not another writer, and a retry must proceed, as
+        ## it did before the guard existed (review round ebooklet-lease-code-1,
+        ## Sonnet, executed).
+        attempted = _attempted_commit_stamps(remote_session)
+        current_ts = remote_session.get_timestamp_writer()
+        if current_ts != base_ts and current_ts not in attempted:
+            raise ConcurrentCommitError(
+                'The remote was committed by another writer after this session read it '
+                f'(remote commit stamp {current_ts}, this session is based on {base_ts}) '
+                '- aborting the push before the commit. All pending changes are retained in the '
+                'journal; re-open the file and push again.'
             )
+        attempted.add(time_int_us)
 
-        resp = remote_session.put_db_object(payload, metadata=metadata)
+        ## A leased lock fences the commit on the server's clock: the PUT is
+        ## presigned to expire at the lease deadline, so a commit delayed past
+        ## it (a stalled process, slow retries) is refused by the server
+        ## instead of landing after another writer may have broken in.
+        deadline = getattr(lock, 'lease_deadline', None) if lock is not None else None
+        resp = None
+        try:
+            if deadline is not None:
+                resp = remote_session.put_db_object(payload, metadata=metadata, expires_at=deadline)
+            else:
+                resp = remote_session.put_db_object(payload, metadata=metadata)
+        except s3func.LeaseExpiredError as err:
+            ## Refused locally: nothing was sent.
+            raise LockLostError(
+                f"The lock lease ran out before the commit could be sent ({err}) - aborting the push "
+                'before the commit. All pending changes are retained in the journal; re-open the file '
+                'and push again.'
+            ) from err
+        except Exception:
+            ## The PUT raised (e.g. retries exhausted after a lost response):
+            ## the commit may still have landed. One HEAD decides.
+            if not _commit_landed(remote_session, time_int_us):
+                raise
+            push_logger.warning('the commit PUT raised, but the remote carries this commit - continuing as committed')
 
-        if resp.status // 100 != 2:
-            raise urllib3.exceptions.HTTPError("The db object failed to upload. You need to rerun the push with force_push=True or the remote will be corrupted.")
+        if resp is not None and resp.status // 100 != 2:
+            if _commit_landed(remote_session, time_int_us):
+                ## A stored commit whose response failed (or a retry refused
+                ## after the first attempt landed): it IS committed.
+                push_logger.warning(f'the commit PUT reported HTTP {resp.status}, but the remote carries this '
+                                    'commit - continuing as committed')
+            elif deadline is not None and resp.status in (401, 403):
+                if lock is not None and not lock.verify():
+                    raise LockLostError(
+                        f'The fenced commit PUT was refused by the server (HTTP {resp.status}) and '
+                        + lock_lost_message(lock, 'at its commit').replace('The write lock', 'the write lock', 1)
+                        + ' Nothing was committed (the remote does not carry this commit).'
+                    )
+                raise urllib3.exceptions.HTTPError(
+                    f'The fenced commit PUT was refused (HTTP {resp.status}: {resp.error}) although this session '
+                    'still holds its lease - not a lease expiry: check the credentials and the client clock. '
+                    'Nothing was committed (the remote does not carry this commit); the pending changes are '
+                    'retained in the journal.'
+                )
+            else:
+                raise urllib3.exceptions.HTTPError(
+                    f'The db object failed to upload (HTTP {resp.status}: {resp.error}). Nothing was committed '
+                    '(the remote does not carry this commit); the pending changes are retained - rerun the push.'
+                )
 
         push_logger.info(f'commit succeeded ({len(payload):,} B db object)')
 
@@ -1902,7 +2018,7 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                 ## so re-verify the lock; on failure, abort the sweep (the
                 ## commit already succeeded - the leftovers are orphans for
                 ## fsck, never a correctness problem).
-                if lock is not None and not lock.verify():
+                if lock is not None and not _verify_quietly(lock):
                     logger.warning('The write lock was lost after the replacement commit - skipping the old-object sweep (the leftovers are invisible orphans; run fsck to clean them up).')
                 else:
                     expected = {group_obj_key(gid, gen) for gid, gen in new_manifest.items()}
@@ -1920,6 +2036,13 @@ def update_remote(local_file, remote_index, remote_index_path, changelog_path, r
                                 logger.warning(f"Replacement sweep could not delete '{child}' (orphan; fsck will sweep): {err}")
                     except Exception as err:
                         logger.warning(f'Replacement sweep failed (leftovers are invisible orphans; run fsck): {err}')
+            ## Ordinary push: delete the generations this commit replaced or
+            ## emptied - safe only while mutual exclusion holds (a writer that
+            ## lost the lock could delete generations another writer's commit
+            ## still names), so re-verify first; on failure skip the GC (the
+            ## leftovers are orphans for fsck).
+            elif lock is not None and not _verify_quietly(lock):
+                logger.warning('The write lock was lost after the commit - skipping the GC of replaced generations (the leftovers are invisible orphans; run fsck to clean them up).')
             else:
                 for gid, gen in new_gens.items():
                     old_gen = pre_push_manifest.get(gid)

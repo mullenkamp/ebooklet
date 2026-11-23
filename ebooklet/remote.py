@@ -392,12 +392,17 @@ class S3SessionWriter(S3SessionReader):
         return self._writable
 
 
-    def put_db_object(self, data: bytes, metadata):
+    def put_db_object(self, data: bytes, metadata, expires_at=None):
         """
         Upload the main db object to the remote.
+
+        ``expires_at`` (aware datetime, server clock): fence the PUT so the
+        server refuses it after that time (s3func put_object(expires_at=), a
+        presigned PUT). A leased session commits with its lock's lease_deadline.
         """
         if self.writable:
-            return self._write_session.put_object(self.write_db_key, data, metadata=metadata)
+            extra = {} if expires_at is None else {'expires_at': expires_at}
+            return self._write_session.put_object(self.write_db_key, data, metadata=metadata, **extra)
         else:
             raise ReadOnlyError('Session is not writable.')
 
@@ -611,12 +616,17 @@ class S3SessionWriter(S3SessionReader):
         """
         return self._write_session.list_object_versions(prefix=self.write_db_key + '/')
 
-    def create_lock(self):
+    def create_lock(self, lease: int = None):
         """
         Initialise an S3 lock object. A lock is not immediately aquired. This must be done via the lock object (as well as releasing locks).
+
+        ``lease`` (seconds) declares a maximum hold (s3func >= 0.10): other
+        writers may break this ticket once it is that old (+ s3func's grace),
+        and this lock's verify() turns False shortly before. None = no lease.
         """
         if self.writable:
-            lock = self._write_session.lock(self.write_db_key)
+            ## lease only when declared: duck-typed sessions need not know it.
+            lock = self._write_session.lock(self.write_db_key, **({'lease': lease} if lease is not None else {}))
             return lock
         else:
             raise ReadOnlyError('Session is not writable.')
@@ -646,6 +656,19 @@ class S3SessionWriter(S3SessionReader):
         else:
             raise ReadOnlyError('Session is not writable.')
 
+
+    def get_timestamp_writer(self):
+        """
+        The db object's commit timestamp as the WRITE session sees it now (the
+        S3 API, never a public db_url), or None if it does not exist. Used by
+        the pre-commit check that no other writer committed in between.
+        """
+        resp = self._head_object_writer()
+        if resp.status == 200:
+            return int(resp.metadata['timestamp'])
+        if resp.status == 404:
+            return None
+        raise urllib3.exceptions.HTTPError(resp.error)
 
     def _head_object_writer(self, key: str=None):
         """

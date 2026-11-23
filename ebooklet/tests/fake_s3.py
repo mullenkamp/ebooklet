@@ -44,21 +44,54 @@ class FakeListResp:
 
 class FakeLock:
     """Single-process stand-in for the s3func bakery lock. verify() mirrors
-    s3func 0.9.3's contract minimally: True only while acquired. Tests that
-    need a broken-ticket scenario flip `broken` to make verify() fail."""
-    def __init__(self):
+    s3func's contract minimally: True only while acquired. Tests that need a
+    broken-ticket scenario flip `broken` to make verify() fail.
+
+    Leases (s3func >= 0.10): a lock created with ``lease`` exposes
+    ``lease_deadline`` (acquire time + lease - LEASE_MARGIN) and its verify()
+    turns False past it, with ``lost_reason`` set as s3func does. Time comes
+    from ``FakeLock.clock`` (a callable returning an aware datetime) when a
+    test sets it, else the real clock. Unlike s3func, a False verify() does
+    not release here: tests flip ``broken`` and retry on the same lock."""
+    clock = None
+    LEASE_MARGIN = 60
+
+    def __init__(self, lease=None):
         self._held = False
         self.broken = False
+        self.lease = lease
+        self.lost_reason = None
+        self._acquired_at = None
+
+    @classmethod
+    def now(cls):
+        return cls.clock() if cls.clock else datetime.datetime.now(datetime.timezone.utc)
 
     def acquire(self, blocking=True, timeout=-1, exclusive=True):
         self._held = True
+        self._acquired_at = self.now()
+        self.lost_reason = None
         return True
 
     def release(self):
         self._held = False
 
+    @property
+    def lease_deadline(self):
+        if self.lease is None or not self._held:
+            return None
+        return self._acquired_at + datetime.timedelta(seconds=self.lease - self.LEASE_MARGIN)
+
     def verify(self):
-        return self._held and not self.broken
+        if not self._held:
+            return False
+        if self.broken:
+            self.lost_reason = 'broken'
+            return False
+        if self.lease is not None and self.now() > self.lease_deadline:
+            self.lost_reason = 'lease_expired'
+            return False
+        return True
 
     def other_locks(self):
         return {}
@@ -81,10 +114,17 @@ class FakeS3Session:
         self._access_key_id = 'fake'
         self._access_key = 'fake'
         self.put_log = []           # every key ever PUT (survives deletes)
+        self.fenced_puts = []       # (key, expires_at) of every fenced PUT (put_object expires_at=)
         self.upload_times = self._upload_times_by_store.setdefault(id(store), {})
 
     # --- object ops -------------------------------------------------
-    def put_object(self, key, obj, metadata=None, content_type=None):
+    def put_object(self, key, obj, metadata=None, content_type=None, expires_at=None):
+        if expires_at is not None:
+            ## A fenced (presigned) PUT: the server refuses it after the
+            ## deadline, as B2 (401) and MEGA (403) do - nothing is stored.
+            self.fenced_puts.append((key, expires_at))
+            if FakeLock.now() > expires_at:
+                return FakeResp(403, error={'Code': 'AccessDenied', 'Message': 'Request has expired'})
         metadata = dict(metadata or {})
         if hasattr(obj, 'read'):
             obj = obj.read()
@@ -160,7 +200,7 @@ class FakeS3Session:
 
     # --- lock -------------------------------------------------------
     def lock(self, key, lock_id=None, **kw):
-        return FakeLock()
+        return FakeLock(lease=kw.get('lease'))
 
 
 class FakeS3Connection(remote.S3Connection):
