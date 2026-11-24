@@ -27,10 +27,15 @@ see docs/ops.md.
 
 Commit timestamps are the writer's wall clock and are NOT monotonic: a commit is "new" when its
 (uuid, timestamp) pair DIFFERS from `applied`, never when it is "newer".
+
+A dataset document gets an incarnation token `inc` (a random hex string) when it is first inserted.
+If the document is deleted and recreated, `rev` restarts from the beginning but `inc` differs, so a
+store built on the old document still sees the change (plan review `edr-worker-plan-2`).
 """
 import datetime
 import io
 import logging
+import uuid
 
 import booklet
 import urllib3
@@ -80,7 +85,7 @@ def _mark_missing(db, dataset_id, db_url, checked):
         {'_id': dataset_id},
         {
             '$set': {'missing': True, 'checked_at': checked, 'db_url': db_url},
-            '$setOnInsert': {'rev': 0, 'applied': None},
+            '$setOnInsert': {'rev': 0, 'applied': None, 'inc': uuid.uuid4().hex},
         },
         upsert=True,
     )
@@ -183,7 +188,7 @@ def refresh(db, dataset_id, remote_conn, *, db_url=None):
         {
             '$inc': {'rev': 1},
             '$set': {'applying': True, 'db_url': db_url},
-            '$setOnInsert': {'applied': None, 'checked_at': None, 'missing': False},
+            '$setOnInsert': {'applied': None, 'checked_at': None, 'missing': False, 'inc': uuid.uuid4().hex},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,

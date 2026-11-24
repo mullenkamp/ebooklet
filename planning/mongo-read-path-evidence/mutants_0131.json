@@ -1,0 +1,79 @@
+[
+ {
+  "name": "_changed ignores inc",
+  "file": "ebooklet/mongo/store.py",
+  "old": "return doc is None or doc['rev'] != self._rev or doc.get('inc') != self._inc",
+  "new": "return doc is None or doc['rev'] != self._rev",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "claim sets no inc",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "'$setOnInsert': {'applied': None, 'checked_at': None, 'missing': False, 'inc': uuid.uuid4().hex},",
+  "new": "'$setOnInsert': {'applied': None, 'checked_at': None, 'missing': False},",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "TTL index created without expiry",
+  "file": "ebooklet/mongo/schema.py",
+  "old": "db[CHUNKS].create_index([('t', 1)], name=TTL_INDEX, expireAfterSeconds=chunk_ttl_seconds)",
+  "new": "db[CHUNKS].create_index([('t', 1)], name=TTL_INDEX)",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "cache insert ordered=True",
+  "file": "ebooklet/mongo/store.py",
+  "old": "self._db[CHUNKS].insert_many(docs, ordered=False)",
+  "new": "self._db[CHUNKS].insert_many(docs, ordered=True)",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "_mark_missing sets no inc",
+  "file": "ebooklet/mongo/refresh.py",
+  "old": "            '$setOnInsert': {'rev': 0, 'applied': None, 'inc': uuid.uuid4().hex},",
+  "new": "            '$setOnInsert': {'rev': 0, 'applied': None},",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "store requires inc (a 0.13.0 doc raises)",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        self._inc = doc.get('inc')",
+  "new": "        self._inc = doc['inc']",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ },
+ {
+  "name": "_changed requires inc (a 0.13.0 doc raises)",
+  "file": "ebooklet/mongo/store.py",
+  "old": "or doc.get('inc') != self._inc",
+  "new": "or doc['inc'] != self._inc",
+  "tests": [
+   "ebooklet/tests/test_mongo_refresh.py",
+   "ebooklet/tests/test_mongo_store.py",
+   "ebooklet/tests/test_mongo_cfdb.py"
+  ]
+ }
+]

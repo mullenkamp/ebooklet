@@ -70,7 +70,9 @@ uv build
 The library layer of envlib's read-only API. It is a separate subpackage; nothing in the core imports it.
 - **`refresh.py`:** `refresh(db, dataset_id, remote_conn)` copies one remote's index and metadata into
   MongoDB, and is run by **exactly one** worker. Its writes go in a fixed order: claim (`rev`+1 and
-  `applying`), entries, the dataset document, deletes, then `applied`.
+  `applying`), entries, the dataset document, deletes, then `applied`. A newly inserted dataset document
+  gets an incarnation token `inc` (0.13.1). The store compares `inc` along with `rev`, so a document that
+  is deleted and recreated cannot alias an old one.
 - **`store.py`:** `MongoStore(db, dataset_id, reader)` is a read-only store, built per request, that
   cfdb opens with `cfdb.open_store_dataset`. Call `verify()` before using its results. `object_reader`
   takes a public `db_url` only.
@@ -80,7 +82,9 @@ The library layer of envlib's read-only API. It is a separate subpackage; nothin
 The operating rules, the 404 table and the known limits are in `docs/ops.md`, "The MongoDB read path".
 The design history is `planning/mongo-read-path-plan.md` and the `edr-mongo-*` review records.
 - **Tests:** they need a real `mongod` through `EBOOKLET_TEST_MONGO_URI` (see
-  `ebooklet/tests/mongo_support.py`). They skip locally without it, and fail under CI.
+  `ebooklet/tests/mongo_support.py`). They skip locally without it, and fail under CI. CI runs them on
+  MongoDB 9.0, plus one job on 8.0.
+- **The consumer** is envlib's refresher service, repo `envlib/envlib-api`.
 - **Mutation evidence:** `planning/mongo-read-path-evidence/` (runner `mutate.py`).
 - **Benchmarks:** `benchmarks/bench_mongo.py`, run from a scratch copy.
 

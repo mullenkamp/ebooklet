@@ -4,10 +4,34 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## Unreleased
+## 0.13.1 (unreleased)
 
+From plan review `edr-worker-plan-2` (Fable 5.2 and Sonnet 5.5), which reviewed envlib's refresher
+service on top of `ebooklet.mongo`.
+
+- **Fix: a dataset document that is deleted and recreated is now detected.** `refresh()` gives each
+  new dataset document an incarnation token, `inc`, which is a random hex string. `MongoStore` compares
+  it along with `rev`.
+  - Before this fix, a recreated document restarted `rev` at the value the old one had, for example
+    1 for a dataset applied once.
+  - A request built on the old document could then read a key whose entry had not been re-upserted
+    yet as absent, which cfdb reads as fill values. `verify()` passed, because `rev` matched.
+  - Both review arms reproduced it.
+  - Documents written by 0.13.0 have no `inc`, and they are compared as before until they are
+    recreated.
+- **Tested on MongoDB 9.0** (9.0.8) as well as 8.0. CI now runs every Python version against 9.0,
+  plus one job against 8.0.
+- **New tests from the review:**
+  - The TTL index is created with its expiry by a single `ensure_schema` call. Before, a second
+    call's `collMod` repaired a missing expiry, so a mutant survived.
+  - A chunk-cache insert that contains one duplicate still caches every other chunk. Before, an
+  `ordered=True` mutant survived.
+  - From code review `edr-worker-code-2`:
+    - A document first created by `_mark_missing` and later recreated the same way is still detected.
+      A mutant dropping `inc` from `_mark_missing` survived before, and it does serve fill values.
+    - A document written by 0.13.0 (no `inc`) still serves, and still detects a recreation.
 - **Dev dependency:** `cfdb>=0.12.0`. `tests/test_mongo_cfdb.py` now opens datasets with the public
-  `cfdb.open_store_dataset` instead of cfdb's classes. No change to the package itself.
+  `cfdb.open_store_dataset` instead of cfdb's classes.
 
 ## 0.13.0 (2026-11-24)
 

@@ -15,13 +15,14 @@ A read:
 
 The consistency rule: a request is answered only if no refresh applied a commit while it ran. The
 store refuses to build while an apply is in progress, and verify() raises StaleIndexError if `rev`
-moved or an apply started since construction - the request's metadata and its chunks might then
+moved, an apply started, or the document was deleted or recreated (its incarnation token `inc`
+differs) since construction - the request's metadata and its chunks might then
 come from different commits (decoded values from neither). StaleIndexError is retryable WITH A NEW
 STORE; a store that raised it stays stale.
 
 Never returns None for a failed fetch (cfdb would read it as fill values). The rules:
 
-- a key with no entry: re-read the dataset's `rev`; changed (or applying) -> StaleIndexError,
+- a key with no entry: re-read the dataset's `rev` and `inc`; changed -> StaleIndexError,
   unchanged -> genuinely absent, None.
 - a per-key object whose timestamp differs from its entry's (overwritten in place since the index
   was copied, maybe not yet committed) -> StaleIndexError.
@@ -120,6 +121,7 @@ class MongoStore:
             )
         self._applied = (applied['uuid'], applied['ts'])
         self._rev = doc['rev']
+        self._inc = doc.get('inc')   # None for a document written before 0.13.1
         ## The remote's ebooklet type (e.g. 'EVariableLengthValue', 'RemoteConnGroup'). The store serves
         ## the bytes as stored whatever the type; what they mean is the caller's business.
         self.ebooklet_type = doc.get('ebooklet_type')
@@ -201,8 +203,10 @@ class MongoStore:
         # rev alone suffices: an apply's claim bumps rev in the same write that sets `applying`,
         # and a store is never built while `applying` is set (mutant "_changed ignores applying"
         # survived every test for exactly this reason; review edr-mongo-code-1).
-        doc = self._db[DATASETS].find_one({'_id': self._d}, {'rev': 1})
-        return doc is None or doc['rev'] != self._rev
+        ## `inc` catches a document deleted and recreated since construction: its `rev` restarts and
+        ## may equal ours (plan review edr-worker-plan-2, both arms).
+        doc = self._db[DATASETS].find_one({'_id': self._d}, {'rev': 1, 'inc': 1})
+        return doc is None or doc['rev'] != self._rev or doc.get('inc') != self._inc
 
     def _absent(self, keys):
         """Keys with no entry: genuinely absent, unless a refresh changed the dataset meanwhile."""

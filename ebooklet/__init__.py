@@ -30,4 +30,4 @@ __all__ = [
     'fsck', 'FsckReport',
 ]
 
-__version__ = '0.13.0'
+__version__ = '0.13.1'

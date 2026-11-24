@@ -58,6 +58,7 @@ VALIDATORS = {
                     'properties': {'uuid': {'bsonType': 'string'}, 'ts': _INT},
                 },
                 'rev': _INT,
+                'inc': _STR_OR_NULL,
                 'uuid': _STR_OR_NULL,
                 'storage_kind': _STR_OR_NULL,
                 'ebooklet_type': _STR_OR_NULL,

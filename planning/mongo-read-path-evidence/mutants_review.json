@@ -277,7 +277,7 @@
  {
   "name": "_mark_missing without setOnInsert",
   "file": "ebooklet/mongo/refresh.py",
-  "old": "            '$setOnInsert': {'rev': 0, 'applied': None},\n",
+  "old": "            '$setOnInsert': {'rev': 0, 'applied': None, 'inc': uuid.uuid4().hex},\n",
   "new": "",
   "tests": [
    "ebooklet/tests/test_mongo_refresh.py",

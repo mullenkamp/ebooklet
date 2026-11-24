@@ -29,6 +29,8 @@ from ebooklet.tests import fake_s3
 from ebooklet.tests.groups import TEST_GB
 from ebooklet.tests.mongo_support import (  # noqa: F401  (mongo_client, mongo_db are fixtures)
     CountingSession,
+    Crash,
+    CrashAfter,
     HookConnection,
     RecordingConnection,
     mongo_client,
@@ -446,6 +448,86 @@ def test_an_unknown_dataset_is_missing(db):
         MongoStore(db, 'nope', object_reader(DB, http_session=CountingSession({})))
 
 
+def test_a_cache_insert_with_one_duplicate_still_caches_every_other_chunk(db, tmp_path):
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh(db, store)
+    a, _ = _mstore(db, store)
+    a.load_items(['k1'])                                 # k1 is cached first, by another request
+    assert db[CHUNKS].count_documents({}) == 1
+    b, _ = _mstore(db, store)
+    b._fetch_and_heal(b._read_entries(list(VALUES)))     # b's insert batch includes the duplicate k1
+    assert db[CHUNKS].count_documents({}) == len(VALUES), 'a duplicate must not stop the rest of the batch'
+
+
+# ── plan review edr-worker-plan-2: a dataset document deleted and recreated (ABA on rev) ───────────
+
+def _drop_dataset(db):
+    db[DATASETS].delete_one({'_id': DS})
+    db[ENTRIES].delete_many({'d': DS})
+
+
+@MODES
+def test_a_recreated_dataset_document_mid_re_mirror_is_stale_not_absent(db, tmp_path, group_bytes):
+    store = {}
+    _seed(store, tmp_path, group_bytes)
+    _refresh(db, store)
+    st, _ = _mstore(db, store)
+    st.load_items(['k0'])
+    _drop_dataset(db)
+    with pytest.raises(Crash):                           # the re-mirror stops right after its claim
+        refresh(CrashAfter(db, DATASETS, 'find_one_and_update'), DS, HookConnection(store, DB))
+    assert db[DATASETS].find_one({'_id': DS})['rev'] == st._rev, 'premise: rev restarted at the old value'
+    with pytest.raises(StaleIndexError):
+        st.get('k1')                                     # no entry yet: must not read as absent (fill)
+    with pytest.raises(StaleIndexError):
+        st.verify()
+
+
+def test_a_recreated_dataset_document_after_a_full_re_mirror_fails_verify(db, tmp_path):
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh(db, store)
+    st, _ = _mstore(db, store)
+    _drop_dataset(db)
+    _refresh(db, store)
+    assert db[DATASETS].find_one({'_id': DS})['rev'] == st._rev, 'premise: rev restarted at the old value'
+    with pytest.raises(StaleIndexError):
+        st.verify()
+
+
+def test_a_document_recreated_through_a_missing_remote_is_detected(db, tmp_path):
+    """Both incarnations begin in _mark_missing, so both get their `inc` there (code review edr-worker-code-2)."""
+    store = {}
+    assert refresh(db, DS, HookConnection({}, DB))['status'] == 'missing'  # first seen while missing
+    _seed(store, tmp_path, TEST_GB)
+    _refresh(db, store)
+    st, _ = _mstore(db, store)
+    _drop_dataset(db)
+    assert refresh(db, DS, HookConnection({}, DB))['status'] == 'missing'  # recreated while missing
+    _refresh(db, store)
+    doc = db[DATASETS].find_one({'_id': DS})
+    assert doc['rev'] == st._rev, 'premise: rev restarted at the old value'
+    assert doc['inc'] is not None and doc['inc'] != st._inc
+    with pytest.raises(StaleIndexError):
+        st.verify()
+
+
+def test_a_document_written_by_0_13_0_still_serves_and_detects_a_recreation(db, tmp_path):
+    """A 0.13.0 document has no `inc`: it reads as before, and a recreated one is still detected."""
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh(db, store)
+    db[DATASETS].update_one({'_id': DS}, {'$unset': {'inc': ''}})  # as 0.13.0 wrote it
+    st, _ = _mstore(db, store)
+    assert st.get('k1') == VALUES['k1'] and st.get('nope') is None
+    st.verify()
+    _drop_dataset(db)
+    _refresh(db, store)  # recreated by 0.13.1, so it now has an inc
+    with pytest.raises(StaleIndexError):
+        st.verify()
+
+
 def test_the_validators_take_large_integers_and_require_a_date(db):
     db[ENTRIES].insert_one({'_id': 'x|k', 'd': 'x', 'k': 'k', 'ts': 2**52, 'g': 4_000_000_000,
                             'n': 'abc', 'o': 3_000_000_000, 'l': 2**32 - 1, 'u': 'u'})
@@ -455,13 +537,19 @@ def test_the_validators_take_large_integers_and_require_a_date(db):
                            't': datetime.datetime.now(datetime.timezone.utc)})
 
 
-def test_expired_chunks_are_removed_by_the_ttl_monitor(db, mongo_client):
-    """~1-2 s: waits for MongoDB's TTL monitor (its period set to 1 s for the test)."""
+def test_expired_chunks_are_removed_by_the_ttl_monitor(mongo_db, mongo_client):
+    """
+    ~1-2 s: waits for MongoDB's TTL monitor (its period set to 1 s for the test). A fresh database
+    and ONE ensure_schema call, so the TTL index under test is the one created (not repaired by a
+    second call's collMod - review edr-worker-plan-2).
+    """
+    db = mongo_db
     admin = mongo_client.admin
     old = admin.command('getParameter', 1, ttlMonitorSleepSecs=1)['ttlMonitorSleepSecs']
     admin.command('setParameter', 1, ttlMonitorSleepSecs=1)
     try:
         ensure_schema(db, 60)
+        assert db[CHUNKS].index_information()[schema_mod.TTL_INDEX]['expireAfterSeconds'] == 60
         past = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
         db[CHUNKS].insert_one({'_id': 'x|u|k|1', 'v': Binary(b'v'), 'n': 1, 't': past})
         deadline = datetime.datetime.now() + datetime.timedelta(seconds=5)

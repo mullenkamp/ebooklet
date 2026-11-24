@@ -1,0 +1,7 @@
+_changed ignores inc                     KILLED  (1 failed, 72 passed, 1 warning in 2.09s)
+claim sets no inc                        KILLED  (1 failed, 72 passed, 1 warning in 2.18s)
+TTL index created without expiry         KILLED  (1 failed, 78 passed, 1 warning in 2.31s)
+cache insert ordered=True                KILLED  (1 failed, 71 passed, 1 warning in 2.17s)
+_mark_missing sets no inc                KILLED  (1 failed, 75 passed, 1 warning in 2.24s)
+store requires inc (a 0.13.0 doc raises) KILLED  (1 failed, 76 passed, 1 warning in 2.33s)
+_changed requires inc (a 0.13.0 doc raises) KILLED  (1 failed, 76 passed, 1 warning in 2.29s)

@@ -11,13 +11,14 @@ on:
 
 jobs:
   test:
-    name: Test Python ${{ matrix.python-version }}
+    name: Test Python ${{ matrix.python-version }}, MongoDB ${{ matrix.mongo-version }}
     runs-on: ubuntu-latest
     services:
       # A real MongoDB for the ebooklet.mongo tests (they fail, not skip, when CI is set and
-      # EBOOKLET_TEST_MONGO_URI is missing).
+      # EBOOKLET_TEST_MONGO_URI is missing). 9.0 is what envlib-api runs; 8.0 is kept for other
+      # users of ebooklet[mongo] (one extra job, so the live-B2 tests are not doubled).
       mongo:
-        image: mongo:8.0
+        image: mongo:${{ matrix.mongo-version }}
         ports:
           - 27017:27017
     strategy:
@@ -26,6 +27,10 @@ jobs:
       matrix:
         # Define the versions you want to test here
         python-version: ["3.10", "3.11", "3.12"]
+        mongo-version: ["9.0"]
+        include:
+          - python-version: "3.12"
+            mongo-version: "8.0"
 
     steps:
       - uses: actions/checkout@v4

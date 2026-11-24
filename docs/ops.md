@@ -295,13 +295,18 @@ with `pip install 'ebooklet[mongo]'`. It has two halves:
   with `object_reader(db_url, http_session)`; it makes no request until a miss, and one HTTP session
   can be shared per process.
 
-Call `ensure_schema(db, chunk_ttl_seconds)` once before first use.
+Call `ensure_schema(db, chunk_ttl_seconds)` once before first use. Calling it again is safe, and a
+worker typically calls it at every start. On existing collections it re-applies the validators with
+`collMod`, which MongoDB's `readWrite` role does not grant. A user that runs it needs `readWrite`
+plus `collMod` on the database (plan review `edr-worker-plan-2`, reproduced on 8.0, 8.3 and 9.0).
+
+Tested on MongoDB 8.0 and 9.0, with pymongo 4.9 or later.
 
 **The three collections:**
 
 | Collection | One document per | Block compressor | Notes |
 |---|---|---|---|
-| `datasets` | dataset | zstd | The metadata section, the storage kind and format, the remote's ebooklet type (`ebooklet_type`, e.g. `EVariableLengthValue` or `RemoteConnGroup`; the store serves the stored bytes whatever the type), `applied` (the remote commit's `(uuid, timestamp)` the entries reflect), `rev` (bumped when an apply starts), `applying` (an apply is in progress), `checked_at`, `missing` |
+| `datasets` | dataset | zstd | The metadata section, the storage kind and format, the remote's ebooklet type (`ebooklet_type`, e.g. `EVariableLengthValue` or `RemoteConnGroup`; the store serves the stored bytes whatever the type), `applied` (the remote commit's `(uuid, timestamp)` the entries reflect), `rev` (bumped when an apply starts), `inc` (a random incarnation token, set when the document is first inserted), `applying` (an apply is in progress), `checked_at`, `missing` |
 | `entries` | remote-index key | zstd | `ts`, group id `g`, generation `n`, offset `o`, length `l`, remote uuid `u` |
 | `chunks` | (dataset, uuid, key, timestamp) | none | Insert-only cache of the compressed chunk bytes. A TTL index on `t` (a BSON date) expires it. |
 
@@ -331,13 +336,26 @@ because `applied` is written last and a left-over `applying` forces the redo.
 
 **A request is answered only if no commit was applied while it ran.** A store refuses to build while
 `applying` is set, and `store.verify()` raises `StaleIndexError` if `rev` has moved since the store
-was built. **Call `verify()` before using a request's results.** Without it, a request that overlaps
+was built, or if the dataset document was deleted or recreated. **Call `verify()` before using a
+request's results.** Without it, a request that overlaps
 an apply can decode the new commit's chunks with the old commit's metadata: values, and even
 coordinates, from neither commit, with no error (plan review `edr-mongo-code-1`, both arms). The
 window is the apply's MongoDB writes only, about tens of milliseconds for an hourly push, so about
 one request in 50,000 retries.
 
 `StaleIndexError` is retryable **with a new store**: a store that raised it stays stale.
+
+**A recreated dataset document (0.13.1).** If a dataset document is deleted and a later refresh
+recreates it, its `rev` starts again from the beginning. It can then equal the `rev` a running
+request kept, for example 1 for a dataset that has been applied only once.
+- **Before 0.13.1**, such a request read a key whose entry had not been re-upserted yet as absent
+  (fill values), and `verify()` passed (plan review `edr-worker-plan-2`, both arms).
+- **Since 0.13.1**, each new dataset document gets a random incarnation token `inc`. The store
+  compares it along with `rev`, so the request raises `StaleIndexError` instead.
+- **Documents written by 0.13.0** have no `inc`. They keep the old behaviour until they are
+  recreated.
+- **A caller that deletes dataset documents** (for example to retire a dataset) should still prefer
+  a tombstone (`rev` bumped, `applied` cleared, `missing` set), and keep the document.
 
 **Commit timestamps are wall-clock and can go backwards.** A commit counts as new when its
 `(uuid, timestamp)` *differs* from `applied`, never when it is "newer".
@@ -346,8 +364,8 @@ one request in 50,000 retries.
 
 | Situation | Result |
 |---|---|
-| The key has no entry, and `rev` is unchanged since the store was built | `None` (the key is genuinely absent) |
-| The key has no entry, and `rev` changed during the request | `StaleIndexError` (a commit was applied during the request); retry |
+| The key has no entry, and `rev` and `inc` are unchanged since the store was built | `None` (the key is genuinely absent) |
+| The key has no entry, and `rev` or `inc` changed during the request | `StaleIndexError` (a commit was applied, or the document recreated, during the request); retry |
 | A per-key object's timestamp differs from its entry's (overwritten in place since the index was copied, perhaps not yet committed) | `StaleIndexError`; the bytes are cached under their own timestamp, so the retry after the next refresh hits the cache |
 | A chunk 404s, and its re-read entry changed | Fetched again from the new location |
 | A chunk 404s again after one refetch, and a HEAD of the db object **differs** from the `applied` pair read when the store was built | `StaleIndexError`: the index is behind; retry after the next refresh (an API answers 503 with `Retry-After`) |
@@ -369,6 +387,13 @@ one request in 50,000 retries.
   schedules). The cause is that the older refresh's unconditional entry writes and deletes can land
   around the newer refresh's checks. On Docker Swarm, use `replicas: 1` and the default stop-first
   update order, and never run a manual refresh beside the worker.
+  - Stop-first is not a strict guarantee. Swarm starts the replacement task after the old task
+    stops, after its node goes DOWN, or after 60 s, whichever comes first (swarmkit
+    `defaultOldTaskTimeout`). So the worker must exit well within 60 s of SIGTERM: abandon the
+    refresh rather than finish it, which is safe because a crash at any step is redone on the next
+    poll. Set `stop_grace_period` under 60 s, and bound the HTTP timeouts, because s3func's read
+    timeout is an idle timeout. To close the node-DOWN path, pin the worker to MongoDB's node
+    (plan review `edr-worker-plan-2`).
   - *If concurrent refreshers are ever wanted:* every entry write and delete would have to be
     conditional. One way is to tag each entry with the claiming apply's `rev`, claim **before** the
     GET (so a higher tag always means a later commit), write only over entries with a lower tag, and

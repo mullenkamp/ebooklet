@@ -1,0 +1,129 @@
+{
+ "versions": {
+  "ebooklet": "0.13.1",
+  "cfdb": "0.12.0"
+ },
+ "refresh": {
+  "ecan_raw_streamflow": {
+   "status": "applied",
+   "upserted": 10660,
+   "removed": 0,
+   "unmanifested": 0,
+   "applied": [
+    "019f8cdcb9fe824da49f08b173012e5c",
+    1795467002328537
+   ],
+   "seconds": 1.91,
+   "second_poll": "nochange"
+  },
+  "wrf_precip": {
+   "status": "applied",
+   "upserted": 156500,
+   "removed": 0,
+   "unmanifested": 0,
+   "applied": [
+    "01a0d5e8d136835e85b9cd90059745af",
+    1794426414933766
+   ],
+   "seconds": 6.14,
+   "second_poll": "nochange"
+  },
+  "flow_fc": {
+   "status": "applied",
+   "upserted": 342,
+   "removed": 0,
+   "unmanifested": 0,
+   "applied": [
+    "01a0607627768dacbee82ba590c323b8",
+    1795460227608963
+   ],
+   "seconds": 1.4,
+   "second_poll": "nochange"
+  }
+ },
+ "cases": {
+  "ecan_1stn_2wk": {
+   "shape": [
+    1,
+    336
+   ],
+   "finite": 335,
+   "cold_s": 0.839,
+   "cold_equal": true,
+   "warm_s": 0.004,
+   "warm_equal": true
+  },
+  "ecan_all_48h": {
+   "shape": [
+    144,
+    48
+   ],
+   "finite": 6238,
+   "cold_s": 0.224,
+   "cold_equal": true,
+   "warm_s": 0.009,
+   "warm_equal": true
+  },
+  "ecan_loc_week": {
+   "shape": [
+    144,
+    169
+   ],
+   "finite": 22636,
+   "cold_s": 0.374,
+   "cold_equal": true,
+   "warm_s": 0.02,
+   "warm_equal": true
+  },
+  "wrf_cell_1y": {
+   "shape": [
+    8760,
+    1,
+    1
+   ],
+   "finite": 8760,
+   "cold_s": 3.24,
+   "cold_equal": true,
+   "warm_s": 0.018,
+   "warm_equal": true
+  },
+  "wrf_map_1h": {
+   "shape": [
+    1,
+    534,
+    315
+   ],
+   "finite": 168210,
+   "cold_s": 2.0,
+   "cold_equal": true,
+   "warm_s": 0.19,
+   "warm_equal": true
+  },
+  "fc_latest_run": {
+   "shape": [
+    1,
+    1,
+    96
+   ],
+   "finite": 66,
+   "cold_s": 1.277,
+   "cold_equal": true,
+   "warm_s": 0.004,
+   "warm_equal": true
+  },
+  "fc_last_120_runs": {
+   "shape": [
+    1,
+    120,
+    96
+   ],
+   "finite": 8136,
+   "cold_s": 2.835,
+   "cold_equal": true,
+   "warm_s": 0.011,
+   "warm_equal": true
+  }
+ },
+ "chunks_cached": 601,
+ "all_equal": true
+}
