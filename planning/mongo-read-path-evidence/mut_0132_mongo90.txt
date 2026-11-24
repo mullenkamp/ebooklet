@@ -1,0 +1,5 @@
+reader built from a second find_one      KILLED  (1 failed, 50 passed in 2.48s)
+db_url read lazily                       KILLED  (1 failed, 50 passed in 2.49s)
+session path ignores the doc's db_url    KILLED  (1 failed, 49 passed in 2.50s)
+both reader and session accepted         KILLED  (1 failed, 51 passed in 2.54s)
+applied reports the live document        KILLED  (1 failed, 50 passed in 2.48s)

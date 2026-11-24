@@ -4,7 +4,26 @@ Notable changes to ebooklet. The format loosely follows [Keep a Changelog](https
 ebooklet does not promise SemVer — minor versions may change behavior.
 Entries for 0.8.3 and earlier were reconstructed from commit history after the fact.
 
-## 0.13.1 (unreleased)
+## 0.13.2 (unreleased)
+
+From plan review `edr-api-plan-3` (Fable 5.2 and Sonnet 5.5), which reviewed envlib's EDR API on top of
+`ebooklet.mongo`.
+
+- **`MongoStore(db, dataset_id, http_session=session)`** builds its reader from the `db_url` recorded
+  in the dataset document it reads. The reader therefore always belongs to the remote the entries
+  were applied from, even across a re-point.
+  - Pass exactly one of `reader` or `http_session`. `MongoStore(db, dataset_id, reader)` still works.
+  - A document that records no `db_url` (refreshed from a connection without one) is refused on the
+    session path with a `ValueError`.
+- **New read-only properties:** `store.db_url` and `store.applied` (the remote commit's
+  `(uuid hex, timestamp)`). Both come from the document the store was built on, never from a later
+  read.
+- **Construction cost is unchanged:** 10,000 builds took a median of 152–155 µs each, the same as
+  0.13.1 in the same environment.
+- **Mutation evidence:** five mutants, all killed on MongoDB 9.0.8
+  (`planning/mongo-read-path-evidence/mutants_0132.json`).
+
+## 0.13.1 (2026-11-24)
 
 From plan review `edr-worker-plan-2` (Fable 5.2 and Sonnet 5.5), which reviewed envlib's refresher
 service on top of `ebooklet.mongo`.

@@ -687,6 +687,96 @@ def test_fetches_within_one_request_run_concurrently(db, tmp_path):
     assert state['max'] > 1, 'fetches ran one at a time'
 
 
+class _RepointAfterFirstRead:
+    """A database whose first datasets.find_one is followed at once by a re-point of that document."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getitem__(self, name):
+        coll = self._db[name]
+        if name != DATASETS:
+            return coll
+        outer = self
+
+        class _Coll:
+            def find_one(self, *args, **kwargs):
+                doc = coll.find_one(*args, **kwargs)
+                if not getattr(outer, 'fired', False):
+                    outer.fired = True
+                    coll.update_one(
+                        {'_id': DS},
+                        {'$set': {'db_url': 'elsewhere', 'applied': {'uuid': 'f' * 32, 'ts': 1}}, '$inc': {'rev': 1}},
+                    )
+                return doc
+
+            def __getattr__(self, attr):
+                return getattr(coll, attr)
+
+        return _Coll()
+
+
+def _refresh_with_url(db, store):
+    res = refresh(db, DS, HookConnection(store, DB), db_url=DB)
+    assert res['status'] in ('applied', 'nochange'), res
+
+
+def test_a_store_built_from_a_session_reads_through_the_db_url_of_its_own_document(db, tmp_path):
+    store = {}
+    other = 'another-db'   # not DB, so a reader built from any other name reads nothing
+    conn = fake_s3.FakeS3Connection(store, other)
+    with open_ebooklet(conn, tmp_path / 'other.blt', flag='n', group_bytes=TEST_GB) as eb:
+        for k, v in VALUES.items():
+            eb[k] = v
+        assert eb.changes().push()
+    assert refresh(db, DS, conn, db_url=other)['status'] == 'applied'
+    doc = db[DATASETS].find_one({'_id': DS})
+    st = MongoStore(db, DS, http_session=CountingSession(store))
+    assert st.db_url == other and st._reader.read_db_key == other
+    assert st.applied == (doc['applied']['uuid'], doc['applied']['ts'])
+    st.load_items(VALUES)
+    assert {k: st.get(k) for k in VALUES} == VALUES
+    st.verify()
+
+
+def test_a_repoint_after_construction_changes_neither_the_db_url_nor_the_reader(db, tmp_path):
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh_with_url(db, store)
+    before = db[DATASETS].find_one({'_id': DS})['applied']
+    st = MongoStore(_RepointAfterFirstRead(db), DS, http_session=CountingSession(store))
+    assert db[DATASETS].find_one({'_id': DS})['db_url'] == 'elsewhere', 'the re-point did not land'
+    assert st.applied == (before['uuid'], before['ts'])
+    ## The store keeps the document it read: the re-point happened after it, so the reader, db_url
+    ## and the request's verdict all belong to that document.
+    assert st.db_url == DB and st._reader.read_db_key == DB
+    st.load_items(VALUES)
+    assert {k: st.get(k) for k in VALUES} == VALUES
+    with pytest.raises(StaleIndexError):
+        st.verify()
+
+
+def test_a_store_takes_exactly_one_of_a_reader_or_a_session(db, tmp_path):
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh_with_url(db, store)
+    session = CountingSession(store)
+    with pytest.raises(TypeError, match='exactly one'):
+        MongoStore(db, DS)
+    with pytest.raises(TypeError, match='exactly one'):
+        MongoStore(db, DS, object_reader(DB, http_session=session), http_session=session)
+
+
+def test_a_session_store_refuses_a_document_without_a_db_url(db, tmp_path):
+    store = {}
+    _seed(store, tmp_path, TEST_GB)
+    _refresh(db, store)   # a FakeS3Connection has no db_url, so none is recorded
+    assert db[DATASETS].find_one({'_id': DS}).get('db_url') is None
+    with pytest.raises(ValueError, match='no db_url'):
+        MongoStore(db, DS, http_session=CountingSession(store))
+    assert MongoStore(db, DS, object_reader(DB, http_session=CountingSession(store))).db_url is None
+
+
 def test_object_reader_builds_a_non_streaming_session_and_refuses_a_streaming_one():
     reader = object_reader('https://example.invalid/db')   # no request is made
     assert reader._read_session._stream is False and reader.read_db_key == 'https://example.invalid/db'

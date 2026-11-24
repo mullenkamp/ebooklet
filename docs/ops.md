@@ -289,11 +289,19 @@ with `pip install 'ebooklet[mongo]'`. It has two halves:
 
 - **`refresh(db, dataset_id, remote_conn)`** copies one dataset's remote index and metadata into
   MongoDB. Run it from **one** process (a worker) on a timer.
-- **`MongoStore(db, dataset_id, reader)`** is a read-only store for one request. Open it with
-  `cfdb.open_store_dataset(store)`. It reads everything from MongoDB, and on a cache miss fetches the
-  chunk from the remote with ebooklet's own fetchers and inserts it into the cache. Build the reader
-  with `object_reader(db_url, http_session)`; it makes no request until a miss, and one HTTP session
-  can be shared per process.
+- **`MongoStore(db, dataset_id, http_session=session)`** is a read-only store for one request. Open
+  it with `cfdb.open_store_dataset(store)`. It reads everything from MongoDB, and on a cache miss
+  fetches the chunk from the remote with ebooklet's own fetchers and inserts it into the cache. One
+  HTTP session can be shared per process.
+  - **The reader comes from the same document (0.13.2).** Given `http_session`, the store builds its
+    reader from the `db_url` recorded in the dataset document it read, and exposes that `db_url`
+    and the `applied` pair as `store.db_url` and `store.applied`.
+  - A caller that read `db_url` from a separate query could pair a reader with the wrong remote
+    across a re-point. ebooklet's guards turn that into a retry or a spurious `RemoteMissingError`,
+    never wrong data, but it is an availability fault (plan review `edr-api-plan-3`).
+  - Passing a prebuilt reader, `MongoStore(db, dataset_id, object_reader(db_url, http_session))`,
+    still works. It is needed when the document records no `db_url`.
+  - `object_reader` makes no request until a miss.
 
 Call `ensure_schema(db, chunk_ttl_seconds)` once before first use. Calling it again is safe, and a
 worker typically calls it at every start. On existing collections it re-applies the validators with

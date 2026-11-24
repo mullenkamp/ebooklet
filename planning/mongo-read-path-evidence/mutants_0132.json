@@ -1,0 +1,37 @@
+[
+ {
+  "name": "reader built from a second find_one",
+  "file": "ebooklet/mongo/store.py",
+  "old": "reader = object_reader(self._db_url, http_session, threads=threads)",
+  "new": "reader = object_reader(db[DATASETS].find_one({'_id': dataset_id})['db_url'], http_session, threads=threads)",
+  "tests": ["ebooklet/tests/test_mongo_store.py"]
+ },
+ {
+  "name": "db_url read lazily",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        return self._db_url\n",
+  "new": "        return (self._db[DATASETS].find_one({'_id': self._d}) or {}).get('db_url')\n",
+  "tests": ["ebooklet/tests/test_mongo_store.py"]
+ },
+ {
+  "name": "session path ignores the doc's db_url",
+  "file": "ebooklet/mongo/store.py",
+  "old": "reader = object_reader(self._db_url, http_session, threads=threads)",
+  "new": "reader = object_reader('db', http_session, threads=threads)",
+  "tests": ["ebooklet/tests/test_mongo_store.py"]
+ },
+ {
+  "name": "both reader and session accepted",
+  "file": "ebooklet/mongo/store.py",
+  "old": "if (reader is None) == (http_session is None):",
+  "new": "if reader is None and http_session is None:",
+  "tests": ["ebooklet/tests/test_mongo_store.py"]
+ },
+ {
+  "name": "applied reports the live document",
+  "file": "ebooklet/mongo/store.py",
+  "old": "        return self._applied\n",
+  "new": "        doc = self._db[DATASETS].find_one({'_id': self._d})['applied']\n        return (doc['uuid'], doc['ts'])\n",
+  "tests": ["ebooklet/tests/test_mongo_store.py"]
+ }
+]

@@ -2,8 +2,11 @@
 MongoStore: a read-only, per-request store that serves cfdb from MongoDB and fills missing chunks
 from the ebooklet remote.
 
-Build one per request: `cfdb.open_store_dataset(MongoStore(db, dataset_id, reader))`, and call
-`store.verify()` before using what the request read. The store reads the dataset document once, at
+Build one per request: `cfdb.open_store_dataset(MongoStore(db, dataset_id, http_session=session))`,
+and call `store.verify()` before using what the request read. Given a shared `http_session`, the
+store builds its reader from the `db_url` of the same dataset document it keeps (0.13.2), so the
+reader always belongs to the remote the entries were applied from. Passing a prebuilt `reader`
+instead still works. The store reads the dataset document once, at
 construction, and keeps that document's `applied` pair and `rev` for the whole request. Nothing
 persists in the process between requests; MongoDB is the only cache.
 
@@ -102,7 +105,16 @@ class MongoStore:
 
     writable = False
 
-    def __init__(self, db, dataset_id, reader, *, threads=8):
+    def __init__(self, db, dataset_id, reader=None, *, http_session=None, threads=8):
+        """
+        Pass exactly one of `reader` (from `object_reader`) or `http_session` (a shared
+        ``s3func.HttpSession(stream=False)``). With `http_session`, the reader is built from the
+        `db_url` recorded in the dataset document read here, so it cannot belong to a different
+        remote than the entries: a caller that read `db_url` separately could pair a reader with
+        the wrong remote across a re-point (plan review edr-api-plan-3).
+        """
+        if (reader is None) == (http_session is None):
+            raise TypeError('MongoStore needs exactly one of reader= or http_session=.')
         check_dataset_id(dataset_id)
         self._db = db
         self._d = dataset_id
@@ -120,6 +132,15 @@ class MongoStore:
                 dataset_id=dataset_id,
             )
         self._applied = (applied['uuid'], applied['ts'])
+        self._db_url = doc.get('db_url')
+        if reader is None:
+            if not self._db_url:
+                raise ValueError(
+                    f'Dataset {dataset_id!r}: its document records no db_url (refreshed from a connection without '
+                    'one), so http_session= cannot build a reader; pass reader= instead.'
+                )
+            reader = object_reader(self._db_url, http_session, threads=threads)
+            self._reader = reader
         self._rev = doc['rev']
         self._inc = doc.get('inc')   # None for a document written before 0.13.1
         ## The remote's ebooklet type (e.g. 'EVariableLengthValue', 'RemoteConnGroup'). The store serves
@@ -128,6 +149,16 @@ class MongoStore:
         section = doc.get('meta_section')
         self._meta_ts, self._meta = utils.parse_meta_section(bytes(section)) if section else (None, None)
         self._values = {}    # key -> bytes, or None for genuinely absent (memo for this request)
+
+    @property
+    def db_url(self):
+        """The `db_url` recorded in the dataset document this store was built on (None if unrecorded)."""
+        return self._db_url
+
+    @property
+    def applied(self):
+        """The remote commit `(uuid hex, timestamp)` this store's entries reflect."""
+        return self._applied
 
     def __repr__(self):
         return f'MongoStore({self._d!r}, applied={self._applied})'
